@@ -1564,7 +1564,73 @@ met_fill_rank <- function(x) {
   if (all(is.na(x))) return(rep((length(x) + 1) / 2, length(x)))
   replace(x, is.na(x), max(x, na.rm = TRUE) + 1)
 }
-build_met_integrated_ranking <- function(df_raw, met_results) {
+normalize_met_component_weights <- function(mean_weight, fw_weight, asv_weight) {
+  scalar_weight <- function(value) {
+    value <- suppressWarnings(as.numeric(value))
+    if (length(value) == 0 || !is.finite(value[1]) || value[1] < 0) {
+      return(0)
+    }
+    value[1]
+  }
+  weights <- c(
+    mean = scalar_weight(mean_weight),
+    fw = scalar_weight(fw_weight),
+    asv = scalar_weight(asv_weight)
+  )
+  if (sum(weights) <= 0) {
+    weights <- c(mean = 50, fw = 25, asv = 25)
+  }
+  weights / sum(weights)
+}
+build_met_selection_ranking <- function(result, component_weights = c(mean = 0.5, fw = 0.25, asv = 0.25)) {
+  asv_table <- if (nrow(result$ammi_genotype) > 0) {
+    result$ammi_genotype[, c("Genotype", "ASV"), drop = FALSE]
+  } else {
+    data.frame(Genotype = character(), ASV = numeric())
+  }
+  selection_base <- result$blups_main %>%
+    left_join(result$fw_results[, c("Genotype", "Sens", "b_interp")], by = "Genotype") %>%
+    left_join(asv_table, by = "Genotype")
+  rank_blup <- rank(-selection_base$BLUP_G, ties.method = "average")
+  rank_stability <- met_fill_rank(rank(abs(selection_base$Sens - 1), ties.method = "average", na.last = "keep"))
+  rank_asv <- met_fill_rank(rank(selection_base$ASV, ties.method = "average", na.last = "keep"))
+  selection_base %>%
+    mutate(
+      Rank_BLUP = rank_blup,
+      Rank_stability = rank_stability,
+      Rank_ASV = rank_asv,
+      Mean_weight = round(component_weights[["mean"]] * 100, 1),
+      FW_weight = round(component_weights[["fw"]] * 100, 1),
+      ASV_weight = round(component_weights[["asv"]] * 100, 1),
+      Combined_score = component_weights[["mean"]] * Rank_BLUP +
+        component_weights[["fw"]] * Rank_stability +
+        component_weights[["asv"]] * Rank_ASV,
+      Final_rank = rank(Combined_score, ties.method = "first")
+    ) %>%
+    arrange(Final_rank) %>%
+    mutate(CI_overlap_flag = CI_upper > lead(CI_lower))
+}
+plot_met_selection_ranking <- function(selection, trait_used) {
+  ggplot(selection, aes(x = reorder(Genotype, -BLUP_G), y = BLUP_G, fill = b_interp)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.3, color = "#2C3E50", linewidth = 0.6) +
+    geom_text(aes(y = BLUP_G / 2, label = paste0("#", Final_rank)), vjust = 0.5, size = 3.5, fontface = "bold", color = "white") +
+    scale_fill_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71"), na.value = "gray70") +
+    labs(
+      title = paste0("Hybrid selection - ", trait_used, " performance & stability"),
+      subtitle = paste0(
+        "Weights: Mean=", round(unique(selection$Mean_weight)[1], 1),
+        "%, FW=", round(unique(selection$FW_weight)[1], 1),
+        "%, ASV=", round(unique(selection$ASV_weight)[1], 1), "%"
+      ),
+      x = "Genotype",
+      y = paste0("BLUP for ", trait_used),
+      fill = "Stability (FW)"
+    ) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 8), plot.margin = margin(t = 10, r = 24, b = 24, l = 12))
+}
+build_met_integrated_ranking <- function(df_raw, met_results, component_weights = c(mean = 1, fw = 0, asv = 0)) {
   prepared <- prepare_met_trait_settings(df_raw)
   successful_traits <- intersect(prepared$trait_cols, names(met_results))
   if (length(successful_traits) == 0) {
@@ -1584,12 +1650,28 @@ build_met_integrated_ranking <- function(df_raw, met_results) {
   }
   weights <- weights_raw / sum(weights_raw)
   trait_blups <- purrr::map_dfr(successful_traits, function(tr) {
+    fw_scores <- met_results[[tr]]$fw_results %>%
+      transmute(
+        Genotype = as.character(Genotype),
+        FW_stability_raw = -abs(as.numeric(Sens) - 1)
+      )
+    asv_scores <- if (nrow(met_results[[tr]]$ammi_genotype) > 0) {
+      met_results[[tr]]$ammi_genotype %>%
+        transmute(
+          Genotype = as.character(Genotype),
+          ASV_stability_raw = -as.numeric(ASV)
+        )
+    } else {
+      data.frame(Genotype = character(), ASV_stability_raw = numeric())
+    }
     met_results[[tr]]$blups_main %>%
       transmute(
         Genotype = as.character(Genotype),
         Trait = tr,
         Raw_BLUP = as.numeric(BLUP_G)
-      )
+      ) %>%
+      left_join(fw_scores, by = "Genotype") %>%
+      left_join(asv_scores, by = "Genotype")
   })
   adjust_value <- function(value, trait_name) {
     if (trait_name %in% names(prepared$target_traits)) {
@@ -1605,23 +1687,41 @@ build_met_integrated_ranking <- function(df_raw, met_results) {
     trait_blups$Raw_BLUP,
     trait_blups$Trait
   )
+  trait_blups <- trait_blups %>%
+    group_by(Trait) %>%
+    mutate(
+      Mean_component = standardize_trait(Adjusted_performance),
+      FW_component = standardize_trait(FW_stability_raw),
+      ASV_component = standardize_trait(ASV_stability_raw),
+      Component_weight_coverage =
+        ifelse(!is.na(Mean_component), component_weights[["mean"]], 0) +
+        ifelse(!is.na(FW_component), component_weights[["fw"]], 0) +
+        ifelse(!is.na(ASV_component), component_weights[["asv"]], 0),
+      Standardized_score = ifelse(
+        Component_weight_coverage > 0,
+        (
+          replace_na(Mean_component, 0) * ifelse(!is.na(Mean_component), component_weights[["mean"]], 0) +
+          replace_na(FW_component, 0) * ifelse(!is.na(FW_component), component_weights[["fw"]], 0) +
+          replace_na(ASV_component, 0) * ifelse(!is.na(ASV_component), component_weights[["asv"]], 0)
+        ) / Component_weight_coverage,
+        NA_real_
+      )
+    ) %>%
+    ungroup()
   adjusted_wide <- trait_blups %>%
     dplyr::select(Genotype, Trait, Adjusted_performance) %>%
     pivot_wider(
       names_from = Trait,
       values_from = Adjusted_performance
     )
-  standardized_wide <- adjusted_wide %>%
-    mutate(across(
-      all_of(successful_traits),
-      standardize_trait
-    ))
-  score_long <- standardized_wide %>%
-    pivot_longer(
-      cols = all_of(successful_traits),
-      names_to = "Trait",
-      values_to = "Standardized_score"
-    ) %>%
+  standardized_wide <- trait_blups %>%
+    dplyr::select(Genotype, Trait, Standardized_score) %>%
+    pivot_wider(
+      names_from = Trait,
+      values_from = Standardized_score
+    )
+  score_long <- trait_blups %>%
+    dplyr::select(Genotype, Trait, Standardized_score) %>%
     mutate(Normalized_weight = as.numeric(weights[Trait]))
   integrated <- score_long %>%
     group_by(Genotype) %>%
@@ -1645,6 +1745,9 @@ build_met_integrated_ranking <- function(df_raw, met_results) {
     left_join(adjusted_output, by = "Genotype") %>%
     left_join(standardized_output, by = "Genotype") %>%
     mutate(
+      Mean_weight = round(component_weights[["mean"]] * 100, 1),
+      FW_weight = round(component_weights[["fw"]] * 100, 1),
+      ASV_weight = round(component_weights[["asv"]] * 100, 1),
       Integrated_MET_Index = round(Integrated_MET_Index, 4),
       Weight_coverage = round(Weight_coverage, 4)
     )
@@ -1695,7 +1798,10 @@ build_met_integrated_ranking <- function(df_raw, met_results) {
         title = "Integrated MET ranking",
         subtitle = paste0(
           length(successful_traits),
-          " parameter(s), performance BLUPs only; trait directions and weights applied"
+          " parameter(s), Mean/FW/ASV weights = ",
+          round(component_weights[["mean"]] * 100, 1), "/",
+          round(component_weights[["fw"]] * 100, 1), "/",
+          round(component_weights[["asv"]] * 100, 1)
         ),
         x = "Genotype",
         y = "Weighted standardized MET performance index",
@@ -1914,13 +2020,15 @@ run_met_pipeline <- function(df_raw, trait_used = NULL, check_varieties = NULL) 
     cor_long <- as.data.frame(cor_mat) %>% rownames_to_column("Env1") %>% pivot_longer(-Env1, names_to = "Env2", values_to = "r")
     p_env_cor <- ggplot(cor_long, aes(x = Env1, y = Env2, fill = r)) + geom_tile(color = "white") + geom_text(aes(label = round(r, 2)), size = 4.5) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 0, limits = c(-1, 1)) + labs(title = "Genotype BLUP correlation across environments", x = NULL, y = NULL, fill = "r") + theme_bw()
   }
-  asv_table <- if (nrow(AMMI_geno) > 0) AMMI_geno[, c("Genotype", "ASV"), drop = FALSE] else data.frame(Genotype = character(), ASV = numeric())
-  selection_base <- BLUPs_main %>% left_join(FW_results[, c("Genotype", "Sens", "b_interp")], by = "Genotype") %>% left_join(asv_table, by = "Genotype")
-  rank_blup <- rank(-selection_base$BLUP_G, ties.method = "average")
-  rank_stability <- met_fill_rank(rank(abs(selection_base$Sens - 1), ties.method = "average", na.last = "keep"))
-  rank_asv <- met_fill_rank(rank(selection_base$ASV, ties.method = "average", na.last = "keep"))
-  selection <- selection_base %>% mutate(Rank_BLUP = rank_blup, Rank_stability = rank_stability, Rank_ASV = rank_asv, Combined_score = MET_W_YIELD * Rank_BLUP + MET_W_FW * Rank_stability + MET_W_ASV * Rank_ASV, Final_rank = rank(Combined_score, ties.method = "first")) %>% arrange(Final_rank) %>% mutate(CI_overlap_flag = CI_upper > lead(CI_lower))
-  p_met_selection <- ggplot(selection, aes(x = reorder(Genotype, -BLUP_G), y = BLUP_G, fill = b_interp)) + geom_bar(stat = "identity", width = 0.7) + geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.3, color = "#2C3E50", linewidth = 0.6) + geom_text(aes(y = BLUP_G / 2, label = paste0("#", Final_rank)), vjust = 0.5, size = 3.5, fontface = "bold", color = "white") + scale_fill_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71"), na.value = "gray70") + labs(title = paste0("Hybrid selection â€” ", trait_used, " performance & stability"), subtitle = paste0("Weights: Mean=", MET_W_YIELD * 100, "%, FW=", MET_W_FW * 100, "%, ASV=", MET_W_ASV * 100, "%"), x = "Genotype", y = paste0("BLUP for ", trait_used), fill = "Stability (FW)") + theme_bw() + theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 8), plot.margin = margin(t = 10, r = 24, b = 24, l = 12))
+  selection <- build_met_selection_ranking(
+    list(
+      blups_main = BLUPs_main,
+      fw_results = FW_results,
+      ammi_genotype = AMMI_geno
+    ),
+    component_weights = c(mean = MET_W_YIELD, fw = MET_W_FW, asv = MET_W_ASV)
+  )
+  p_met_selection <- plot_met_selection_ranking(selection, trait_used)
   return(list(raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean, outlier_summary = outlier_summary, presence = presence, model_summary = model_summary, variance_components = variance_components, lrt_table = lrt_table, blups_main = BLUPs_main, blups_environment = BLUPs_env_full, gxe_matrix = GxE_matrix_wide %>% rownames_to_column("Genotype"), fw_results = FW_results, ammi_notes = ammi_notes, ammi_genotype = AMMI_geno, ammi_environment = AMMI_env, gge_genotype = GGE_geno, gge_environment = GGE_env, met_selection = selection, p_before = p_before, p_after = p_after, p_variance = p_variance, p_residual = p_residual, p_blup = p_blup, p_accuracy = p_accuracy, p_perf_heatmap = p_perf_heatmap, p_fw_mean_sens = p_fw_mean_sens, p_fw_regression = p_fw_regression, p_ammi1 = p_ammi1, p_ammi2 = p_ammi2, p_gge = p_gge, p_env_cor = p_env_cor, p_met_selection = p_met_selection))
 }
 run_met_all_traits <- function(df_raw, check_varieties = NULL) {
@@ -2336,6 +2444,28 @@ ui <- page_navbar(
     .chart-options-subpanel .form-group {
       margin-bottom: 10px;
     }
+    .met-weight-panel {
+      border-top: 1px solid #E6E0D2;
+      margin-top: 18px;
+      padding-top: 16px;
+    }
+    .met-weight-title {
+      color: #34402F;
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+    .met-weight-panel .form-group {
+      margin-bottom: 0;
+    }
+    .met-weight-panel .irs--shiny .irs-bar,
+    .met-weight-panel .irs--shiny .irs-single {
+      background: #315F28;
+      border-color: #315F28;
+    }
+    .met-weight-panel .irs--shiny .irs-handle {
+      border-color: #315F28;
+    }
     .chart-download-title {
       color: #34402F;
       font-size: 13px;
@@ -2635,6 +2765,40 @@ ui <- page_navbar(
               "Overall Selection" = "met_integrated"
             )
           )
+        ),
+        conditionalPanel(
+          "input.result_view == 'met_selection' || input.result_view == 'met_integrated'",
+          tags$div(
+            class = "side-subpanel met-weight-panel",
+            tags$div(class = "side-subpanel-title", "Weight"),
+            sliderInput(
+              inputId = "met_weight_mean",
+              label = "Mean",
+              min = 0,
+              max = 100,
+              value = 50,
+              step = 5,
+              post = "%"
+            ),
+            sliderInput(
+              inputId = "met_weight_fw",
+              label = "FW",
+              min = 0,
+              max = 100,
+              value = 25,
+              step = 5,
+              post = "%"
+            ),
+            sliderInput(
+              inputId = "met_weight_asv",
+              label = "ASV",
+              min = 0,
+              max = 100,
+              value = 25,
+              step = 5,
+              post = "%"
+            )
+          )
         )
       ),
       card(
@@ -2804,6 +2968,34 @@ server <- function(input, output, session) {
     validate(need(!is.null(result), "This MET trait plot is not available."))
     result
   })
+  met_component_weights <- reactive({
+    normalize_met_component_weights(
+      input$met_weight_mean,
+      input$met_weight_fw,
+      input$met_weight_asv
+    )
+  })
+  weighted_met_selection_for_table <- reactive({
+    build_met_selection_ranking(
+      met_result_for_table(),
+      component_weights = met_component_weights()
+    )
+  })
+  weighted_met_selection_for_plot <- reactive({
+    build_met_selection_ranking(
+      met_result_for_plot(),
+      component_weights = met_component_weights()
+    )
+  })
+  weighted_met_integrated <- reactive({
+    req(analysis_results(), uploaded_data())
+    validate(need(analysis_used() == "MET", "Run MET analysis to view this result."))
+    build_met_integrated_ranking(
+      uploaded_data(),
+      analysis_results()$met_by_trait,
+      component_weights = met_component_weights()
+    )
+  })
   selected_chart <- reactive({
     req(input$plot_view)
     view <- input$plot_view
@@ -2829,7 +3021,7 @@ server <- function(input, output, session) {
     validate(need(analysis_used() == "MET", "Run MET analysis before downloading this chart."))
     if (view == "met_integrated_plot") {
       return(list(
-        plot = analysis_results()$p_met_integrated_ranking,
+        plot = weighted_met_integrated()$plot,
         name = "MET_overall_ranking"
       ))
     }
@@ -2837,7 +3029,13 @@ server <- function(input, output, session) {
     result <- met_result_for_plot()
     chart_details <- switch(
       view,
-      met_selection_plot = list(result$p_met_selection, "MET_ranking"),
+      met_selection_plot = list(
+        plot_met_selection_ranking(
+          weighted_met_selection_for_plot(),
+          input$met_plot_trait
+        ),
+        "MET_ranking"
+      ),
       met_fw_plot = list(result$p_fw_mean_sens, "MET_FW_sensitivity"),
       met_fw_regression = list(result$p_fw_regression, "MET_FW_regression"),
       met_ammi1 = list(result$p_ammi1, "MET_AMMI1"),
@@ -3439,23 +3637,23 @@ server <- function(input, output, session) {
     datatable(met_result_for_table()$gge_genotype, options = list(pageLength = 50, scrollX = TRUE))
   })
   output$met_selection_table <- renderDT({
-    datatable(met_result_for_table()$met_selection, options = list(pageLength = 50, scrollX = TRUE))
+    datatable(weighted_met_selection_for_table(), options = list(pageLength = 50, scrollX = TRUE))
   })
   output$met_integrated_table <- renderDT({
     req(analysis_results())
     validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
     datatable(
-      analysis_results()$met_integrated_ranking,
+      weighted_met_integrated()$ranking,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$met_selection_plot <- renderPlot({
-    print(met_result_for_plot()$p_met_selection)
+    print(plot_met_selection_ranking(weighted_met_selection_for_plot(), input$met_plot_trait))
   }, res = 96, execOnResize = TRUE)
   output$met_integrated_plot <- renderPlot({
     req(analysis_results())
     validate(need(analysis_used() == "MET", "Run MET analysis to view this plot."))
-    print(analysis_results()$p_met_integrated_ranking)
+    print(weighted_met_integrated()$plot)
   }, res = 96, execOnResize = TRUE)
   output$met_performance_heatmap <- renderPlot({
     print(met_result_for_plot()$p_perf_heatmap)
