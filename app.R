@@ -33,6 +33,7 @@ advance_index_cutoff <- 0
 retest_index_cutoff  <- -0.20
 priority_advance_cutoff_pct <- 0
 priority_severe_weak_pct <- -10
+lpsi_selection_intensity <- 0.10
 run_simple_anova <- TRUE
 run_lsd_test     <- TRUE
 lsd_significance_alpha <- 0.05
@@ -204,7 +205,9 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("02", "anova", results$anova_full)
     add_sheet("03", "mean_comparison", results$lsd_wide)
     add_sheet("04", "superiority", results$superiority_index)
-    add_sheet("05", "selection", results$index_ranking)
+    add_sheet("05", "selection_index", results$index_ranking)
+    add_sheet("06", "decision", results$final_decision)
+    add_sheet("07", "heritability_gain", results$heritability_gain)
   } else if (analysis_type == "MET") {
     for (trait in results$met_trait_names) {
       result <- results$met_by_trait[[trait]]
@@ -674,7 +677,7 @@ make_diagnostic_plot <- function(diag, trait, plot_type) {
 
 
 # Main LPSI function
-run_selection_pipeline <- function(df_raw) {
+run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
   prepared <- prepare_excel_input(df_raw)
   df_data <- prepared$data
   trait_cols <- prepared$trait_cols
@@ -713,15 +716,26 @@ run_selection_pipeline <- function(df_raw) {
   }
   weights <- weights_raw_used / sum(weights_raw_used)
   variety_levels <- unique(df$ID)
-  variety_map <- setNames(as.character(seq_along(variety_levels)), variety_levels)
-  if (!check_original_name %in% names(variety_map)) {
-    stop("The first-row check genotype was not found after cleaning: ", check_original_name)
+  selected_checks <- unique(clean_text(check_varieties))
+  selected_checks <- selected_checks[
+    !is.na(selected_checks) & selected_checks != "" & selected_checks %in% variety_levels
+  ]
+  if (length(selected_checks) == 0) {
+    selected_checks <- check_original_name
   }
-  check_label <- as.character(variety_map[[check_original_name]])
+  variety_map <- setNames(as.character(seq_along(variety_levels)), variety_levels)
+  if (!all(selected_checks %in% names(variety_map))) {
+    stop(
+      "Selected check genotype was not found after cleaning: ",
+      paste(setdiff(selected_checks, names(variety_map)), collapse = ", ")
+    )
+  }
+  check_labels <- as.character(variety_map[selected_checks])
+  check_label <- check_labels[1]
   mapping_table <- data.frame(
     ID_number = as.character(variety_map),
     Original_variety = names(variety_map),
-    Check = ifelse(names(variety_map) == check_original_name, "YES", "")
+    Check = ifelse(names(variety_map) %in% selected_checks, "YES", "")
   )
   df$Original_ID <- df$ID
   df$ID <- as.character(variety_map[df$ID])
@@ -734,7 +748,7 @@ run_selection_pipeline <- function(df_raw) {
       Original_ID = Original_variety
     ) %>%
     dplyr::select(ID, Original_ID)
-  check_original_label <- check_original_name
+  check_original_label <- paste(selected_checks, collapse = ", ")
   score_cols <- trait_cols[
     sapply(trait_cols, function(tr) {
       vals <- na.omit(as.numeric(df[[tr]]))
@@ -832,8 +846,9 @@ run_selection_pipeline <- function(df_raw) {
     dplyr::select(ID, Original_ID, Selection_Index) %>%
     arrange(desc(Selection_Index))
   check_index <- index_df %>%
-    filter(ID == check_label) %>%
-    pull(Selection_Index)
+    filter(ID %in% check_labels) %>%
+    summarise(Check_index = mean(Selection_Index, na.rm = TRUE)) %>%
+    pull(Check_index)
   if (length(check_index) == 0) {
     stop("Check index not found.")
   }
@@ -846,7 +861,7 @@ run_selection_pipeline <- function(df_raw) {
         2
       ),
       Status = case_when(
-        ID == check_label ~ "Check",
+        ID %in% check_labels ~ "Check",
         Index_Advantage > 0 ~ "Above check",
         Index_Advantage == 0 ~ "Equal to check",
         TRUE ~ "Below check"
@@ -865,10 +880,15 @@ run_selection_pipeline <- function(df_raw) {
     left_join(id_lookup, by = "ID") %>%
     relocate(Original_ID, .after = ID)
   check_actual <- actual_means %>%
-    filter(ID == check_label)
+    filter(ID %in% check_labels)
   if (nrow(check_actual) == 0) {
     stop("Check not found in actual adjusted means.")
   }
+  check_actual_values <- vapply(
+    trait_cols,
+    function(tr) mean(as.numeric(check_actual[[tr]]), na.rm = TRUE),
+    numeric(1)
+  )
   calc_superiority_pct <- function(candidate, check, trait_name) {
     if (is.na(check)) {
       return(NA_real_)
@@ -887,11 +907,11 @@ run_selection_pipeline <- function(df_raw) {
     return((candidate - check) / denom * 100)
   }
   superiority_df <- actual_means %>%
-    filter(ID != check_label)
+    filter(!ID %in% check_labels)
   for (tr in trait_cols) {
     superiority_df[[tr]] <- calc_superiority_pct(
       candidate  = superiority_df[[tr]],
-      check      = check_actual[[tr]][1],
+      check      = check_actual_values[[tr]],
       trait_name = tr
     )
   }
@@ -937,8 +957,24 @@ run_selection_pipeline <- function(df_raw) {
         priority_pass_rate = NA_real_
       )
   }
+  weakness_traits <- if (length(priority_traits) > 0) priority_traits else trait_cols
+  weakness_table <- superiority_df %>%
+    dplyr::select(ID, Original_ID, all_of(weakness_traits)) %>%
+    pivot_longer(
+      cols = all_of(weakness_traits),
+      names_to = "Trait",
+      values_to = "Superiority_pct"
+    ) %>%
+    group_by(ID, Original_ID) %>%
+    summarise(
+      Weakness_trait = {
+        weak <- Trait[!is.na(Superiority_pct) & Superiority_pct < priority_advance_cutoff_pct]
+        if (length(weak) == 0) "None" else paste(unique(weak), collapse = ", ")
+      },
+      .groups = "drop"
+    )
   final_decision <- index_df %>%
-    filter(ID != check_label) %>%
+    filter(!ID %in% check_labels) %>%
     left_join(
       priority_summary %>%
         dplyr::select(
@@ -951,6 +987,10 @@ run_selection_pipeline <- function(df_raw) {
         ),
       by = "ID"
     ) %>%
+    left_join(
+      weakness_table %>% dplyr::select(ID, Weakness_trait),
+      by = "ID"
+    ) %>%
     mutate(
       across(
         c(
@@ -961,6 +1001,7 @@ run_selection_pipeline <- function(df_raw) {
         ),
         ~ replace_na(.x, 0)
       ),
+      Weakness_trait = replace_na(Weakness_trait, "None"),
       Plot_ID = Original_ID,
       Decision = case_when(
         Index_Advantage >= advance_index_cutoff &
@@ -1175,6 +1216,77 @@ run_selection_pipeline <- function(df_raw) {
       anova_full <- bind_rows(anova_full, temp)
     }
   }
+  selection_k <- dnorm(qnorm(1 - lpsi_selection_intensity)) / lpsi_selection_intensity
+  heritability_gain <- map_dfr(trait_cols, function(tr) {
+    model_data <- df %>%
+      filter(!is.na(.data[[tr]]))
+    tryCatch({
+      if (n_distinct(model_data$ID) < 2) {
+        stop("At least two varieties are required.")
+      }
+      model <- aov(make_model_formula(tr, model_data), data = model_data)
+      sm <- as.data.frame(summary(model)[[1]])
+      sm$Source <- trimws(rownames(sm))
+      id_row <- sm[sm$Source == "ID", , drop = FALSE]
+      residual_row <- sm[grepl("Residual", sm$Source), , drop = FALSE]
+      if (nrow(id_row) == 0 || nrow(residual_row) == 0) {
+        stop("ID or residual mean square was not available.")
+      }
+      ms_genotype <- as.numeric(id_row$`Mean Sq`[1])
+      ms_error <- as.numeric(residual_row$`Mean Sq`[1])
+      rep_harmonic <- model_data %>%
+        group_by(ID) %>%
+        summarise(n_rep = n_distinct(Rep), .groups = "drop") %>%
+        summarise(value = 1 / mean(1 / n_rep)) %>%
+        pull(value)
+      genotypic_var <- max((ms_genotype - ms_error) / rep_harmonic, 0)
+      error_var <- ms_error
+      phenotypic_var <- genotypic_var + (error_var / rep_harmonic)
+      h2 <- ifelse(phenotypic_var > 0, genotypic_var / phenotypic_var, NA_real_)
+      trait_mean <- mean(model_data[[tr]], na.rm = TRUE)
+      genetic_advance <- selection_k * sqrt(phenotypic_var) * h2
+      genetic_advance_pct <- ifelse(
+        is.finite(trait_mean) && abs(trait_mean) > 0.0001,
+        (genetic_advance / trait_mean) * 100,
+        NA_real_
+      )
+      data.frame(
+        Trait = tr,
+        Mean = round(trait_mean, 4),
+        MS_genotype = round(ms_genotype, 4),
+        MS_error = round(ms_error, 4),
+        Harmonic_replication = round(rep_harmonic, 3),
+        Genotypic_variance = round(genotypic_var, 5),
+        Error_variance = round(error_var, 5),
+        Phenotypic_variance = round(phenotypic_var, 5),
+        Broad_sense_H2 = round(h2, 4),
+        Selection_intensity_pct = lpsi_selection_intensity * 100,
+        Selection_intensity_k = round(selection_k, 4),
+        Genetic_advance = round(genetic_advance, 4),
+        Genetic_advance_pct_mean = round(genetic_advance_pct, 2),
+        Note = "Single-environment replicated estimate",
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) {
+      data.frame(
+        Trait = tr,
+        Mean = NA_real_,
+        MS_genotype = NA_real_,
+        MS_error = NA_real_,
+        Harmonic_replication = NA_real_,
+        Genotypic_variance = NA_real_,
+        Error_variance = NA_real_,
+        Phenotypic_variance = NA_real_,
+        Broad_sense_H2 = NA_real_,
+        Selection_intensity_pct = lpsi_selection_intensity * 100,
+        Selection_intensity_k = round(selection_k, 4),
+        Genetic_advance = NA_real_,
+        Genetic_advance_pct_mean = NA_real_,
+        Note = paste("Not calculated:", e$message),
+        stringsAsFactors = FALSE
+      )
+    })
+  })
   lsd_all <- data.frame()
   lsd_wide <- data.frame()
   if (run_lsd_test) {
@@ -1308,18 +1420,19 @@ run_selection_pipeline <- function(df_raw) {
     superiority_index = superiority_df,
     priority_summary = priority_summary,
     final_decision = final_decision,
+    heritability_gain = heritability_gain,
     anova_full = anova_full,
     lsd_wide = lsd_wide,
     ranking_plot = p_index,
     heatmap_plot = heatmap_plot,
-    check_original_label = check_original_label
+    check_original_label = check_original_label,
+    selected_checks = selected_checks
   ))
 }
 
 
 
 # MET function
-MET_CONTROLS <- c("WMCT-2821", "WMCT-2825", "Blackjack")
 MET_W_YIELD <- 0.50
 MET_W_FW <- 0.25
 MET_W_ASV <- 0.25
@@ -1607,7 +1720,7 @@ build_met_integrated_ranking <- function(df_raw, met_results) {
     plot = p_integrated
   )
 }
-run_met_pipeline <- function(df_raw, trait_used = NULL) {
+run_met_pipeline <- function(df_raw, trait_used = NULL, check_varieties = NULL) {
   input <- make_met_data(df_raw, trait_used)
   dat <- input$data
   trait_used <- input$trait_used
@@ -1623,14 +1736,38 @@ run_met_pipeline <- function(df_raw, trait_used = NULL) {
   p_after <- ggplot(dat_clean, aes(x = Weight)) + geom_histogram(bins = 30, fill = "#2ECC71", color = "white", linewidth = 0.2) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = paste0(trait_used, " distribution after both outlier steps"), x = trait_used, y = "Count") + theme_bw()
   outlier_summary <- data.frame(Trait_used = trait_used, Rows_original = nrow(dat), Rows_after_cell_clean = nrow(dat_stepA), Rows_after_environment_clean = nrow(dat_clean), Removed_total = nrow(dat) - nrow(dat_clean), stringsAsFactors = FALSE)
   presence <- dat_clean %>% distinct(Genotype, Environment) %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment), present = 1) %>% pivot_wider(names_from = Environment, values_from = present, values_fill = 0) %>% mutate(n_envs = rowSums(across(-Genotype))) %>% arrange(desc(n_envs), Genotype)
-  controls_present <- intersect(MET_CONTROLS, as.character(unique(dat_clean$Genotype)))
-  controls_used <- presence %>% filter(Genotype %in% controls_present, n_envs == n_envs_total) %>% pull(Genotype)
-  if (length(controls_present) == 0) {
+  selected_controls <- unique(clean_text(check_varieties))
+  selected_controls <- selected_controls[!is.na(selected_controls) & selected_controls != ""]
+  controls_present <- intersect(selected_controls, as.character(unique(dat_clean$Genotype)))
+  if (length(selected_controls) > 0 && length(controls_present) > 0) {
+    controls_used <- controls_present
+    missing_selected_controls <- setdiff(selected_controls, controls_present)
+    if (length(missing_selected_controls) > 0) {
+      notes <- c(
+        notes,
+        paste0(
+          "Selected controls not found in cleaned MET data: ",
+          paste(missing_selected_controls, collapse = ", "),
+          "."
+        )
+      )
+    }
+  } else {
     controls_used <- presence %>% filter(n_envs == n_envs_total) %>% pull(Genotype)
-    notes <- c(notes, "None of the default controls were found. Genotypes present in all environments were used as the control set for percent-of-control calculation.")
-  } else if (length(controls_used) < length(MET_CONTROLS)) {
-    missing_controls <- setdiff(MET_CONTROLS, controls_used)
-    notes <- c(notes, paste0("Default controls missing from at least one environment or absent from data: ", paste(missing_controls, collapse = ", "), ". Percent-of-control calculation used only complete controls."))
+    if (length(selected_controls) > 0) {
+      notes <- c(
+        notes,
+        paste0(
+          "No selected controls were found in cleaned MET data. ",
+          "Genotypes present in all environments were used as the control set."
+        )
+      )
+    } else {
+      notes <- c(
+        notes,
+        "No controls were selected. Genotypes present in all environments were used as the control set."
+      )
+    }
   }
   if (length(controls_used) == 0) {
     controls_used <- as.character(unique(dat_clean$Genotype))
@@ -1786,13 +1923,13 @@ run_met_pipeline <- function(df_raw, trait_used = NULL) {
   p_met_selection <- ggplot(selection, aes(x = reorder(Genotype, -BLUP_G), y = BLUP_G, fill = b_interp)) + geom_bar(stat = "identity", width = 0.7) + geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.3, color = "#2C3E50", linewidth = 0.6) + geom_text(aes(y = BLUP_G / 2, label = paste0("#", Final_rank)), vjust = 0.5, size = 3.5, fontface = "bold", color = "white") + scale_fill_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71"), na.value = "gray70") + labs(title = paste0("Hybrid selection â€” ", trait_used, " performance & stability"), subtitle = paste0("Weights: Mean=", MET_W_YIELD * 100, "%, FW=", MET_W_FW * 100, "%, ASV=", MET_W_ASV * 100, "%"), x = "Genotype", y = paste0("BLUP for ", trait_used), fill = "Stability (FW)") + theme_bw() + theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 8), plot.margin = margin(t = 10, r = 24, b = 24, l = 12))
   return(list(raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean, outlier_summary = outlier_summary, presence = presence, model_summary = model_summary, variance_components = variance_components, lrt_table = lrt_table, blups_main = BLUPs_main, blups_environment = BLUPs_env_full, gxe_matrix = GxE_matrix_wide %>% rownames_to_column("Genotype"), fw_results = FW_results, ammi_notes = ammi_notes, ammi_genotype = AMMI_geno, ammi_environment = AMMI_env, gge_genotype = GGE_geno, gge_environment = GGE_env, met_selection = selection, p_before = p_before, p_after = p_after, p_variance = p_variance, p_residual = p_residual, p_blup = p_blup, p_accuracy = p_accuracy, p_perf_heatmap = p_perf_heatmap, p_fw_mean_sens = p_fw_mean_sens, p_fw_regression = p_fw_regression, p_ammi1 = p_ammi1, p_ammi2 = p_ammi2, p_gge = p_gge, p_env_cor = p_env_cor, p_met_selection = p_met_selection))
 }
-run_met_all_traits <- function(df_raw) {
+run_met_all_traits <- function(df_raw, check_varieties = NULL) {
   trait_cols <- get_met_trait_cols(df_raw)
   results <- list()
   failures <- data.frame(Trait = character(), Error = character(), stringsAsFactors = FALSE)
   for (trait in trait_cols) {
     result <- tryCatch({
-      run_met_pipeline(df_raw, trait)
+      run_met_pipeline(df_raw, trait, check_varieties = check_varieties)
     }, error = function(e) {
       failures <<- bind_rows(
         failures,
@@ -1938,6 +2075,9 @@ ui <- page_navbar(
       box-shadow: none;
       margin: 0;
       padding: 7px 10px;
+      position: sticky;
+      top: 0;
+      z-index: 1030;
     }
     .navbar > .container-fluid {
       max-width: none;
@@ -2097,6 +2237,24 @@ ui <- page_navbar(
       font-size: 12px;
       margin-top: 12px;
       padding: 9px 10px;
+    }
+    .analyze-workspace {
+      height: calc(100vh - 112px);
+      height: calc(100dvh - 112px);
+      overflow: hidden;
+    }
+    .analyze-workspace > .bslib-grid {
+      height: 100%;
+    }
+    .analyze-pane {
+      max-height: 100%;
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 6px;
+      scrollbar-gutter: stable;
+    }
+    .analyze-pane > .card:last-child {
+      margin-bottom: 0;
     }
     pre.shiny-text-output {
       white-space: pre-wrap;
@@ -2290,6 +2448,15 @@ ui <- page_navbar(
       .navbar {
         margin: 0;
       }
+      .analyze-workspace {
+        height: auto;
+        overflow: visible;
+      }
+      .analyze-pane {
+        max-height: none;
+        overflow-y: visible;
+        padding-right: 0;
+      }
     }
   ")),
   # Upload data navbar
@@ -2318,10 +2485,14 @@ ui <- page_navbar(
   # Analysis navbar
   nav_panel(
     title = "Analyze",
-    layout_columns(
-      col_widths = c(4, 8),
-      card(
-        panel_header("Analyze", "Choose a trait and an analysis"),
+    tags$div(
+      class = "analyze-workspace",
+      layout_columns(
+        col_widths = c(4, 8),
+        tags$div(
+          class = "analyze-pane analyze-left-pane",
+          card(
+            panel_header("Analyze", "Choose a trait and an analysis"),
         tags$div(
           class = "control-section",
           tags$div(class = "control-label", "Which trait?"),
@@ -2390,6 +2561,13 @@ ui <- page_navbar(
             uiOutput("mating_column_inputs")
           )
         ),
+        conditionalPanel(
+          condition = "input.analysis_method == 'LPSI' || input.analysis_method == 'MET'",
+          tags$div(
+            class = "control-section",
+            uiOutput("check_variety_inputs")
+          )
+        ),
         actionButton(
           inputId = "run_analysis",
           label = tagList("Run analysis", tags$span(" ->")),
@@ -2399,15 +2577,18 @@ ui <- page_navbar(
           class = "analysis-status",
           verbatimTextOutput("analysis_status")
         )
-      ),
-      tags$div(
-        card(
-          card_header(uiOutput("diagnostic_header")),
-          plotOutput("diagnostic_plot", height = "470px")
+        )
         ),
-        card(
-          panel_header("Data summary by trait", "Residual normality test for every measured trait"),
-          DTOutput("shapiro_table")
+        tags$div(
+          class = "analyze-pane analyze-right-pane",
+          card(
+            card_header(uiOutput("diagnostic_header")),
+            plotOutput("diagnostic_plot", height = "470px")
+          ),
+          card(
+            panel_header("Data summary by trait", "Residual normality test for every measured trait"),
+            DTOutput("shapiro_table")
+          )
         )
       )
     )
@@ -2441,6 +2622,7 @@ ui <- page_navbar(
               "ANOVA" = "lpsi_anova",
               "Mean comparison" = "lpsi_lsd",
               "Superiority" = "lpsi_superiority",
+              "Heritability & gain" = "lpsi_heritability",
               "Selected varieties" = "lpsi_ranking"
             ),
             "Across locations (MET)" = c(
@@ -2466,6 +2648,7 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'lpsi_superiority'", DTOutput("superiority_table")),
         conditionalPanel("input.result_view == 'lpsi_anova'", DTOutput("anova_full_table")),
         conditionalPanel("input.result_view == 'lpsi_lsd'", DTOutput("lsd_wide_table")),
+        conditionalPanel("input.result_view == 'lpsi_heritability'", DTOutput("heritability_gain_table")),
         conditionalPanel("input.result_view == 'met_variance'", DTOutput("met_variance_table")),
         conditionalPanel("input.result_view == 'met_blup'", DTOutput("met_blup_table")),
         conditionalPanel("input.result_view == 'met_fw'", DTOutput("met_fw_table")),
@@ -2781,6 +2964,7 @@ server <- function(input, output, session) {
       lpsi_anova = "LPSI analysis of variance",
       lpsi_lsd = "Mean comparison",
       lpsi_superiority = "Trait superiority",
+      lpsi_heritability = "Heritability and genetic gain",
       lpsi_ranking = "Selected varieties",
       met_variance = paste("Mixed model -", trait),
       met_blup = paste("BLUP -", trait),
@@ -2851,6 +3035,48 @@ server <- function(input, output, session) {
       inputId = "met_plot_trait",
       choices = traits,
       selected = if (length(traits) > 0) traits[1] else character(0)
+    )
+  })
+  output$check_variety_inputs <- renderUI({
+    req(uploaded_data(), input$analysis_method)
+    if (input$analysis_method == "MATING") {
+      return(NULL)
+    }
+
+    if (input$analysis_method == "LPSI") {
+      prepared <- tryCatch({
+        prepare_excel_input(uploaded_data())
+      }, error = function(e) {
+        NULL
+      })
+      validate(need(!is.null(prepared), "Upload valid LPSI data before choosing checks."))
+      choices <- unique(clean_text(prepared$data[[id_col]]))
+      choices <- choices[!is.na(choices) & choices != ""]
+      return(selectizeInput(
+        inputId = "check_varieties",
+        label = "Check variety",
+        choices = choices,
+        selected = prepared$check_original_name,
+        multiple = TRUE,
+        options = list(placeholder = "Choose one or more check varieties")
+      ))
+    }
+
+    prepared <- tryCatch({
+      prepare_met_trait_settings(uploaded_data())
+    }, error = function(e) {
+      NULL
+    })
+    validate(need(!is.null(prepared), "Upload valid MET data before choosing checks."))
+    choices <- unique(clean_text(prepared$data$Genotype))
+    choices <- choices[!is.na(choices) & choices != ""]
+    selectizeInput(
+      inputId = "check_varieties",
+      label = "Check variety",
+      choices = choices,
+      selected = character(0),
+      multiple = TRUE,
+      options = list(placeholder = "Optional: choose one or more check varieties")
     )
   })
   output$mating_column_inputs <- renderUI({
@@ -3006,7 +3232,10 @@ server <- function(input, output, session) {
     } else if (input$analysis_method == "LPSI") {
       analysis_message("Running LPSI analysis...")
       res <- tryCatch({
-        run_selection_pipeline(uploaded_data())
+        run_selection_pipeline(
+          uploaded_data(),
+          check_varieties = input$check_varieties
+        )
       }, error = function(e) {
         showNotification(
           paste("LPSI pipeline failed:", e$message),
@@ -3026,7 +3255,10 @@ server <- function(input, output, session) {
     } else if (input$analysis_method == "MET") {
       analysis_message("Running MET analysis for all detected numeric traits...")
       res <- tryCatch({
-        run_met_all_traits(uploaded_data())
+        run_met_all_traits(
+          uploaded_data(),
+          check_varieties = input$check_varieties
+        )
       }, error = function(e) {
         showNotification(
           paste("MET pipeline failed:", e$message),
@@ -3117,7 +3349,7 @@ server <- function(input, output, session) {
     req(analysis_results())
     validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
     datatable(
-      analysis_results()$index_ranking,
+      analysis_results()$final_decision,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
@@ -3148,6 +3380,17 @@ server <- function(input, output, session) {
     )
     datatable(
       analysis_results()$lsd_wide,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$heritability_gain_table <- renderDT({
+    req(analysis_results())
+    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    validate(
+      need(nrow(analysis_results()$heritability_gain) > 0, "Heritability table was not generated.")
+    )
+    datatable(
+      analysis_results()$heritability_gain,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
