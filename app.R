@@ -590,6 +590,177 @@ empty_plot <- function(message_text) {
     annotate("text", x = 0, y = 0, label = message_text, size = 5) +
     theme_void()
 }
+plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = NULL) {
+  if (is.null(heritability_gain) || nrow(heritability_gain) == 0) {
+    return(empty_plot("Run LPSI analysis to view genetic gain."))
+  }
+  valid_gain <- heritability_gain %>%
+    filter(
+      is.finite(Mean),
+      is.finite(Phenotypic_variance),
+      Phenotypic_variance > 0,
+      is.finite(Genetic_advance)
+    )
+  if (nrow(valid_gain) == 0) {
+    return(empty_plot("Genetic gain curve needs valid phenotypic variance and genetic advance."))
+  }
+  if (is.null(trait_name) || !trait_name %in% valid_gain$Trait) {
+    trait_name <- valid_gain$Trait[1]
+  }
+
+  gain_row <- valid_gain %>% filter(Trait == trait_name) %>% slice(1)
+  direction <- trait_info %>%
+    filter(Trait == trait_name) %>%
+    pull(Direction)
+  target_value <- trait_info %>%
+    filter(Trait == trait_name) %>%
+    pull(Target_value)
+  target_value <- if (length(target_value) == 0) NA_real_ else as.numeric(target_value[1])
+  direction <- if (length(direction) == 0 || is.na(direction[1])) {
+    "Higher better"
+  } else {
+    direction[1]
+  }
+
+  original_mean <- as.numeric(gain_row$Mean)
+  sd_p <- sqrt(as.numeric(gain_row$Phenotypic_variance))
+  ga <- abs(as.numeric(gain_row$Genetic_advance))
+  h2 <- as.numeric(gain_row$Broad_sense_H2)
+  select_pct <- as.numeric(gain_row$Selection_intensity_pct)
+  select_prop <- select_pct / 100
+  if (!is.finite(select_prop) || select_prop <= 0 || select_prop >= 1) {
+    select_prop <- lpsi_selection_intensity
+  }
+  sign_direction <- if (direction == "Target trait" && is.finite(target_value)) {
+    target_delta <- target_value - original_mean
+    ifelse(abs(target_delta) < 0.0001, 1, sign(target_delta))
+  } else if (direction == "Lower better") {
+    -1
+  } else {
+    1
+  }
+  selected_mean <- original_mean + sign_direction * ga
+  threshold <- original_mean + sign_direction * qnorm(1 - select_prop) * sd_p
+
+  x_min <- min(original_mean, selected_mean, threshold) - 3.6 * sd_p
+  x_max <- max(original_mean, selected_mean, threshold) + 3.6 * sd_p
+  curve_x <- seq(x_min, x_max, length.out = 500)
+  curves <- bind_rows(
+    data.frame(
+      x = curve_x,
+      density = dnorm(curve_x, original_mean, sd_p),
+      Population = "Original population"
+    ),
+    data.frame(
+      x = curve_x,
+      density = dnorm(curve_x, selected_mean, sd_p),
+      Population = "Expected selected population"
+    )
+  )
+  selected_tail <- data.frame(
+    x = curve_x,
+    density = dnorm(curve_x, original_mean, sd_p)
+  ) %>%
+    filter(if (sign_direction > 0) x >= threshold else x <= threshold)
+
+  y_max <- max(curves$density, na.rm = TRUE)
+  label_y <- y_max * 1.13
+  selected_label_y <- y_max * 1.24
+  gain_y <- -y_max * 0.10
+  intensity_y <- y_max * 0.36
+  mean_label_offset <- sd_p * 0.18
+
+  ggplot(curves, aes(x = x, y = density, fill = Population, color = Population)) +
+    geom_area(alpha = 0.50, position = "identity", linewidth = 0.4) +
+    geom_line(linewidth = 0.9) +
+    geom_area(
+      data = selected_tail,
+      aes(x = x, y = density),
+      inherit.aes = FALSE,
+      fill = "#F28E2B",
+      alpha = 0.45
+    ) +
+    geom_vline(xintercept = original_mean, linetype = "longdash", color = "gray35", linewidth = 0.8) +
+    geom_vline(xintercept = selected_mean, linetype = "longdash", color = "gray35", linewidth = 0.8) +
+    geom_vline(xintercept = threshold, linetype = "dotted", color = "#C95F18", linewidth = 0.9) +
+    annotate(
+      "segment",
+      x = original_mean,
+      xend = selected_mean,
+      y = gain_y,
+      yend = gain_y,
+      arrow = arrow(ends = "both", length = unit(0.16, "cm")),
+      color = "gray30",
+      linewidth = 0.8
+    ) +
+    annotate(
+      "text",
+      x = mean(c(original_mean, selected_mean)),
+      y = gain_y * 1.8,
+      label = paste0("Expected genetic gain = ", round(ga, 3)),
+      color = "gray20",
+      size = 3.7
+    ) +
+    annotate(
+      "text",
+      x = original_mean - sign_direction * mean_label_offset,
+      y = label_y,
+      label = "Average performance\n(original)",
+      color = "gray15",
+      size = 3.8,
+      lineheight = 0.95
+    ) +
+    annotate(
+      "text",
+      x = selected_mean + sign_direction * mean_label_offset,
+      y = selected_label_y,
+      label = "Average performance\n(selected)",
+      color = "gray15",
+      size = 3.8,
+      lineheight = 0.95
+    ) +
+    annotate(
+      "text",
+      x = threshold,
+      y = intensity_y,
+      label = paste0("Selection intensity\n", round(select_pct, 1), "% selected"),
+      color = "#8B3F0F",
+      size = 3.4,
+      lineheight = 0.95
+    ) +
+    scale_fill_manual(values = c(
+      "Original population" = "#CFE8C5",
+      "Expected selected population" = "#58B947"
+    )) +
+    scale_color_manual(values = c(
+      "Original population" = "#557A50",
+      "Expected selected population" = "#1F6F2A"
+    )) +
+    coord_cartesian(ylim = c(gain_y * 2.2, y_max * 1.40), clip = "off") +
+    labs(
+      title = paste("Genetic gain response curve -", trait_name),
+      subtitle = paste0(
+        "H2 = ", round(h2, 3),
+        " | Phenotypic SD = ", round(sd_p, 3),
+        " | Direction: ", direction
+      ),
+      x = "Trait value",
+      y = NULL,
+      fill = NULL,
+      color = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(color = "gray35"),
+      legend.position = "top",
+      legend.justification = "right",
+      panel.grid = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.margin = margin(t = 12, r = 22, b = 28, l = 16)
+    )
+}
 make_diagnostic_plot <- function(diag, trait, plot_type) {
   df <- diag$data
   if (!trait %in% names(df)) {
@@ -2834,6 +3005,14 @@ ui <- page_navbar(
           input_id = "plot_view",
           selected = "lpsi_ranking_plot",
           group_controls = list(
+            "LPSI" = conditionalPanel(
+              "input.plot_view == 'lpsi_gain_curve'",
+              selectInput(
+                inputId = "lpsi_gain_trait",
+                label = "Choose gain trait",
+                choices = NULL
+              )
+            ),
             "MET" = selectInput(
               inputId = "met_plot_trait",
               label = "Choose trait",
@@ -2843,7 +3022,8 @@ ui <- page_navbar(
           groups = list(
             "LPSI" = c(
               "Ranking" = "lpsi_ranking_plot",
-              "Superiority" = "lpsi_heatmap"
+              "Superiority" = "lpsi_heatmap",
+              "Genetic gain" = "lpsi_gain_curve"
             ),
             "MET" = c(
               "Environment Correlation" = "met_env_cor",
@@ -3000,13 +3180,25 @@ server <- function(input, output, session) {
     req(input$plot_view)
     view <- input$plot_view
 
-    if (view %in% c("lpsi_ranking_plot", "lpsi_heatmap")) {
+    if (view %in% c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_gain_curve")) {
       req(analysis_results())
       validate(need(analysis_used() == "LPSI", "Run LPSI analysis before downloading this chart."))
       if (view == "lpsi_ranking_plot") {
         return(list(
           plot = analysis_results()$ranking_plot,
           name = "LPSI_ranking"
+        ))
+      }
+      if (view == "lpsi_gain_curve") {
+        gain_trait <- input$lpsi_gain_trait
+        validate(need(!is.null(gain_trait) && gain_trait != "", "Choose a trait for the genetic gain chart."))
+        return(list(
+          plot = plot_genetic_gain_curve(
+            analysis_results()$heritability_gain,
+            analysis_results()$trait_info,
+            gain_trait
+          ),
+          name = paste0("LPSI_genetic_gain_", gsub("[^A-Za-z0-9_-]+", "_", gain_trait))
         ))
       }
       heatmap <- analysis_results()$heatmap_plot
@@ -3066,6 +3258,7 @@ server <- function(input, output, session) {
       view,
       lpsi_ranking_plot = "ranking_plot",
       lpsi_heatmap = "heatmap_plot",
+      lpsi_gain_curve = "gain_curve_plot",
       met_selection_plot = "met_selection_plot",
       met_fw_plot = "met_fw_plot",
       met_fw_regression = "met_fw_regression_plot",
@@ -3211,6 +3404,12 @@ server <- function(input, output, session) {
     updateSelectInput(
       session = session,
       inputId = "eval_trait",
+      choices = traits,
+      selected = traits[1]
+    )
+    updateSelectInput(
+      session = session,
+      inputId = "lpsi_gain_trait",
       choices = traits,
       selected = traits[1]
     )
@@ -3445,6 +3644,23 @@ server <- function(input, output, session) {
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$LPSI <- res
+        gain_traits <- res$heritability_gain %>%
+          filter(
+            is.finite(Mean),
+            is.finite(Phenotypic_variance),
+            Phenotypic_variance > 0,
+            is.finite(Genetic_advance)
+          ) %>%
+          pull(Trait)
+        if (length(gain_traits) == 0) {
+          gain_traits <- res$trait_info$Trait
+        }
+        updateSelectInput(
+          session = session,
+          inputId = "lpsi_gain_trait",
+          choices = gain_traits,
+          selected = gain_traits[1]
+        )
         analysis_message("LPSI analysis complete. Check the Result and Plot navbars.")
         showNotification("LPSI analysis complete.", type = "message")
       } else {
@@ -3614,6 +3830,16 @@ server <- function(input, output, session) {
       grid::grid.newpage()
       grid::grid.draw(analysis_results()$heatmap_plot$gtable)
     }
+  }, res = 96, execOnResize = TRUE)
+  output$gain_curve_plot <- renderPlot({
+    req(analysis_results())
+    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this plot."))
+    validate(need(!is.null(input$lpsi_gain_trait) && input$lpsi_gain_trait != "", "Choose a trait for the genetic gain chart."))
+    print(plot_genetic_gain_curve(
+      analysis_results()$heritability_gain,
+      analysis_results()$trait_info,
+      input$lpsi_gain_trait
+    ))
   }, res = 96, execOnResize = TRUE)
   output$met_model_summary_table <- renderDT({
     datatable(met_result_for_table()$model_summary, options = list(pageLength = 20, scrollX = TRUE))
