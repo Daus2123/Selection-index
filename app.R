@@ -21,6 +21,9 @@ options(shiny.maxRequestSize = 50 * 1024^2)
 # Standalone mating-design analysis functions
 source("mating_design_module.R", local = TRUE)
 
+# Source-safe breeding gain analysis functions
+source("Breeding Modul.R", local = TRUE)
+
 
 # User settings
 id_col  <- "Variety"
@@ -30,7 +33,7 @@ weight_row_labels <- c("WEIGHT", "WEIGHTS", "IMPORTANCE", "IMPORTANT")
 direction_row_labels <- c("DIRECTION", "DIRECTIONS", "TRAIT_DIRECTION")
 priority_weight_cutoff <- 4
 advance_index_cutoff <- 0
-retest_index_cutoff  <- -0.20
+retest_index_cutoff  <- 0
 priority_advance_cutoff_pct <- 0
 priority_severe_weak_pct <- -10
 lpsi_selection_intensity <- 0.10
@@ -200,11 +203,22 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("02", "gca", get_mating_result_table(results, "gca"))
     add_sheet("03", "sca", get_mating_result_table(results, "sca"))
     add_sheet("04", "variance", get_mating_result_table(results, "variance"))
+  } else if (analysis_type == "BREEDING") {
+    add_sheet("00", "settings", results$settings)
+    add_sheet("01", "genetic_stats", results$genetic_stats)
+    add_sheet("02", "response_year", results$response_per_year)
+    if (!is.null(results$realized_gain) && nrow(results$realized_gain) > 0) {
+      add_sheet("03", "realized_gain", results$realized_gain)
+    }
+    if (!is.null(results$generation_stats) && nrow(results$generation_stats) > 0) {
+      add_sheet("04", "generation", results$generation_stats)
+    }
   } else if (analysis_type == "LPSI") {
     add_sheet("01", "summary", results$trait_info)
     add_sheet("02", "anova", results$anova_full)
     add_sheet("03", "mean_comparison", results$lsd_wide)
-    add_sheet("04", "superiority", results$superiority_index)
+    add_sheet("04", "superiority_mean", results$superiority_index)
+    add_sheet("04b", "superiority_by_check", results$superiority_by_check)
     add_sheet("05", "selection_index", results$index_ranking)
     add_sheet("06", "decision", results$final_decision)
     add_sheet("07", "heritability_gain", results$heritability_gain)
@@ -664,11 +678,17 @@ plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = 
     filter(if (sign_direction > 0) x >= threshold else x <= threshold)
 
   y_max <- max(curves$density, na.rm = TRUE)
-  label_y <- y_max * 1.13
-  selected_label_y <- y_max * 1.24
-  gain_y <- -y_max * 0.10
-  intensity_y <- y_max * 0.36
-  mean_label_offset <- sd_p * 0.18
+  original_peak_y <- dnorm(original_mean, original_mean, sd_p)
+  selected_peak_y <- dnorm(selected_mean, selected_mean, sd_p)
+  threshold_y <- dnorm(threshold, original_mean, sd_p)
+  original_label_y <- original_peak_y * 1.05
+  selected_label_y <- selected_peak_y * 1.05
+  gain_y <- -y_max * 0.12
+  gain_label_y <- gain_y * 1.80
+  intensity_y <- gain_y * 0.65
+  gain_label_x <- mean(c(original_mean, selected_mean))
+  intensity_label_x <- threshold + sign_direction * sd_p * 0.16
+  intensity_label_hjust <- ifelse(sign_direction > 0, 0, 1)
 
   ggplot(curves, aes(x = x, y = density, fill = Population, color = Population)) +
     geom_area(alpha = 0.50, position = "identity", linewidth = 0.4) +
@@ -680,9 +700,37 @@ plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = 
       fill = "#F28E2B",
       alpha = 0.45
     ) +
-    geom_vline(xintercept = original_mean, linetype = "longdash", color = "gray35", linewidth = 0.8) +
-    geom_vline(xintercept = selected_mean, linetype = "longdash", color = "gray35", linewidth = 0.8) +
-    geom_vline(xintercept = threshold, linetype = "dotted", color = "#C95F18", linewidth = 0.9) +
+    geom_hline(yintercept = 0, color = "gray10", linewidth = 0.45) +
+    annotate(
+      "segment",
+      x = original_mean,
+      xend = original_mean,
+      y = 0,
+      yend = original_peak_y,
+      linetype = "longdash",
+      color = "gray35",
+      linewidth = 0.8
+    ) +
+    annotate(
+      "segment",
+      x = selected_mean,
+      xend = selected_mean,
+      y = 0,
+      yend = selected_peak_y,
+      linetype = "longdash",
+      color = "gray35",
+      linewidth = 0.8
+    ) +
+    annotate(
+      "segment",
+      x = threshold,
+      xend = threshold,
+      y = 0,
+      yend = threshold_y,
+      linetype = "dotted",
+      color = "#C95F18",
+      linewidth = 0.9
+    ) +
     annotate(
       "segment",
       x = original_mean,
@@ -695,38 +743,44 @@ plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = 
     ) +
     annotate(
       "text",
-      x = mean(c(original_mean, selected_mean)),
-      y = gain_y * 1.8,
+      x = gain_label_x,
+      y = gain_label_y,
       label = paste0("Expected genetic gain = ", round(ga, 3)),
       color = "gray20",
-      size = 3.7
+      size = 3.7,
+      hjust = 0.5
     ) +
     annotate(
       "text",
-      x = original_mean - sign_direction * mean_label_offset,
-      y = label_y,
-      label = "Average performance\n(original)",
+      x = original_mean,
+      y = original_label_y,
+      label = "Average\nperformance\n(original)",
       color = "gray15",
       size = 3.8,
-      lineheight = 0.95
+      lineheight = 0.95,
+      hjust = 0.5,
+      vjust = 0
     ) +
     annotate(
       "text",
-      x = selected_mean + sign_direction * mean_label_offset,
+      x = selected_mean,
       y = selected_label_y,
-      label = "Average performance\n(selected)",
+      label = "Average\nperformance\n(selected)",
       color = "gray15",
       size = 3.8,
-      lineheight = 0.95
+      lineheight = 0.95,
+      hjust = 0.5,
+      vjust = 0
     ) +
     annotate(
       "text",
-      x = threshold,
+      x = intensity_label_x,
       y = intensity_y,
-      label = paste0("Selection intensity\n", round(select_pct, 1), "% selected"),
+      label = paste0("Selection intensity = ", round(select_pct, 1), "%"),
       color = "#8B3F0F",
       size = 3.4,
-      lineheight = 0.95
+      lineheight = 0.95,
+      hjust = intensity_label_hjust
     ) +
     scale_fill_manual(values = c(
       "Original population" = "#CFE8C5",
@@ -1016,11 +1070,14 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
     ungroup() %>%
     dplyr::select(ID, Original_ID, Selection_Index) %>%
     arrange(desc(Selection_Index))
-  check_index <- index_df %>%
+  check_index_details <- index_df %>%
     filter(ID %in% check_labels) %>%
+    arrange(match(ID, check_labels)) %>%
+    dplyr::select(ID, Original_ID, Selection_Index)
+  check_index <- check_index_details %>%
     summarise(Check_index = mean(Selection_Index, na.rm = TRUE)) %>%
     pull(Check_index)
-  if (length(check_index) == 0) {
+  if (length(check_index) == 0 || !is.finite(check_index)) {
     stop("Check index not found.")
   }
   index_df <- index_df %>%
@@ -1060,6 +1117,11 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
     function(tr) mean(as.numeric(check_actual[[tr]]), na.rm = TRUE),
     numeric(1)
   )
+  superiority_benchmark_label <- if (length(check_labels) > 1) {
+    paste0("Mean of selected checks (", check_original_label, ")")
+  } else {
+    paste0("Check ", check_original_label)
+  }
   calc_superiority_pct <- function(candidate, check, trait_name) {
     if (is.na(check)) {
       return(NA_real_)
@@ -1090,7 +1152,56 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
     mutate(across(
       all_of(trait_cols),
       ~ round(.x, 1)
-    ))
+    )) %>%
+    mutate(
+      Check_Benchmark = superiority_benchmark_label,
+      .after = Original_ID
+    )
+  candidate_actual_long <- actual_means %>%
+    filter(!ID %in% check_labels) %>%
+    dplyr::select(ID, Original_ID, all_of(trait_cols)) %>%
+    pivot_longer(
+      cols = all_of(trait_cols),
+      names_to = "Trait",
+      values_to = "Candidate_Value"
+    )
+  check_actual_long <- check_actual %>%
+    dplyr::select(ID, Original_ID, all_of(trait_cols)) %>%
+    rename(
+      Check_ID = ID,
+      Check_Original_ID = Original_ID
+    ) %>%
+    pivot_longer(
+      cols = all_of(trait_cols),
+      names_to = "Trait",
+      values_to = "Check_Value"
+    )
+  superiority_by_check_long <- candidate_actual_long %>%
+    left_join(
+      check_actual_long,
+      by = "Trait",
+      relationship = "many-to-many"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      Superiority_pct = calc_superiority_pct(
+        Candidate_Value,
+        Check_Value,
+        Trait
+      )
+    ) %>%
+    ungroup() %>%
+    mutate(Superiority_pct = round(Superiority_pct, 1)) %>%
+    dplyr::select(
+      ID,
+      Original_ID,
+      Check_ID,
+      Check_Original_ID,
+      Trait,
+      Candidate_Value,
+      Check_Value,
+      Superiority_pct
+    )
   if (length(priority_traits) > 0 && nrow(superiority_df) > 0) {
     priority_summary <- superiority_df %>%
       dplyr::select(ID, Original_ID, all_of(priority_traits)) %>%
@@ -1210,6 +1321,43 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
     "DISCARD" = "#999999"
   )
   if (nrow(final_decision) > 0) {
+    check_line_palette <- data.frame(
+      Color_name = c(
+        "Gray", "Blue", "Purple", "Teal", "Brown",
+        "Orange", "Pink", "Dark green"
+      ),
+      Line_color = c(
+        "#6F6F6F", "#2F6FDB", "#8E44AD", "#00897B", "#795548",
+        "#F39C12", "#C2185B", "#2E7D32"
+      ),
+      stringsAsFactors = FALSE
+    )
+    check_index_details <- check_index_details %>%
+      mutate(
+        Check_order = row_number(),
+        Color_name = check_line_palette$Color_name[
+          ((Check_order - 1) %% nrow(check_line_palette)) + 1
+        ],
+        Line_color = check_line_palette$Line_color[
+          ((Check_order - 1) %% nrow(check_line_palette)) + 1
+        ]
+      )
+    check_line_text <- paste0(
+      check_index_details$Color_name,
+      " dotted = ",
+      check_index_details$Original_ID
+    )
+    check_line_note <- if (nrow(check_index_details) > 1) {
+      paste0(
+        "Red dashed = mean checks | ",
+        paste(check_line_text, collapse = " | ")
+      )
+    } else {
+      paste0(
+        "Red dashed = check ",
+        check_original_label
+      )
+    }
     p_index <- ggplot(
       final_decision,
       aes(
@@ -1219,6 +1367,17 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
       )
     ) +
       geom_col(width = 0.58) +
+      {
+        if (nrow(check_index_details) > 1) {
+          geom_hline(
+            data = check_index_details,
+            aes(yintercept = Selection_Index, color = Line_color),
+            inherit.aes = FALSE,
+            linetype = "dotted",
+            linewidth = 0.55
+          )
+        }
+      } +
       geom_hline(
         yintercept = check_index,
         linetype = "dashed",
@@ -1237,17 +1396,14 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
         size = 3.0
       ) +
       scale_fill_manual(values = decision_colors) +
+      scale_color_identity() +
       scale_y_continuous(
         expand = expansion(mult = c(0.12, 0.25))
       ) +
       coord_flip() +
       labs(
         title = "Hybrid selection index ranking",
-        subtitle = paste0(
-          "Dashed line = check ",
-          check_original_label,
-          " | Label = selection index and advantage over check"
-        ),
+        subtitle = check_line_note,
         x = "Hybrid ID",
         y = "Weighted standardized selection index",
         fill = NULL
@@ -1273,51 +1429,62 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
       theme_void()
   }
   heatmap_plot <- NULL
-  if (nrow(superiority_df) > 0) {
-    sup_mat <- superiority_df %>%
-      dplyr::select(Original_ID, all_of(trait_cols)) %>%
-      column_to_rownames("Original_ID") %>%
-      as.matrix()
-    storage.mode(sup_mat) <- "numeric"
-    sup_mat <- sup_mat[rowSums(!is.na(sup_mat)) > 0, , drop = FALSE]
-    sup_mat <- sup_mat[, colSums(!is.na(sup_mat)) > 0, drop = FALSE]
-    if (nrow(sup_mat) >= 1 && ncol(sup_mat) >= 1) {
-      sup_mat_horizontal <- t(sup_mat)
-      max_abs_sup <- max(abs(sup_mat_horizontal), na.rm = TRUE)
-      if (!is.finite(max_abs_sup) || max_abs_sup < 0.0001) {
-        max_abs_sup <- 1
-      }
-      col_sup <- colorRampPalette(
-        c("#D85A30", "white", "#1D9E75")
-      )(101)
-      breaks_sup <- seq(
-        -max_abs_sup,
-        max_abs_sup,
-        length.out = 102
-      )
-      heatmap_plot <- pheatmap(
-        sup_mat_horizontal,
-        color = col_sup,
-        breaks = breaks_sup,
-        cluster_rows = FALSE,
-        cluster_cols = ifelse(ncol(sup_mat_horizontal) > 1, TRUE, FALSE),
-        border_color = "white",
-        fontsize = 9,
-        fontsize_row = 10,
-        fontsize_col = 8,
-        angle_col = 90,
-        display_numbers = TRUE,
-        number_format = "%.1f%%",
-        number_color = "black",
-        na_col = "grey90",
-        main = paste0(
-          "Superiority index (%) vs check ",
-          check_original_label,
-          "\nGreen = better than check | Red = worse than check"
-        ),
-        silent = TRUE
-      )
+  heatmap_data <- superiority_by_check_long %>%
+    filter(!is.na(Superiority_pct))
+  if (nrow(heatmap_data) > 0) {
+    max_abs_sup <- max(abs(heatmap_data$Superiority_pct), na.rm = TRUE)
+    if (!is.finite(max_abs_sup) || max_abs_sup < 0.0001) {
+      max_abs_sup <- 1
     }
+    hybrid_levels <- final_decision %>%
+      arrange(desc(Selection_Index)) %>%
+      pull(Original_ID)
+    if (length(hybrid_levels) == 0) {
+      hybrid_levels <- unique(heatmap_data$Original_ID)
+    }
+    check_levels <- check_index_details$Original_ID
+    heatmap_data <- heatmap_data %>%
+      mutate(
+        Original_ID = factor(Original_ID, levels = hybrid_levels),
+        Trait = factor(Trait, levels = rev(trait_cols)),
+        Check_Original_ID = factor(Check_Original_ID, levels = check_levels),
+        Cell_label = paste0(sprintf("%.1f", Superiority_pct), "%")
+      )
+    heatmap_plot <- ggplot(
+      heatmap_data,
+      aes(x = Original_ID, y = Trait, fill = Superiority_pct)
+    ) +
+      geom_tile(color = "white", linewidth = 0.25) +
+      geom_text(aes(label = Cell_label), size = 2.4, color = "gray10") +
+      facet_grid(Check_Original_ID ~ .) +
+      scale_fill_gradient2(
+        low = "#D85A30",
+        mid = "white",
+        high = "#1D9E75",
+        midpoint = 0,
+        limits = c(-max_abs_sup, max_abs_sup)
+      ) +
+      labs(
+        title = "Superiority index (%) by selected check",
+        subtitle = paste0(
+          "Each panel uses its own check as the reference. ",
+          "Green = better than that panel's check; red = worse."
+        ),
+        x = "Hybrid ID",
+        y = NULL,
+        fill = "% vs check"
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.5),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.text.y = element_text(size = 9),
+        strip.text.y = element_text(face = "bold"),
+        panel.grid = element_blank(),
+        legend.position = "right",
+        plot.margin = margin(t = 8, r = 10, b = 8, l = 8)
+      )
   }
   anova_full <- data.frame()
   if (run_simple_anova) {
@@ -1587,8 +1754,10 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL) {
     standardized_scores = std_means,
     weight_table = weight_table,
     index_ranking = index_df,
+    check_index_details = check_index_details,
     actual_adjusted_means = actual_means,
     superiority_index = superiority_df,
+    superiority_by_check = superiority_by_check_long,
     priority_summary = priority_summary,
     final_decision = final_decision,
     heritability_gain = heritability_gain,
@@ -2830,6 +2999,10 @@ ui <- page_navbar(
                 tags$span(class = "analysis-description", "Compare parents and cross combinations")
               ),
               tags$span(
+                tags$span(class = "analysis-name", "Breeding Analysis"),
+                tags$span(class = "analysis-description", "Track heritability, genetic gain, and response per year")
+              ),
+              tags$span(
                 tags$span(class = "analysis-name", "LPSI"),
                 tags$span(class = "analysis-description", "Blend every trait into one selection score")
               ),
@@ -2838,7 +3011,7 @@ ui <- page_navbar(
                 tags$span(class = "analysis-description", "Compare performance and stability across locations")
               )
             ),
-            choiceValues = c("MATING", "LPSI", "MET"),
+            choiceValues = c("MATING", "BREEDING", "LPSI", "MET"),
             selected = "MATING"
           )
         ),
@@ -2863,7 +3036,14 @@ ui <- page_navbar(
           )
         ),
         conditionalPanel(
-          condition = "input.analysis_method == 'LPSI' || input.analysis_method == 'MET'",
+          condition = "input.analysis_method == 'BREEDING'",
+          tags$div(
+            class = "control-section",
+            uiOutput("breeding_column_inputs")
+          )
+        ),
+        conditionalPanel(
+          condition = "input.analysis_method == 'MET'",
           tags$div(
             class = "control-section",
             uiOutput("check_variety_inputs")
@@ -2905,6 +3085,7 @@ ui <- page_navbar(
           input_id = "result_view",
           selected = "mating_anova",
           group_controls = list(
+            "One overall ranking (LPSI)" = uiOutput("lpsi_benchmark_check_inputs"),
             "Across locations (MET)" = selectInput(
               inputId = "met_result_trait",
               label = "Choose trait",
@@ -2918,11 +3099,18 @@ ui <- page_navbar(
               "SCA - cross effects" = "mating_sca",
               "Variance breakdown" = "mating_variance"
             ),
+            "Breeding progress" = c(
+              "Genetic parameters" = "breeding_stats",
+              "Response per year" = "breeding_response",
+              "Realized gain" = "breeding_realized",
+              "Generation summary" = "breeding_generation"
+            ),
             "One overall ranking (LPSI)" = c(
               "Summary" = "lpsi_trait",
               "ANOVA" = "lpsi_anova",
               "Mean comparison" = "lpsi_lsd",
               "Superiority" = "lpsi_superiority",
+              "Superiority by check" = "lpsi_superiority_by_check",
               "Heritability & gain" = "lpsi_heritability",
               "Selected varieties" = "lpsi_ranking"
             ),
@@ -2978,9 +3166,14 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'mating_gca'", DTOutput("mating_gca_table")),
         conditionalPanel("input.result_view == 'mating_sca'", DTOutput("mating_sca_table")),
         conditionalPanel("input.result_view == 'mating_variance'", DTOutput("mating_variance_table")),
+        conditionalPanel("input.result_view == 'breeding_stats'", DTOutput("breeding_stats_table")),
+        conditionalPanel("input.result_view == 'breeding_response'", DTOutput("breeding_response_table")),
+        conditionalPanel("input.result_view == 'breeding_realized'", DTOutput("breeding_realized_table")),
+        conditionalPanel("input.result_view == 'breeding_generation'", DTOutput("breeding_generation_table")),
         conditionalPanel("input.result_view == 'lpsi_trait'", DTOutput("trait_table")),
         conditionalPanel("input.result_view == 'lpsi_ranking'", DTOutput("index_table")),
         conditionalPanel("input.result_view == 'lpsi_superiority'", DTOutput("superiority_table")),
+        conditionalPanel("input.result_view == 'lpsi_superiority_by_check'", DTOutput("superiority_by_check_table")),
         conditionalPanel("input.result_view == 'lpsi_anova'", DTOutput("anova_full_table")),
         conditionalPanel("input.result_view == 'lpsi_lsd'", DTOutput("lsd_wide_table")),
         conditionalPanel("input.result_view == 'lpsi_heritability'", DTOutput("heritability_gain_table")),
@@ -3013,6 +3206,14 @@ ui <- page_navbar(
                 choices = NULL
               )
             ),
+            "Breeding Analysis" = conditionalPanel(
+              "input.plot_view == 'breeding_trend' || input.plot_view == 'breeding_distribution'",
+              selectInput(
+                inputId = "breeding_plot_trait",
+                label = "Choose trait",
+                choices = NULL
+              )
+            ),
             "MET" = selectInput(
               inputId = "met_plot_trait",
               label = "Choose trait",
@@ -3020,6 +3221,12 @@ ui <- page_navbar(
             )
           ),
           groups = list(
+            "Breeding Analysis" = c(
+              "Genetic trend" = "breeding_trend",
+              "GAM" = "breeding_gam",
+              "Heritability heatmap" = "breeding_h2_heatmap",
+              "Distribution shift" = "breeding_distribution"
+            ),
             "LPSI" = c(
               "Ranking" = "lpsi_ranking_plot",
               "Superiority" = "lpsi_heatmap",
@@ -3115,6 +3322,7 @@ server <- function(input, output, session) {
   analysis_message <- reactiveVal("No analysis has been run yet.")
   saved_results <- reactiveValues(
     MATING = NULL,
+    BREEDING = NULL,
     LPSI = NULL,
     MET = NULL
   )
@@ -3131,6 +3339,27 @@ server <- function(input, output, session) {
       paste("No", gsub("_", " ", table_type), "table is available for this mating design.")
     ))
     as.data.frame(table)
+  })
+  breeding_result <- reactive({
+    req(analysis_results())
+    validate(need(
+      analysis_used() == "BREEDING",
+      "Run Breeding Analysis to view this result."
+    ))
+    analysis_results()
+  })
+  lpsi_result <- reactive({
+    req(analysis_results(), uploaded_data())
+    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this result."))
+
+    benchmark_checks <- input$lpsi_benchmark_checks
+    if (is.null(benchmark_checks) || length(benchmark_checks) == 0) {
+      benchmark_checks <- analysis_results()$selected_checks
+    }
+    run_selection_pipeline(
+      uploaded_data(),
+      check_varieties = benchmark_checks
+    )
   })
   met_result_for_table <- reactive({
     req(analysis_results())
@@ -3181,11 +3410,11 @@ server <- function(input, output, session) {
     view <- input$plot_view
 
     if (view %in% c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_gain_curve")) {
-      req(analysis_results())
+      lpsi <- lpsi_result()
       validate(need(analysis_used() == "LPSI", "Run LPSI analysis before downloading this chart."))
       if (view == "lpsi_ranking_plot") {
         return(list(
-          plot = analysis_results()$ranking_plot,
+          plot = lpsi$ranking_plot,
           name = "LPSI_ranking"
         ))
       }
@@ -3194,18 +3423,76 @@ server <- function(input, output, session) {
         validate(need(!is.null(gain_trait) && gain_trait != "", "Choose a trait for the genetic gain chart."))
         return(list(
           plot = plot_genetic_gain_curve(
-            analysis_results()$heritability_gain,
-            analysis_results()$trait_info,
+            lpsi$heritability_gain,
+            lpsi$trait_info,
             gain_trait
           ),
           name = paste0("LPSI_genetic_gain_", gsub("[^A-Za-z0-9_-]+", "_", gain_trait))
         ))
       }
-      heatmap <- analysis_results()$heatmap_plot
+      heatmap <- lpsi$heatmap_plot
       validate(need(!is.null(heatmap), "The superiority heatmap is not available."))
       return(list(
-        plot = heatmap$gtable,
+        plot = heatmap,
         name = "LPSI_superiority_heatmap"
+      ))
+    }
+
+    if (view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution")) {
+      req(analysis_results())
+      validate(need(analysis_used() == "BREEDING", "Run Breeding Analysis before downloading this chart."))
+      trait_name <- input$breeding_plot_trait
+      generation_col <- input$breeding_generation_col
+      generation_stats <- analysis_results()$generation_stats
+
+      if (view == "breeding_trend") {
+        validate(need(
+          !is.null(generation_stats) && nrow(generation_stats) > 0,
+          "Genetic trend needs a generation/stage column."
+        ))
+        validate(need(!is.null(trait_name) && trait_name != "", "Choose a trait."))
+        trend_data <- generation_stats %>% filter(Trait == trait_name)
+        return(list(
+          plot = breeding_plot_genetic_trend(trend_data),
+          name = paste0("Breeding_genetic_trend_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
+        ))
+      }
+
+      if (view == "breeding_gam") {
+        return(list(
+          plot = breeding_plot_gam(
+            analysis_results()$genetic_stats,
+            x_col = "Trait",
+            title = "Genetic advance as percent of mean"
+          ),
+          name = "Breeding_GAM"
+        ))
+      }
+
+      if (view == "breeding_h2_heatmap") {
+        h2_data <- if (!is.null(generation_stats) && nrow(generation_stats) > 0) {
+          generation_stats
+        } else {
+          analysis_results()$genetic_stats %>% mutate(Generation = "Overall")
+        }
+        return(list(
+          plot = breeding_plot_heritability_heatmap(h2_data),
+          name = "Breeding_heritability_heatmap"
+        ))
+      }
+
+      validate(need(
+        !is.null(generation_col) && generation_col != "",
+        "Distribution shift needs a generation/stage column."
+      ))
+      validate(need(!is.null(trait_name) && trait_name != "", "Choose a trait."))
+      return(list(
+        plot = breeding_plot_distribution_shift(
+          uploaded_data(),
+          trait = trait_name,
+          generation_col = generation_col
+        ),
+        name = paste0("Breeding_distribution_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
       ))
     }
 
@@ -3259,6 +3546,10 @@ server <- function(input, output, session) {
       lpsi_ranking_plot = "ranking_plot",
       lpsi_heatmap = "heatmap_plot",
       lpsi_gain_curve = "gain_curve_plot",
+      breeding_trend = "breeding_trend_plot",
+      breeding_gam = "breeding_gam_plot",
+      breeding_h2_heatmap = "breeding_h2_heatmap_plot",
+      breeding_distribution = "breeding_distribution_plot",
       met_selection_plot = "met_selection_plot",
       met_fw_plot = "met_fw_plot",
       met_fw_regression = "met_fw_regression_plot",
@@ -3336,6 +3627,8 @@ server <- function(input, output, session) {
     }
     trait <- if (startsWith(view, "mating_")) {
       input$mating_trait_col
+    } else if (startsWith(view, "breeding_")) {
+      input$breeding_plot_trait
     } else if (startsWith(view, "met_")) {
       input$met_result_trait
     } else {
@@ -3351,10 +3644,15 @@ server <- function(input, output, session) {
       mating_gca = "GCA parent effects",
       mating_sca = "SCA cross effects",
       mating_variance = "Variance breakdown",
+      breeding_stats = "Breeding genetic parameters",
+      breeding_response = "Response per year",
+      breeding_realized = "Realized gain",
+      breeding_generation = "Generation summary",
       lpsi_trait = "Trait summary",
       lpsi_anova = "LPSI analysis of variance",
       lpsi_lsd = "Mean comparison",
-      lpsi_superiority = "Trait superiority",
+      lpsi_superiority = "Trait superiority vs mean check benchmark",
+      lpsi_superiority_by_check = "Trait superiority by selected check",
       lpsi_heritability = "Heritability and genetic gain",
       lpsi_ranking = "Selected varieties",
       met_variance = paste("Mixed model -", trait),
@@ -3378,6 +3676,11 @@ server <- function(input, output, session) {
         if (is.null(saved_results$MATING)) "pending" else "ready",
         "Mating_analysis_results.xlsx",
         "download_mating"
+      ),
+      export_row(
+        if (is.null(saved_results$BREEDING)) "pending" else "ready",
+        "Breeding_analysis_results.xlsx",
+        "download_breeding"
       ),
       export_row(
         if (is.null(saved_results$LPSI)) "pending" else "ready",
@@ -3413,6 +3716,12 @@ server <- function(input, output, session) {
       choices = traits,
       selected = traits[1]
     )
+    updateSelectInput(
+      session = session,
+      inputId = "breeding_plot_trait",
+      choices = traits,
+      selected = traits[1]
+    )
   })
   observe({
     req(uploaded_data())
@@ -3436,27 +3745,8 @@ server <- function(input, output, session) {
   })
   output$check_variety_inputs <- renderUI({
     req(uploaded_data(), input$analysis_method)
-    if (input$analysis_method == "MATING") {
+    if (input$analysis_method != "MET") {
       return(NULL)
-    }
-
-    if (input$analysis_method == "LPSI") {
-      prepared <- tryCatch({
-        prepare_excel_input(uploaded_data())
-      }, error = function(e) {
-        NULL
-      })
-      validate(need(!is.null(prepared), "Upload valid LPSI data before choosing checks."))
-      choices <- unique(clean_text(prepared$data[[id_col]]))
-      choices <- choices[!is.na(choices) & choices != ""]
-      return(selectizeInput(
-        inputId = "check_varieties",
-        label = "Check variety",
-        choices = choices,
-        selected = prepared$check_original_name,
-        multiple = TRUE,
-        options = list(placeholder = "Choose one or more check varieties")
-      ))
     }
 
     prepared <- tryCatch({
@@ -3468,12 +3758,47 @@ server <- function(input, output, session) {
     choices <- unique(clean_text(prepared$data$Genotype))
     choices <- choices[!is.na(choices) & choices != ""]
     selectizeInput(
-      inputId = "check_varieties",
-      label = "Check variety",
+      inputId = "met_reference_checks",
+      label = "Reference check",
       choices = choices,
       selected = character(0),
       multiple = TRUE,
       options = list(placeholder = "Optional: choose one or more check varieties")
+    )
+  })
+  output$lpsi_benchmark_check_inputs <- renderUI({
+    if (is.null(saved_results$LPSI) && !identical(analysis_used(), "LPSI")) {
+      return(NULL)
+    }
+    req(uploaded_data())
+    prepared <- tryCatch({
+      prepare_excel_input(uploaded_data())
+    }, error = function(e) {
+      NULL
+    })
+    if (is.null(prepared)) {
+      return(NULL)
+    }
+
+    choices <- unique(clean_text(prepared$data[[id_col]]))
+    choices <- choices[!is.na(choices) & choices != ""]
+    selected <- if (!is.null(saved_results$LPSI) && length(saved_results$LPSI$selected_checks) > 0) {
+      saved_results$LPSI$selected_checks
+    } else {
+      prepared$check_original_name
+    }
+    selected <- selected[selected %in% choices]
+    if (length(selected) == 0) {
+      selected <- prepared$check_original_name
+    }
+
+    selectizeInput(
+      inputId = "lpsi_benchmark_checks",
+      label = "Benchmark check",
+      choices = choices,
+      selected = selected,
+      multiple = TRUE,
+      options = list(placeholder = "Choose one or more check varieties")
     )
   })
   output$mating_column_inputs <- renderUI({
@@ -3551,6 +3876,135 @@ server <- function(input, output, session) {
       )
     }
   })
+  output$breeding_column_inputs <- renderUI({
+    req(uploaded_data())
+    data <- uploaded_data()
+    all_cols <- names(data)
+    numeric_cols <- all_cols[vapply(data, function(column) {
+      sum(!is.na(to_number(column))) > 0
+    }, logical(1))]
+    numeric_cols <- setdiff(
+      numeric_cols,
+      c("Rep", "Replication", "Block", "Cycle", "Generation", "Stage")
+    )
+    if (length(numeric_cols) == 0) {
+      numeric_cols <- all_cols
+    }
+
+    choose_default <- function(candidates, choices, fallback = 1, allow_empty = FALSE) {
+      matched <- candidates[candidates %in% choices]
+      if (length(matched) > 0) {
+        matched[1]
+      } else if (allow_empty) {
+        ""
+      } else {
+        choices[min(fallback, length(choices))]
+      }
+    }
+
+    genotype_default <- choose_default(
+      c(id_col, "Genotype", "genotype", "ID", "Hybrid", "Variety"),
+      all_cols
+    )
+    rep_default <- choose_default(
+      c(rep_col, "Replication", "Block", "Replicate"),
+      all_cols,
+      allow_empty = TRUE
+    )
+    generation_default <- choose_default(
+      c("Generation", "Stage", "Cycle", "Selection_Cycle", "selection_cycle"),
+      all_cols,
+      allow_empty = TRUE
+    )
+    cycle_group_default <- choose_default(
+      c("cycle_group", "Cycle_group", "CycleGroup", "Group", "Selection_group"),
+      all_cols,
+      allow_empty = TRUE
+    )
+    group_choices <- c("No realized-gain group" = "", all_cols)
+    generation_choices <- c("No generation/stage column" = "", all_cols)
+    rep_choices <- c("No replication column" = "", all_cols)
+
+    cycle_label_ui <- NULL
+    if (!is.null(input$breeding_cycle_group_col) && input$breeding_cycle_group_col != "") {
+      labels <- unique(clean_text(data[[input$breeding_cycle_group_col]]))
+      labels <- labels[!is.na(labels) & labels != ""]
+      if (length(labels) > 0) {
+        current_default <- if ("current_cycle" %in% labels) "current_cycle" else labels[1]
+        check_default <- if ("check_prior_cycle" %in% labels) {
+          "check_prior_cycle"
+        } else if (length(labels) >= 2) {
+          labels[2]
+        } else {
+          labels[1]
+        }
+        cycle_label_ui <- tagList(
+          selectInput(
+            "breeding_current_label", "Current-cycle label",
+            choices = labels,
+            selected = current_default
+          ),
+          selectInput(
+            "breeding_check_label", "Prior/check label",
+            choices = labels,
+            selected = check_default
+          ),
+          checkboxInput(
+            "breeding_higher_is_better",
+            "Higher values are better for realized gain",
+            value = TRUE
+          )
+        )
+      }
+    }
+
+    tagList(
+      selectInput(
+        "breeding_genotype_col", "Genotype / variety column",
+        all_cols,
+        selected = genotype_default
+      ),
+      selectInput(
+        "breeding_rep_col", "Replication column",
+        rep_choices,
+        selected = rep_default
+      ),
+      selectizeInput(
+        "breeding_trait_cols", "Traits",
+        choices = numeric_cols,
+        selected = numeric_cols[1],
+        multiple = TRUE,
+        options = list(placeholder = "Choose one or more traits")
+      ),
+      selectInput(
+        "breeding_generation_col", "Generation / stage column",
+        generation_choices,
+        selected = generation_default
+      ),
+      selectInput(
+        "breeding_cycle_group_col", "Current vs check group",
+        group_choices,
+        selected = cycle_group_default
+      ),
+      cycle_label_ui,
+      numericInput(
+        "breeding_selection_pct",
+        "Selection proportion (%)",
+        value = 5,
+        min = 0.1,
+        max = 99,
+        step = 0.5
+      ),
+      numericInput(
+        "breeding_years_per_cycle",
+        "Years per cycle",
+        value = 3,
+        min = 0.1,
+        max = 20,
+        step = 0.5
+      )
+    )
+  })
   output$diagnostic_plot <- renderPlot({
     req(diagnostic_data())
     req(input$eval_trait)
@@ -3626,12 +4080,108 @@ server <- function(input, output, session) {
       } else {
         analysis_message("Mating analysis failed. Please check the error message.")
       }
+    } else if (input$analysis_method == "BREEDING") {
+      req(input$breeding_genotype_col, input$breeding_trait_cols)
+      selection_proportion <- suppressWarnings(as.numeric(input$breeding_selection_pct) / 100)
+      years_per_cycle <- suppressWarnings(as.numeric(input$breeding_years_per_cycle))
+      if (!is.finite(selection_proportion) || selection_proportion <= 0 || selection_proportion >= 1) {
+        selection_proportion <- 0.05
+      }
+      if (!is.finite(years_per_cycle) || years_per_cycle <= 0) {
+        years_per_cycle <- 3
+      }
+      rep_col_used <- if (!is.null(input$breeding_rep_col) && input$breeding_rep_col != "") {
+        input$breeding_rep_col
+      } else {
+        NULL
+      }
+      generation_col_used <- if (!is.null(input$breeding_generation_col) && input$breeding_generation_col != "") {
+        input$breeding_generation_col
+      } else {
+        NULL
+      }
+      cycle_group_used <- if (!is.null(input$breeding_cycle_group_col) && input$breeding_cycle_group_col != "") {
+        input$breeding_cycle_group_col
+      } else {
+        NULL
+      }
+      current_label <- if (!is.null(cycle_group_used)) input$breeding_current_label else NULL
+      check_label <- if (!is.null(cycle_group_used)) input$breeding_check_label else NULL
+      if (
+        !is.null(cycle_group_used) &&
+          (is.null(current_label) || current_label == "" || is.null(check_label) || check_label == "")
+      ) {
+        cycle_group_used <- NULL
+        current_label <- NULL
+        check_label <- NULL
+      }
+
+      analysis_message("Running Breeding Analysis...")
+      res <- tryCatch({
+        out <- breeding_run_gain_pipeline(
+          data = uploaded_data(),
+          traits = input$breeding_trait_cols,
+          genotype = input$breeding_genotype_col,
+          replication = rep_col_used,
+          cycle_group_col = cycle_group_used,
+          current_label = current_label,
+          check_label = check_label,
+          selection_proportion = selection_proportion,
+          years_per_cycle = years_per_cycle,
+          higher_is_better = isTRUE(input$breeding_higher_is_better)
+        )
+        if (!is.null(generation_col_used)) {
+          out$generation_stats <- purrr::map_dfr(input$breeding_trait_cols, function(trait_name) {
+            breeding_compute_generation_stats(
+              data = uploaded_data(),
+              trait = trait_name,
+              genotype = input$breeding_genotype_col,
+              replication = rep_col_used,
+              generation_col = generation_col_used,
+              selection_proportion = selection_proportion
+            )
+          })
+        } else {
+          out$generation_stats <- data.frame()
+        }
+        out$settings <- data.frame(
+          Genotype_column = input$breeding_genotype_col,
+          Replication_column = ifelse(is.null(rep_col_used), "", rep_col_used),
+          Traits = paste(input$breeding_trait_cols, collapse = ", "),
+          Generation_column = ifelse(is.null(generation_col_used), "", generation_col_used),
+          Cycle_group_column = ifelse(is.null(cycle_group_used), "", cycle_group_used),
+          Selection_proportion_pct = selection_proportion * 100,
+          Years_per_cycle = years_per_cycle,
+          stringsAsFactors = FALSE
+        )
+        out
+      }, error = function(e) {
+        showNotification(
+          paste("Breeding Analysis failed:", e$message),
+          type = "error",
+          duration = NULL
+        )
+        NULL
+      })
+      analysis_results(res)
+      if (!is.null(res)) {
+        saved_results$BREEDING <- res
+        updateSelectInput(
+          session = session,
+          inputId = "breeding_plot_trait",
+          choices = input$breeding_trait_cols,
+          selected = input$breeding_trait_cols[1]
+        )
+        analysis_message("Breeding Analysis complete. Check the Result and Chart navbars.")
+        showNotification("Breeding Analysis complete.", type = "message")
+      } else {
+        analysis_message("Breeding Analysis failed. Please check the error message.")
+      }
     } else if (input$analysis_method == "LPSI") {
       analysis_message("Running LPSI analysis...")
       res <- tryCatch({
         run_selection_pipeline(
-          uploaded_data(),
-          check_varieties = input$check_varieties
+          uploaded_data()
         )
       }, error = function(e) {
         showNotification(
@@ -3671,7 +4221,7 @@ server <- function(input, output, session) {
       res <- tryCatch({
         run_met_all_traits(
           uploaded_data(),
-          check_varieties = input$check_varieties
+          check_varieties = input$met_reference_checks
         )
       }, error = function(e) {
         showNotification(
@@ -3744,101 +4294,174 @@ server <- function(input, output, session) {
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
-  output$trait_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+  output$breeding_stats_table <- renderDT({
+    result <- breeding_result()
     datatable(
-      analysis_results()$trait_info,
+      result$genetic_stats,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$breeding_response_table <- renderDT({
+    result <- breeding_result()
+    datatable(
+      result$response_per_year,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$breeding_realized_table <- renderDT({
+    result <- breeding_result()
+    validate(need(
+      !is.null(result$realized_gain) && nrow(result$realized_gain) > 0,
+      "Realized gain needs a current-vs-check group column and labels."
+    ))
+    datatable(
+      result$realized_gain,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$breeding_generation_table <- renderDT({
+    result <- breeding_result()
+    validate(need(
+      !is.null(result$generation_stats) && nrow(result$generation_stats) > 0,
+      "Generation summary needs a generation/stage column."
+    ))
+    datatable(
+      result$generation_stats,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$trait_table <- renderDT({
+    result <- lpsi_result()
+    datatable(
+      result$trait_info,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$final_table <- renderDT({
-    req(analysis_results())
+    result <- lpsi_result()
     datatable(
-      analysis_results()$final_decision,
+      result$final_decision,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$index_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    result <- lpsi_result()
     datatable(
-      analysis_results()$final_decision,
+      result$final_decision,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$superiority_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    result <- lpsi_result()
     datatable(
-      analysis_results()$superiority_index,
+      result$superiority_index,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
+  output$superiority_by_check_table <- renderDT({
+    result <- lpsi_result()
+    datatable(
+      result$superiority_by_check,
+      options = list(pageLength = 100, scrollX = TRUE)
+    )
+  })
   output$anova_full_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    result <- lpsi_result()
     validate(
-      need(nrow(analysis_results()$anova_full) > 0, "ANOVA table was not generated.")
+      need(nrow(result$anova_full) > 0, "ANOVA table was not generated.")
     )
     datatable(
-      analysis_results()$anova_full,
+      result$anova_full,
       options = list(pageLength = 100, scrollX = TRUE)
     )
   })
   output$lsd_wide_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    result <- lpsi_result()
     validate(
-      need(nrow(analysis_results()$lsd_wide) > 0, "LSD table was not generated.")
+      need(nrow(result$lsd_wide) > 0, "LSD table was not generated.")
     )
     datatable(
-      analysis_results()$lsd_wide,
+      result$lsd_wide,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$heritability_gain_table <- renderDT({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this table."))
+    result <- lpsi_result()
     validate(
-      need(nrow(analysis_results()$heritability_gain) > 0, "Heritability table was not generated.")
+      need(nrow(result$heritability_gain) > 0, "Heritability table was not generated.")
     )
     datatable(
-      analysis_results()$heritability_gain,
+      result$heritability_gain,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$adjusted_means_table <- renderDT({
-    req(analysis_results())
+    result <- lpsi_result()
     datatable(
-      analysis_results()$actual_adjusted_means,
+      result$actual_adjusted_means,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
   output$ranking_plot <- renderPlot({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this plot."))
-    print(analysis_results()$ranking_plot)
+    result <- lpsi_result()
+    print(result$ranking_plot)
   }, res = 96, execOnResize = TRUE)
   output$heatmap_plot <- renderPlot({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this plot."))
-    if (is.null(analysis_results()$heatmap_plot)) {
+    result <- lpsi_result()
+    if (is.null(result$heatmap_plot)) {
       plot.new()
       text(0.5, 0.5, "Heatmap could not be created.")
     } else {
-      grid::grid.newpage()
-      grid::grid.draw(analysis_results()$heatmap_plot$gtable)
+      draw_chart(result$heatmap_plot)
     }
   }, res = 96, execOnResize = TRUE)
   output$gain_curve_plot <- renderPlot({
-    req(analysis_results())
-    validate(need(analysis_used() == "LPSI", "Run LPSI analysis to view this plot."))
+    result <- lpsi_result()
     validate(need(!is.null(input$lpsi_gain_trait) && input$lpsi_gain_trait != "", "Choose a trait for the genetic gain chart."))
     print(plot_genetic_gain_curve(
-      analysis_results()$heritability_gain,
-      analysis_results()$trait_info,
+      result$heritability_gain,
+      result$trait_info,
       input$lpsi_gain_trait
+    ))
+  }, res = 96, execOnResize = TRUE)
+  output$breeding_trend_plot <- renderPlot({
+    result <- breeding_result()
+    validate(need(
+      !is.null(result$generation_stats) && nrow(result$generation_stats) > 0,
+      "Genetic trend needs a generation/stage column."
+    ))
+    validate(need(!is.null(input$breeding_plot_trait) && input$breeding_plot_trait != "", "Choose a trait."))
+    trend_data <- result$generation_stats %>% filter(Trait == input$breeding_plot_trait)
+    print(breeding_plot_genetic_trend(trend_data))
+  }, res = 96, execOnResize = TRUE)
+  output$breeding_gam_plot <- renderPlot({
+    result <- breeding_result()
+    print(breeding_plot_gam(
+      result$genetic_stats,
+      x_col = "Trait",
+      title = "Genetic advance as percent of mean"
+    ))
+  }, res = 96, execOnResize = TRUE)
+  output$breeding_h2_heatmap_plot <- renderPlot({
+    result <- breeding_result()
+    h2_data <- if (!is.null(result$generation_stats) && nrow(result$generation_stats) > 0) {
+      result$generation_stats
+    } else {
+      result$genetic_stats %>% mutate(Generation = "Overall")
+    }
+    print(breeding_plot_heritability_heatmap(h2_data))
+  }, res = 96, execOnResize = TRUE)
+  output$breeding_distribution_plot <- renderPlot({
+    result <- breeding_result()
+    validate(need(
+      !is.null(input$breeding_generation_col) && input$breeding_generation_col != "",
+      "Distribution shift needs a generation/stage column."
+    ))
+    validate(need(!is.null(input$breeding_plot_trait) && input$breeding_plot_trait != "", "Choose a trait."))
+    print(breeding_plot_distribution_shift(
+      uploaded_data(),
+      trait = input$breeding_plot_trait,
+      generation_col = input$breeding_generation_col
     ))
   }, res = 96, execOnResize = TRUE)
   output$met_model_summary_table <- renderDT({
@@ -3965,11 +4588,23 @@ server <- function(input, output, session) {
       write_analysis_workbook("MATING", saved_results$MATING, file)
     }
   )
+  output$download_breeding <- downloadHandler(
+    filename = function() paste0("Breeding_analysis_results_", Sys.Date(), ".xlsx"),
+    content = function(file) {
+      req(saved_results$BREEDING)
+      write_analysis_workbook("BREEDING", saved_results$BREEDING, file)
+    }
+  )
   output$download_lpsi <- downloadHandler(
     filename = function() paste0("LPSI_selection_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
       req(saved_results$LPSI)
-      write_analysis_workbook("LPSI", saved_results$LPSI, file)
+      result <- if (identical(analysis_used(), "LPSI")) {
+        lpsi_result()
+      } else {
+        saved_results$LPSI
+      }
+      write_analysis_workbook("LPSI", result, file)
     }
   )
   output$download_met <- downloadHandler(
@@ -3984,6 +4619,7 @@ server <- function(input, output, session) {
     content = function(file) {
       available <- c(
         MATING = !is.null(saved_results$MATING),
+        BREEDING = !is.null(saved_results$BREEDING),
         LPSI = !is.null(saved_results$LPSI),
         MET = !is.null(saved_results$MET)
       )
@@ -3996,14 +4632,19 @@ server <- function(input, output, session) {
       export_files <- character()
       export_names <- c(
         MATING = "Mating_analysis_results.xlsx",
+        BREEDING = "Breeding_analysis_results.xlsx",
         LPSI = "LPSI_selection_results.xlsx",
         MET = "MET_across_locations_results.xlsx"
       )
       for (analysis_type in names(available)[available]) {
         path <- file.path(temp_dir, export_names[[analysis_type]])
+        result <- saved_results[[analysis_type]]
+        if (analysis_type == "LPSI" && identical(analysis_used(), "LPSI")) {
+          result <- lpsi_result()
+        }
         write_analysis_workbook(
           analysis_type,
-          saved_results[[analysis_type]],
+          result,
           path
         )
         export_files <- c(export_files, path)
