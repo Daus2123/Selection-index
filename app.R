@@ -5513,6 +5513,18 @@ server <- function(input, output, session) {
     tryCatch(make_diagnostic_data(data)$trait_cols, error = function(e) character(0))
   }
   safe_met_traits <- function() {
+    if (!is.null(analysis_results()) && identical(analysis_used(), "MET")) {
+      completed_traits <- analysis_results()$met_trait_names
+      if (!is.null(completed_traits) && length(completed_traits) > 0) {
+        return(as.character(completed_traits))
+      }
+    }
+    if (!is.null(saved_results$MET)) {
+      completed_traits <- saved_results$MET$met_trait_names
+      if (!is.null(completed_traits) && length(completed_traits) > 0) {
+        return(as.character(completed_traits))
+      }
+    }
     data <- safe_uploaded_data()
     if (is.null(data)) return(character(0))
     tryCatch(get_met_trait_cols(data), error = function(e) character(0))
@@ -5598,11 +5610,6 @@ server <- function(input, output, session) {
       ),
       tags$div(
         class = "side-subpanel result-analysis-section",
-        selectInput(
-          "met_result_trait", "ACROSS LOCATIONS (MET) — CHOOSE TRAIT",
-          choices = safe_met_traits(),
-          selected = input$met_result_trait
-        ),
         selectInput(
           "result_met_view", "Choose result",
           choices = c(
