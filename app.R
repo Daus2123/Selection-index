@@ -3632,16 +3632,18 @@ sidebar_button_menu <- function(input_id, choices, selected = NULL, style = "mod
   )
 }
 
-sidebar_detail_panel <- function(title, choices = NULL, input_id = NULL, selected = NULL, controls = NULL, style = "detail") {
+sidebar_detail_panel <- function(title, choices = NULL, input_id = NULL, selected = NULL, controls = NULL, style = "slicer") {
   tags$div(
     class = "side-subpanel detail-subpanel",
     if (!is.null(choices) && !is.null(input_id)) {
-      selectInput(
-        inputId = input_id,
-        label = title,
-        choices = choices,
-        selected = selected,
-        width = "100%"
+      tagList(
+        tags$div(class = "side-subpanel-title", title),
+        sidebar_button_menu(
+          input_id = input_id,
+          choices = choices,
+          selected = selected,
+          style = style
+        )
       )
     } else {
       tags$div(class = "side-subpanel-title", title)
@@ -5939,7 +5941,7 @@ server <- function(input, output, session) {
         choices = choices,
         input_id = "plot_view",
         selected = if (current %in% choices) current else unname(choices)[1],
-        style = "sub"
+        style = "slicer"
       )
     )
   })
