@@ -5430,7 +5430,8 @@ server <- function(input, output, session) {
   })
   output$result_header_trait_control <- renderUI({
     module <- input$result_module %||% "mating"
-    if (identical(module, "met")) {
+    view <- input$result_view %||% ""
+    if (identical(module, "met") || startsWith(view, "met_")) {
       traits <- safe_met_traits()
       if (length(traits) == 0) return(NULL)
       selected <- input$met_result_trait
@@ -5524,6 +5525,12 @@ server <- function(input, output, session) {
       if (!is.null(completed_traits) && length(completed_traits) > 0) {
         return(as.character(completed_traits))
       }
+    }
+    selected_traits <- input$met_trait_cols
+    if (!is.null(selected_traits) && length(selected_traits) > 0) {
+      excluded_columns <- c(input$met_rep_col, input$met_block_col)
+      selected_traits <- setdiff(as.character(selected_traits), excluded_columns)
+      if (length(selected_traits) > 0) return(selected_traits)
     }
     data <- safe_uploaded_data()
     if (is.null(data)) return(character(0))
