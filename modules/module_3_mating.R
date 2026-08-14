@@ -1,4 +1,4 @@
-# mating_design_module.R
+# Module 3 - Mating
 #
 # Standalone statistical functions for mating-design analysis.
 # This file intentionally contains no Shiny UI or server code.

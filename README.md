@@ -1,27 +1,34 @@
 # Selection Index Analysis App
 
-This repository contains an R Shiny application for plant breeding selection analysis. The app supports mating-design analysis, linear phenotypic selection index analysis, and multi-environment trial analysis from uploaded Excel data.
+This repository contains an R Shiny application for an integrated plant-breeding analysis pipeline. The current pipeline incorporates the models and analysis updates maintained in the `Update` folder.
 
 ## Features
 
 - Upload Excel files and preview the raw data.
-- Run mating-design analysis for:
+- Shared input validation and pipeline-safety checks.
+- **Module 1 - Breeding:** heritability, genetic gain, response per year, realized gain, and generation summaries.
+- **Module 2 - Genetic Diversity Analysis:** Mahalanobis D2 distances, clustering, PCA, genotype superiority, and trait correlations.
+- **Module 3 - Mating:**
   - Griffing Method I
   - Griffing Method II
   - Griffing Method III
   - Griffing Method IV
   - Partial diallel
   - Line x Tester
-- Run LPSI analysis to combine multiple traits into one selection score.
-- Run MET analysis across environments, including BLUP, Finlay-Wilkinson stability, AMMI, GGE, and integrated ranking outputs.
+- **Module 4 - Selection Index:** single-trait selection and multi-trait LPSI analysis.
+- **Module 5 - Multi-Environment Trial:** BLUP, Finlay-Wilkinson stability, AMMI, GGE, quality control, and integrated ranking outputs.
 - View interactive result tables in the app.
 - Download analysis results as Excel files.
 - Download selected charts as image files.
 
 ## Project Files
 
-- `app.R` - Main Shiny application, user interface, server logic, LPSI analysis, MET analysis, plotting, and export functions.
-- `mating_design_module.R` - Standalone statistical functions for mating-design analysis.
+- `app.R` - Main Shiny application, user interface, server orchestration, analysis pipelines, plotting, and export functions.
+- `modules/module_1_breeding.R` - Standalone breeding and genetic-gain functions.
+- `modules/module_3_mating.R` - Standalone mating-design functions.
+- `modules/shared_data_validation.R` - Validation and cross-module pipeline-safety helpers.
+- `modules/advanced_analysis_extensions.R` - Advanced extensions used by genetic diversity, selection-index, and MET workflows.
+- `Update/` - Supplied update snapshot retained for comparison and future reference.
 - `.gitignore` - Files and folders excluded from Git tracking.
 
 ## Required R Packages
@@ -99,4 +106,3 @@ git add .
 git commit -m "Describe the update"
 git push
 ```
-

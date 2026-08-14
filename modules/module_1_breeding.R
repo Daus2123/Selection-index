@@ -1,3 +1,7 @@
+# Module 1 - Breeding
+#
+# Source-safe genetic gain and recurrent-selection analysis functions.
+
 if (FALSE) {
 ############################################################
 # GENETIC GAIN TRACKING PIPELINE FOR RECURRENT SELECTION
