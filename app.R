@@ -4658,6 +4658,17 @@ ui <- page_navbar(
           tags$div(
             class = "analyze-preview-header output-header-controls",
             uiOutput("result_header"),
+            conditionalPanel(
+              condition = paste0(
+                "input.result_module == 'met' && ",
+                "(input.result_view || '').indexOf('met_') == 0 && ",
+                "input.result_view != 'met_integrated'"
+              ),
+              tags$div(
+                class = "chart-header-actions",
+                selectInput("met_result_trait", "Trait", choices = character(0))
+              )
+            ),
             uiOutput("result_header_trait_control")
           )
         ),
@@ -5430,15 +5441,6 @@ server <- function(input, output, session) {
   })
   output$result_header_trait_control <- renderUI({
     module <- input$result_module %||% "mating"
-    if (identical(analysis_used(), "MET")) {
-      result <- analysis_results()
-      traits <- if (!is.null(result)) as.character(result$met_trait_names) else character(0)
-      if (length(traits) == 0) return(NULL)
-      return(tags$div(
-        class = "chart-header-actions",
-        selectInput("met_result_trait", "Trait", choices = traits, selected = traits[1])
-      ))
-    }
     if (identical(module, "selection_index") && identical(input$result_lpsi_mode %||% "single", "single")) {
       data <- safe_uploaded_data()
       prepared <- tryCatch(prepare_excel_input(data), error = function(e) NULL)
@@ -5458,7 +5460,7 @@ server <- function(input, output, session) {
       if (is.null(selected) || !selected %in% traits) selected <- traits[1]
       return(selectInput("breeding_plot_trait", "Trait", choices = traits, selected = selected))
     }
-    if (identical(module, "met")) {
+    if (identical(module, "met") && !identical(input$plot_view %||% "", "met_integrated_plot")) {
       traits <- safe_met_traits()
       if (length(traits) == 0) return(NULL)
       selected <- input$met_plot_trait
