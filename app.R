@@ -4658,7 +4658,18 @@ ui <- page_navbar(
           tags$div(
             class = "analyze-preview-header output-header-controls",
             uiOutput("result_header"),
-            uiOutput("result_header_trait_control")
+            uiOutput("result_header_trait_control"),
+            conditionalPanel(
+              condition = "input.result_view && input.result_view.indexOf('met_') === 0",
+              tags$div(
+                class = "chart-header-actions",
+                selectInput(
+                  "met_result_trait",
+                  "Trait",
+                  choices = character(0)
+                )
+              )
+            )
           )
         ),
         conditionalPanel("input.result_view == 'mating_anova'", DTOutput("mating_anova_table")),
@@ -5430,14 +5441,6 @@ server <- function(input, output, session) {
   })
   output$result_header_trait_control <- renderUI({
     module <- input$result_module %||% "mating"
-    view <- input$result_view %||% ""
-    if (identical(module, "met") || startsWith(view, "met_")) {
-      traits <- safe_met_traits()
-      if (length(traits) == 0) return(NULL)
-      selected <- input$met_result_trait
-      if (is.null(selected) || !selected %in% traits) selected <- traits[1]
-      return(selectInput("met_result_trait", NULL, choices = traits, selected = selected))
-    }
     if (identical(module, "selection_index") && identical(input$result_lpsi_mode %||% "single", "single")) {
       data <- safe_uploaded_data()
       prepared <- tryCatch(prepare_excel_input(data), error = function(e) NULL)
