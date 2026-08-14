@@ -4169,13 +4169,13 @@ ui <- page_navbar(
     .slicer-button-menu > .button-menu-item > .form-check {
       align-items: center;
       display: flex;
-      margin-bottom: 8px;
-      padding-left: 8px;
+      margin-bottom: 3px;
+      padding: 2px 6px;
     }
     .slicer-button-menu > .button-menu-item > .form-check > .form-check-input {
       border-color: #B8C3AD;
       flex: 0 0 auto;
-      margin: 0 10px 0 0;
+      margin: 0 8px 0 0;
       opacity: 1;
       pointer-events: auto;
       position: static;
@@ -4186,7 +4186,7 @@ ui <- page_navbar(
       color: #4F594B;
       flex: 1 1 auto;
       font-weight: 500;
-      padding: 8px 10px;
+      padding: 5px 8px;
       text-align: left;
     }
     .slicer-button-menu > .button-menu-item > .form-check:has(> input:checked) {
@@ -4660,18 +4660,40 @@ ui <- page_navbar(
           tags$div(
             class = "analyze-preview-header output-header-controls",
             uiOutput("result_header"),
-            conditionalPanel(
-              condition = paste0(
-                "input.result_module == 'met' && ",
-                "(input.result_view || '').indexOf('met_') == 0 && ",
-                "input.result_view != 'met_integrated'"
-              ),
-              tags$div(
-                class = "chart-header-actions",
+            tags$div(
+              class = "chart-header-actions",
+              conditionalPanel(
+                condition = paste0(
+                  "input.result_module == 'met' && ",
+                  "(input.result_view || '').indexOf('met_') == 0 && ",
+                  "input.result_view != 'met_integrated'"
+                ),
                 selectInput("met_result_trait", "Trait", choices = character(0))
+              ),
+              uiOutput("result_header_trait_control"),
+              tags$details(
+                class = "chart-download-details",
+                tags$summary(
+                  title = "Download active result table",
+                  `aria-label` = "Open active table download options",
+                  icon("download")
+                ),
+                tags$div(
+                  class = "chart-download-panel chart-download-popover",
+                  selectInput(
+                    "active_table_format",
+                    "File format",
+                    choices = c("Excel workbook" = "xlsx", "CSV" = "csv"),
+                    selected = "xlsx"
+                  ),
+                  downloadButton("download_active_table", "DOWNLOAD ACTIVE TABLE"),
+                  tags$div(
+                    class = "small-note",
+                    "Exports only the table or tables in the current Results view."
+                  )
+                )
               )
-            ),
-            uiOutput("result_header_trait_control")
+            )
           )
         ),
         conditionalPanel("input.result_view == 'mating_anova'", DTOutput("mating_anova_table")),
@@ -5247,6 +5269,61 @@ server <- function(input, output, session) {
       plot = chart_details[[1]],
       name = paste(chart_details[[2]], trait_name, sep = "_")
     )
+  })
+  selected_result_tables <- reactive({
+    view <- input$result_view %||% ""
+    safe_name <- function(x) gsub("[^A-Za-z0-9_-]+", "_", x)
+    trait <- input$met_result_trait %||% "trait"
+    details <- switch(
+      view,
+      mating_anova = list(list(ANOVA = mating_result_for_table()), "Mating_ANOVA"),
+      mating_gca = list(list(GCA = mating_result_for_table()), "Mating_GCA"),
+      mating_sca = list(list(SCA = mating_result_for_table()), "Mating_SCA"),
+      mating_variance = list(list(Variance = mating_result_for_table()), "Mating_variance"),
+      breeding_stats = list(list(Genetic_parameters = breeding_result()$genetic_stats), "Breeding_genetic_parameters"),
+      breeding_response = list(list(Response_per_year = breeding_result()$response_per_year), "Breeding_response_per_year"),
+      breeding_realized = list(list(Realized_gain = breeding_result()$realized_gain), "Breeding_realized_gain"),
+      breeding_generation = list(list(Generation_summary = breeding_result()$generation_stats), "Breeding_generation_summary"),
+      lpsi_trait = list(list(Trait_summary = lpsi_result()$trait_info), "LPSI_trait_summary"),
+      lpsi_anova = list(list(ANOVA = lpsi_result()$anova_full), "LPSI_ANOVA"),
+      lpsi_lsd = list(list(Mean_comparison = lpsi_result()$lsd_wide), "LPSI_mean_comparison"),
+      lpsi_superiority = list(list(Superiority = lpsi_result()$superiority_index), "LPSI_superiority"),
+      lpsi_heritability = list(list(Heritability_gain = lpsi_result()$heritability_gain), "LPSI_heritability_gain"),
+      lpsi_ranking = list(list(Recommendation = lpsi_result()$final_decision), "LPSI_recommendation"),
+      lpsi_direct = list(list(Direct_selection = lpsi_direct_selection_r()), "LPSI_direct_selection"),
+      lpsi_compare = list(list(Method_comparison = lpsi_method_comparison_r()), "LPSI_method_comparison"),
+      met_summary = list(list(Summary = met_result_for_table()$genotype_summary), paste0("MET_summary_", safe_name(trait))),
+      met_qc = list(list(Quality_control = build_met_qc_table(met_result_for_table())), paste0("MET_quality_control_", safe_name(trait))),
+      met_variance = list(list(Variance = met_result_for_table()$variance_components), paste0("MET_variance_", safe_name(trait))),
+      met_blup = list(list(BLUP = met_result_for_table()$blups_main), paste0("MET_BLUP_", safe_name(trait))),
+      met_fw = list(list(FW_stability = met_result_for_table()$fw_results), paste0("MET_FW_stability_", safe_name(trait))),
+      met_ammi = list(
+        list(Notes = met_result_for_table()$ammi_notes, AMMI = met_result_for_table()$ammi_genotype),
+        paste0("MET_AMMI_", safe_name(trait))
+      ),
+      met_gge = list(
+        list(Notes = met_result_for_table()$ammi_notes, GGE = met_result_for_table()$gge_genotype),
+        paste0("MET_GGE_", safe_name(trait))
+      ),
+      met_selection = list(list(Selection = weighted_met_selection_for_table()), paste0("MET_selection_", safe_name(trait))),
+      met_integrated = list(list(Integrated_selection = weighted_met_integrated()$ranking), "MET_integrated_selection"),
+      diversity_values = list(list(Genotypic_values = diversity_result()$genotype_values), "GDA_genotypic_values"),
+      diversity_clusters = list(list(Clusters = diversity_result()$clusters), "GDA_clusters"),
+      diversity_superiority = list(list(Superiority = diversity_superiority_result()), "GDA_superiority"),
+      diversity_corr = list(
+        list(Correlation = tibble::rownames_to_column(as.data.frame(diversity_result()$correlation), "Trait")),
+        "GDA_trait_correlation"
+      ),
+      NULL
+    )
+    validate(need(!is.null(details), "Select a result table to download."))
+    tables <- details[[1]]
+    tables <- lapply(tables, as.data.frame)
+    validate(need(
+      length(tables) > 0 && all(vapply(tables, function(x) !is.null(x) && nrow(x) > 0, logical(1))),
+      "The active result table is not available."
+    ))
+    list(tables = tables, name = details[[2]])
   })
   draw_chart <- function(chart) {
     grid::grid.newpage()
@@ -7303,6 +7380,36 @@ server <- function(input, output, session) {
       }
       on.exit(grDevices::dev.off(), add = TRUE)
       draw_chart(chart$plot)
+    }
+  )
+
+  output$download_active_table <- downloadHandler(
+    filename = function() {
+      active <- selected_result_tables()
+      format <- input$active_table_format %||% "xlsx"
+      extension <- if (identical(format, "csv") && length(active$tables) > 1) "zip" else format
+      paste0(active$name, "_", Sys.Date(), ".", extension)
+    },
+    content = function(file) {
+      active <- selected_result_tables()
+      format <- input$active_table_format %||% "xlsx"
+      if (identical(format, "xlsx")) {
+        writexl::write_xlsx(active$tables, path = file)
+        return(invisible(NULL))
+      }
+      if (length(active$tables) == 1) {
+        utils::write.csv(active$tables[[1]], file = file, row.names = FALSE, na = "")
+        return(invisible(NULL))
+      }
+      temp_dir <- tempfile("active_result_tables_")
+      dir.create(temp_dir)
+      on.exit(unlink(temp_dir, recursive = TRUE, force = TRUE), add = TRUE)
+      csv_files <- vapply(names(active$tables), function(table_name) {
+        csv_path <- file.path(temp_dir, paste0(gsub("[^A-Za-z0-9_-]+", "_", table_name), ".csv"))
+        utils::write.csv(active$tables[[table_name]], file = csv_path, row.names = FALSE, na = "")
+        csv_path
+      }, character(1))
+      zip::zipr(zipfile = file, files = csv_files, compression_level = 9)
     }
   )
   
