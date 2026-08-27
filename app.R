@@ -231,6 +231,11 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("03", "mean_comparison", results$lsd_wide)
     add_sheet("04", "superiority_mean", results$superiority_index)
     add_sheet("05", "selection_index", results$index_ranking)
+    add_sheet("05a", "original_scale_means", results$actual_adjusted_means)
+    add_sheet("05b", "standardized_scores", results$standardized_scores)
+    add_sheet("05c", "weighted_contributions", results$weighted_contributions)
+    add_sheet("05d", "trait_weights", results$weight_table)
+    add_sheet("05e", "trait_correlation", tibble::rownames_to_column(as.data.frame(results$trait_correlation), "Trait"))
     add_sheet("06", "decision", results$final_decision)
     add_sheet("07", "heritability_gain", results$heritability_gain)
     add_sheet("08", "pipeline_review", si_lpsi_pipeline_review(results))
@@ -338,21 +343,64 @@ standardize_trait <- function(x) {
   }
   as.numeric(scale(x))
 }
-make_model_formula <- function(trait, data) {
+make_model_formula <- function(trait, data, model_type = "RCBD") {
+  model_type <- toupper(trimws(as.character(model_type %||% "RCBD")))
+  if (identical(model_type, "CRD")) {
+    return(as.formula(paste0(backtick_name(trait), " ~ ID")))
+  }
   if (n_distinct(data$Rep[!is.na(data$Rep)]) > 1) {
-    as.formula(paste0(backtick_name(trait), " ~ ID + Rep"))
+    as.formula(paste0(backtick_name(trait), " ~ Rep + ID"))
   } else {
     as.formula(paste0(backtick_name(trait), " ~ ID"))
   }
 }
+fit_single_location_model <- function(data, trait, model_type = "RCBD") {
+  model_type <- toupper(trimws(as.character(model_type %||% "RCBD")))
+  if (!model_type %in% c("CRD", "RCBD", "LMM")) {
+    stop("Model must be CRD, RCBD, or LMM.")
+  }
+  if (identical(model_type, "LMM")) {
+    if (!"Rep" %in% names(data) || n_distinct(data$Rep[!is.na(data$Rep)]) < 2) {
+      stop("LMM requires at least two Rep/Block levels.")
+    }
+    formula <- as.formula(paste0(backtick_name(trait), " ~ ID + (1 | Rep)"))
+    return(lmerTest::lmer(
+      formula,
+      data = data,
+      REML = TRUE,
+      control = lme4::lmerControl(optimizer = "bobyqa")
+    ))
+  }
+  aov(make_model_formula(trait, data, model_type), data = data)
+}
+single_location_anova_table <- function(model) {
+  sm <- as.data.frame(anova(model))
+  sm$Source <- trimws(rownames(sm))
+  get_col <- function(candidates) {
+    hit <- candidates[candidates %in% names(sm)][1]
+    if (length(hit) == 0 || is.na(hit)) rep(NA_real_, nrow(sm)) else suppressWarnings(as.numeric(sm[[hit]]))
+  }
+  data.frame(
+    Source = sm$Source,
+    Df = get_col(c("Df", "NumDF", "numDF")),
+    Sum_Sq = get_col(c("Sum Sq", "Sum_Sq")),
+    Mean_Sq = get_col(c("Mean Sq", "Mean_Sq")),
+    F_value = get_col(c("F value", "F.value", "F_value")),
+    p_value = get_col(c("Pr(>F)", "p.value", "p_value")),
+    stringsAsFactors = FALSE
+  )
+}
 # Prepare uploaded Excel data
-prepare_excel_input <- function(df_raw) {
+prepare_excel_input <- function(df_raw, require_rep = FALSE) {
   names(df_raw) <- make.unique(trimws(names(df_raw)), sep = "_")
   if (!id_col %in% names(df_raw)) {
     stop("The ID column is missing. Expected column name: ", id_col)
   }
   if (!rep_col %in% names(df_raw)) {
-    stop("The replication column is missing. Expected column name: ", rep_col)
+    if (isTRUE(require_rep)) {
+      stop("The replication column is missing. Expected column name: ", rep_col)
+    }
+    df_raw[[rep_col]] <- "1"
   }
   notes <- c()
   id_values_upper <- toupper(clean_text(df_raw[[id_col]]))
@@ -708,6 +756,41 @@ empty_plot <- function(message_text) {
   ggplot() +
     annotate("text", x = 0, y = 0, label = message_text, size = 5) +
     theme_void()
+}
+dunn_holm_test <- function(data, response, group = "ID", alpha = 0.05) {
+  d <- data.frame(
+    Value = suppressWarnings(as.numeric(data[[response]])),
+    Group = as.character(data[[group]]),
+    stringsAsFactors = FALSE
+  )
+  d <- d[is.finite(d$Value) & !is.na(d$Group) & d$Group != "", , drop = FALSE]
+  groups <- unique(d$Group)
+  if (length(groups) < 2) stop("Dunn test requires at least two groups.")
+  d$Rank <- rank(d$Value, ties.method = "average")
+  n_total <- nrow(d)
+  tie_sizes <- as.numeric(table(d$Value))
+  rank_variance <- n_total * (n_total + 1) / 12 -
+    sum(tie_sizes^3 - tie_sizes) / (12 * (n_total - 1))
+  stats <- aggregate(Rank ~ Group, d, function(x) c(mean = mean(x), n = length(x)))
+  mean_rank <- stats$Rank[, "mean"]
+  group_n <- stats$Rank[, "n"]
+  names(mean_rank) <- names(group_n) <- stats$Group
+  pairs <- combn(groups, 2, simplify = FALSE)
+  out <- do.call(rbind, lapply(pairs, function(pair) {
+    se <- sqrt(rank_variance * (1 / group_n[pair[1]] + 1 / group_n[pair[2]]))
+    z <- (mean_rank[pair[1]] - mean_rank[pair[2]]) / se
+    data.frame(
+      Group_1 = pair[1], Group_2 = pair[2],
+      Mean_rank_difference = unname(mean_rank[pair[1]] - mean_rank[pair[2]]),
+      Z = unname(z), p_value = 2 * pnorm(-abs(z)), stringsAsFactors = FALSE
+    )
+  }))
+  out$p_adjusted <- p.adjust(out$p_value, method = "holm")
+  out$Significant <- out$p_adjusted < alpha
+  p_for_letters <- out$p_adjusted
+  names(p_for_letters) <- paste(out$Group_1, out$Group_2, sep = "-")
+  letters_out <- multcompView::multcompLetters(p_for_letters, threshold = alpha)$Letters
+  list(pairwise = out, letters = letters_out)
 }
 
 format_superiority_pct_label <- function(x) {
@@ -1148,7 +1231,7 @@ plot_diversity_superiority_heatmap <- function(result, check_genotypes = NULL) {
 
 plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = NULL, selection_pct = NULL) {
   if (is.null(heritability_gain) || nrow(heritability_gain) == 0) {
-    return(empty_plot("Run LPSI analysis to view genetic gain."))
+    return(empty_plot("Run Single-Location Trial analysis to view genetic gain."))
   }
   valid_gain <- heritability_gain %>%
     filter(
@@ -1367,7 +1450,7 @@ plot_genetic_gain_curve <- function(heritability_gain, trait_info, trait_name = 
 plot_lpsi_direct_selection <- function(direct_table, selection_pct = 15, lpsi_results = NULL) {
   direct_table <- as.data.frame(direct_table)
   if (nrow(direct_table) == 0) {
-    return(empty_plot("Run LPSI and choose a trait for direct selection."))
+    return(empty_plot("Run Single-Location Trial and choose a trait for direct selection."))
   }
   selection_pct <- suppressWarnings(as.numeric(selection_pct))
   if (length(selection_pct) == 0 || !is.finite(selection_pct[1])) selection_pct <- 15
@@ -1458,7 +1541,7 @@ plot_lpsi_direct_selection <- function(direct_table, selection_pct = 15, lpsi_re
     scale_color_identity() +
     scale_y_continuous(expand = expansion(mult = c(0.02, 0.16))) +
     labs(
-      title = paste("Single trait selection -", primary_trait),
+      title = paste("Single-Trait Analysis -", primary_trait),
       subtitle = subtitle,
       x = "Genotype",
       y = primary_trait,
@@ -1574,8 +1657,13 @@ plot_lpsi_mean_comparison <- function(results, trait) {
   letters_dat$Group <- trimws(as.character(letters_dat$LSD_group %||% ""))
   anova_trait <- as.data.frame(results$anova_full %||% data.frame())
   has_significant_difference <- nrow(anova_trait) > 0 &&
-    all(c("Trait", "p_value") %in% names(anova_trait)) &&
-    any(anova_trait$Trait == trait & suppressWarnings(as.numeric(anova_trait$p_value)) < 0.05, na.rm = TRUE)
+    all(c("Trait", "Source", "p_value") %in% names(anova_trait)) &&
+    any(
+      anova_trait$Trait == trait &
+        trimws(as.character(anova_trait$Source)) == "ID" &
+        suppressWarnings(as.numeric(anova_trait$p_value)) < 0.05,
+      na.rm = TRUE
+    )
   if (!has_significant_difference) letters_dat$Group <- ""
 
   plot_dat <- raw_dat[, c("ID", "Original_ID", trait), drop = FALSE]
@@ -1596,6 +1684,7 @@ plot_lpsi_mean_comparison <- function(results, trait) {
   letters_dat$Label <- factor(letters_dat$Label, levels = label_levels)
 
   ggplot(plot_dat, aes(x = Label, y = Value, fill = Label)) +
+    geom_jitter(width = 0.12, height = 0, alpha = 0.45, size = 1.4, show.legend = FALSE) +
     geom_boxplot(width = 0.68, linewidth = 0.45, outlier.size = 1.5, show.legend = FALSE) +
     geom_text(
       data = letters_dat[letters_dat$Group != "" & !is.na(letters_dat$Group), , drop = FALSE],
@@ -1605,7 +1694,10 @@ plot_lpsi_mean_comparison <- function(results, trait) {
     scale_fill_hue(c = 85, l = 62) +
     labs(
       title = "Distribution of Phenotypic Values",
-      subtitle = paste("Mean comparison for", trait),
+      subtitle = paste(
+        gsub("_", " ", results$mean_comparison_method %||% "Mean comparison"),
+        "for", trait
+      ),
       x = "Entry",
       y = trait
     ) +
@@ -1625,6 +1717,7 @@ plot_lpsi_mean_comparison <- function(results, trait) {
 
 # Main LPSI function
 run_selection_pipeline <- function(df_raw, check_varieties = NULL,
+                                   model_type = "RCBD",
                                    advance_cutoff = advance_index_cutoff,
                                    retest_cutoff = retest_index_cutoff,
                                    priority_cutoff_pct = priority_advance_cutoff_pct,
@@ -1638,7 +1731,15 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
   if (!is.finite(priority_advance_cutoff_pct)) priority_advance_cutoff_pct <- 0
   if (!is.finite(priority_severe_weak_pct)) priority_severe_weak_pct <- -10
   
-  prepared <- prepare_excel_input(df_raw)
+  model_type <- toupper(trimws(as.character(model_type %||% "RCBD")))
+  if (!model_type %in% c("CRD", "RCBD", "LMM")) {
+    stop("Model must be CRD, RCBD, or LMM.")
+  }
+  raw_names <- make.unique(trimws(names(df_raw)), sep = "_")
+  if (!identical(model_type, "CRD") && !rep_col %in% raw_names) {
+    stop(model_type, " requires a Rep column.")
+  }
+  prepared <- prepare_excel_input(df_raw, require_rep = !identical(model_type, "CRD"))
   df_data <- prepared$data
   trait_cols <- prepared$trait_cols
   weights_raw_used <- prepared$weights_raw_used
@@ -1754,7 +1855,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       )
     }
     out <- tryCatch({
-      model <- aov(make_model_formula(trait, model_data), data = model_data)
+      model <- fit_single_location_model(model_data, trait, model_type)
       em <- emmeans(model, ~ ID)
       as.data.frame(em) %>%
         dplyr::select(ID, emmean) %>%
@@ -1794,6 +1895,10 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       all_of(trait_cols),
       standardize_trait
     ))
+  weighted_contributions <- std_means
+  for (tr in trait_cols) {
+    weighted_contributions[[tr]] <- weighted_contributions[[tr]] * weights[[tr]]
+  }
   weight_table <- data.frame(
     Trait = names(weights),
     Direction = as.character(trait_direction[names(weights)]),
@@ -1854,6 +1959,25 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     arrange(as.numeric(as.character(ID))) %>%
     left_join(id_lookup, by = "ID") %>%
     relocate(Original_ID, .after = ID)
+  trait_correlation <- stats::cor(
+    as.data.frame(actual_means[, trait_cols, drop = FALSE]),
+    use = "pairwise.complete.obs"
+  )
+  trait_correlation_long <- as.data.frame(as.table(trait_correlation), stringsAsFactors = FALSE)
+  names(trait_correlation_long) <- c("Trait_1", "Trait_2", "Correlation")
+  trait_correlation_plot <- ggplot(
+    trait_correlation_long,
+    aes(x = Trait_1, y = Trait_2, fill = Correlation)
+  ) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3) +
+    scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0, limits = c(-1, 1)) +
+    labs(title = "Trait Correlation", x = NULL, y = NULL, fill = "r") +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    )
   check_actual <- actual_means %>%
     filter(ID %in% check_labels)
   if (nrow(check_actual) == 0) {
@@ -2239,20 +2363,20 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       temp <- tryCatch({
         normality <- get_lpsi_normality_decision(df, tr)
         if (isTRUE(normality$use_anova)) {
-          model <- aov(make_model_formula(tr, model_data), data = model_data)
-          sm <- as.data.frame(summary(model)[[1]])
+          model <- fit_single_location_model(model_data, tr, model_type)
+          sm <- single_location_anova_table(model)
           data.frame(
             Trait = tr,
             Test = "ANOVA",
             Normality_p = round(normality$p_value, 5),
             Normality_note = "ANOVA used",
-            Source = rownames(sm),
+            Source = sm$Source,
             Df = sm$Df,
-            Sum_Sq = round(sm$`Sum Sq`, 4),
-            Mean_Sq = round(sm$`Mean Sq`, 4),
-            F_value = ifelse(is.na(sm$`F value`), NA, round(sm$`F value`, 4)),
-            p_value = ifelse(is.na(sm$`Pr(>F)`), NA, round(sm$`Pr(>F)`, 5)),
-            Sig = sig_label(sm$`Pr(>F)`),
+            Sum_Sq = round(sm$Sum_Sq, 4),
+            Mean_Sq = round(sm$Mean_Sq, 4),
+            F_value = ifelse(is.na(sm$F_value), NA, round(sm$F_value, 4)),
+            p_value = ifelse(is.na(sm$p_value), NA, round(sm$p_value, 5)),
+            Sig = sig_label(sm$p_value),
             stringsAsFactors = FALSE
           )
         } else {
@@ -2307,7 +2431,10 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       if (n_distinct(model_data$ID) < 2) {
         stop("At least two varieties are required.")
       }
-      model <- aov(make_model_formula(tr, model_data), data = model_data)
+      if (identical(model_type, "LMM")) {
+        stop("Genetic variance and broad-sense heritability are not estimated when Variety is fixed in LMM.")
+      }
+      model <- fit_single_location_model(model_data, tr, model_type)
       sm <- as.data.frame(summary(model)[[1]])
       sm$Source <- trimws(rownames(sm))
       id_row <- sm[sm$Source == "ID", , drop = FALSE]
@@ -2319,7 +2446,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       ms_error <- as.numeric(residual_row$`Mean Sq`[1])
       rep_harmonic <- model_data %>%
         group_by(ID) %>%
-        summarise(n_rep = n_distinct(Rep), .groups = "drop") %>%
+        summarise(n_rep = if (identical(model_type, "CRD")) dplyr::n() else n_distinct(Rep), .groups = "drop") %>%
         summarise(value = 1 / mean(1 / n_rep)) %>%
         pull(value)
       genotypic_var <- max((ms_genotype - ms_error) / rep_harmonic, 0)
@@ -2385,10 +2512,9 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
         filter(!is.na(.data[[tr]]))
       temp <- tryCatch({
         normality <- get_lpsi_normality_decision(df, tr)
-        model <- aov(make_model_formula(tr, model_data), data = model_data)
-        sm <- as.data.frame(summary(model)[[1]])
-        sm$Source <- trimws(rownames(sm))
-        id_p_value <- sm$`Pr(>F)`[sm$Source == "ID"]
+        model <- fit_single_location_model(model_data, tr, model_type)
+        sm <- single_location_anova_table(model)
+        id_p_value <- sm$p_value[sm$Source == "ID"]
         anova_id_p_value <- anova_full %>%
           filter(
             Trait == tr,
@@ -2484,6 +2610,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
   }
   trait_info <- data.frame(
     Trait = trait_cols,
+    Model = model_type,
     Type = ifelse(trait_cols %in% score_cols, "Score 1-5", "Quantitative"),
     Direction = as.character(trait_direction[trait_cols]),
     Target_value = ifelse(
@@ -2504,10 +2631,13 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     trait_info = trait_info,
     adjusted_means_index = adj_means,
     standardized_scores = std_means,
+    weighted_contributions = weighted_contributions,
     weight_table = weight_table,
     index_ranking = index_df,
     check_index_details = check_index_details,
     actual_adjusted_means = actual_means,
+    trait_correlation = trait_correlation,
+    trait_correlation_plot = trait_correlation_plot,
     superiority_index = superiority_df,
     priority_summary = priority_summary,
     final_decision = final_decision,
@@ -2520,6 +2650,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     check_original_label = check_original_label,
     selected_checks = selected_checks,
     decision_settings = data.frame(
+      Model = model_type,
       Advance_index_cutoff = advance_index_cutoff,
       Retest_index_cutoff = retest_index_cutoff,
       Priority_trait_cutoff_pct = priority_advance_cutoff_pct,
@@ -4518,10 +4649,10 @@ ui <- page_navbar(
                 inputId = "analysis_method",
                 label = NULL,
                 choices = c(
-                  "Breeding" = "BREEDING",
+                  "Pre-Breeding" = "BREEDING",
                   "Genetic Diversity Analysis" = "DIVERSITY",
                   "Mating" = "MATING",
-                  "Selection Index" = "LPSI",
+                  "Single-Location Trial" = "LPSI",
                   "Multi-Environment Trial" = "MET"
                 ),
                 selected = "BREEDING"
@@ -4705,6 +4836,8 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'breeding_realized'", DTOutput("breeding_realized_table")),
         conditionalPanel("input.result_view == 'breeding_generation'", DTOutput("breeding_generation_table")),
         conditionalPanel("input.result_view == 'lpsi_trait'", DTOutput("trait_table")),
+        conditionalPanel("input.result_view == 'lpsi_index_summary'", DTOutput("lpsi_index_summary_table")),
+        conditionalPanel("input.result_view == 'lpsi_correlation'", DTOutput("lpsi_correlation_table")),
         conditionalPanel("input.result_view == 'lpsi_ranking'", DTOutput("index_table")),
         conditionalPanel("input.result_view == 'lpsi_superiority'", DTOutput("superiority_table")),
         conditionalPanel("input.result_view == 'lpsi_anova'", DTOutput("anova_full_table")),
@@ -4882,10 +5015,17 @@ server <- function(input, output, session) {
     req(analysis_results())
     validate(need(
       analysis_used() == "BREEDING",
-      "Run Breeding Analysis to view this result."
+      "Run Pre-Breeding Analysis to view this result."
     ))
     analysis_results()
   })
+  lpsi_mean_comparison_method_r <- reactiveVal("lsd")
+  observeEvent(input$lpsi_mean_comparison_method, {
+    method <- input$lpsi_mean_comparison_method
+    if (!is.null(method) && method %in% c("lsd", "tukey")) {
+      lpsi_mean_comparison_method_r(method)
+    }
+  }, ignoreNULL = TRUE)
   lpsi_settings <- reactive({
     checks <- if (identical(analysis_used(), "LPSI")) {
       input$lpsi_benchmark_checks
@@ -4897,6 +5037,7 @@ server <- function(input, output, session) {
     }
     list(
       checks = checks,
+      model = input$lpsi_trial_model %||% "RCBD",
       advance = input$lpsi_advance_cutoff %||% advance_index_cutoff,
       retest = input$lpsi_retest_cutoff %||% retest_index_cutoff,
       priority = input$lpsi_priority_cutoff_pct %||% priority_advance_cutoff_pct,
@@ -4907,6 +5048,7 @@ server <- function(input, output, session) {
     run_selection_pipeline(
       uploaded_data(),
       check_varieties = settings$checks,
+      model_type = settings$model,
       advance_cutoff = settings$advance,
       retest_cutoff = settings$retest,
       priority_cutoff_pct = settings$priority,
@@ -4919,13 +5061,12 @@ server <- function(input, output, session) {
     } else {
       saved_results$LPSI
     }
-    validate(need(!is.null(result), "Run LPSI analysis to view this result."))
+    validate(need(!is.null(result), "Run Single-Location Trial analysis to view this result."))
     result
   })
   observeEvent({
     list(
       input$lpsi_benchmark_checks,
-      input$lpsi_run_benchmark_checks,
       input$lpsi_advance_cutoff,
       input$lpsi_retest_cutoff,
       input$lpsi_priority_cutoff_pct,
@@ -4934,12 +5075,17 @@ server <- function(input, output, session) {
   }, {
     if (!identical(analysis_used(), "LPSI")) return(invisible(NULL))
     req(uploaded_data())
-    analysis_message("Updating LPSI decision settings...")
+    analysis_message("Updating Single-Location Trial decision settings...")
+    update_settings <- lpsi_settings()
+    current_result <- analysis_results()
+    if (!is.null(current_result$decision_settings$Model)) {
+      update_settings$model <- as.character(current_result$decision_settings$Model[1])
+    }
     res <- tryCatch({
-      run_lpsi_with_settings()
+      run_lpsi_with_settings(update_settings)
     }, error = function(e) {
       showNotification(
-        paste("LPSI settings update failed:", e$message),
+        paste("Single-Location Trial settings update failed:", e$message),
         type = "error",
         duration = NULL
       )
@@ -4948,7 +5094,7 @@ server <- function(input, output, session) {
     if (!is.null(res)) {
       analysis_results(res)
       saved_results$LPSI <- res
-      analysis_message("LPSI decision settings updated.")
+      analysis_message("Single-Location Trial decision settings updated.")
     }
   }, ignoreInit = TRUE)
   met_result_for_table <- reactive({
@@ -5096,7 +5242,7 @@ server <- function(input, output, session) {
     if (chart_module == "selection_index") {
       lpsi_mode <- input$chart_lpsi_mode %||% "single"
       lpsi_views <- if (identical(lpsi_mode, "multi")) {
-        c("lpsi_ranking_plot", "lpsi_heatmap")
+        c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot")
       } else {
         c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot")
       }
@@ -5114,14 +5260,20 @@ server <- function(input, output, session) {
       view <- "diversity_superiority_plot"
     }
     
-    if (view %in% c("lpsi_direct_plot", "lpsi_ranking_plot", "lpsi_heatmap", "lpsi_gain_curve", "lpsi_mean_comparison_plot")) {
+    if (view %in% c("lpsi_direct_plot", "lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot", "lpsi_gain_curve", "lpsi_mean_comparison_plot")) {
       lpsi <- lpsi_result()
       if (view == "lpsi_mean_comparison_plot") {
-        comparison_trait <- input$lpsi_chart_trait
-        validate(need(!is.null(comparison_trait) && comparison_trait != "", "Choose a trait for mean comparison."))
+        comparison <- lpsi_selected_mean_comparison()
+        comparison_trait <- comparison$trait
+        plot_result <- lpsi
+        plot_result$lsd_long <- comparison$plot_data
+        plot_result$mean_comparison_method <- comparison$method
         return(list(
-          plot = plot_lpsi_mean_comparison(lpsi, comparison_trait),
-          name = paste0("LPSI_mean_comparison_", gsub("[^A-Za-z0-9_-]+", "_", comparison_trait))
+          plot = plot_lpsi_mean_comparison(plot_result, comparison_trait),
+          name = paste0(
+            "Single-Location_Trial_mean_comparison_", comparison$method, "_",
+            gsub("[^A-Za-z0-9_-]+", "_", comparison_trait)
+          )
         ))
       }
       if (view == "lpsi_direct_plot") {
@@ -5131,13 +5283,19 @@ server <- function(input, output, session) {
             selection_pct = input$lpsi_selection_pct %||% 15,
             lpsi_results = lpsi
           ),
-          name = "LPSI_single_trait_selection"
+          name = "Single-Location_Trial_single_trait_selection"
         ))
       }
       if (view == "lpsi_ranking_plot") {
         return(list(
           plot = lpsi$ranking_plot,
-          name = "LPSI_multi_trait_selection"
+          name = "Single-Location_Trial_multi_trait_selection"
+        ))
+      }
+      if (view == "lpsi_correlation_plot") {
+        return(list(
+          plot = lpsi$trait_correlation_plot,
+          name = "Single-Location_Trial_trait_correlation"
         ))
       }
       if (view == "lpsi_gain_curve") {
@@ -5150,20 +5308,20 @@ server <- function(input, output, session) {
             gain_trait,
             selection_pct = input$lpsi_selection_pct %||% 15
           ),
-          name = paste0("LPSI_genetic_gain_", gsub("[^A-Za-z0-9_-]+", "_", gain_trait))
+          name = paste0("Single-Location_Trial_genetic_gain_", gsub("[^A-Za-z0-9_-]+", "_", gain_trait))
         ))
       }
       heatmap <- lpsi$heatmap_plot
       validate(need(!is.null(heatmap), "The superiority heatmap is not available."))
       return(list(
         plot = heatmap,
-        name = "LPSI_superiority_heatmap"
+        name = "Single-Location_Trial_superiority_heatmap"
       ))
     }
     
     if (view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution")) {
       req(analysis_results())
-      validate(need(analysis_used() == "BREEDING", "Run Breeding Analysis before downloading this chart."))
+      validate(need(analysis_used() == "BREEDING", "Run Pre-Breeding Analysis before downloading this chart."))
       trait_name <- input$breeding_plot_trait
       generation_col <- input$breeding_generation_col
       generation_stats <- analysis_results()$generation_stats
@@ -5177,7 +5335,7 @@ server <- function(input, output, session) {
         trend_data <- generation_stats %>% filter(Trait == trait_name)
         return(list(
           plot = breeding_plot_genetic_trend(trend_data),
-          name = paste0("Breeding_genetic_trend_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
+          name = paste0("Pre-Breeding_genetic_trend_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
         ))
       }
       
@@ -5188,7 +5346,7 @@ server <- function(input, output, session) {
             x_col = "Trait",
             title = "Genetic advance as percent of mean"
           ),
-          name = "Breeding_GAM"
+          name = "Pre-Breeding_GAM"
         ))
       }
       
@@ -5200,7 +5358,7 @@ server <- function(input, output, session) {
         }
         return(list(
           plot = breeding_plot_heritability_heatmap(h2_data),
-          name = "Breeding_heritability_heatmap"
+          name = "Pre-Breeding_heritability_heatmap"
         ))
       }
       
@@ -5215,7 +5373,7 @@ server <- function(input, output, session) {
           trait = trait_name,
           generation_col = generation_col
         ),
-        name = paste0("Breeding_distribution_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
+        name = paste0("Pre-Breeding_distribution_", gsub("[^A-Za-z0-9_-]+", "_", trait_name))
       ))
     }
     
@@ -5280,18 +5438,29 @@ server <- function(input, output, session) {
       mating_gca = list(list(GCA = mating_result_for_table()), "Mating_GCA"),
       mating_sca = list(list(SCA = mating_result_for_table()), "Mating_SCA"),
       mating_variance = list(list(Variance = mating_result_for_table()), "Mating_variance"),
-      breeding_stats = list(list(Genetic_parameters = breeding_result()$genetic_stats), "Breeding_genetic_parameters"),
-      breeding_response = list(list(Response_per_year = breeding_result()$response_per_year), "Breeding_response_per_year"),
-      breeding_realized = list(list(Realized_gain = breeding_result()$realized_gain), "Breeding_realized_gain"),
-      breeding_generation = list(list(Generation_summary = breeding_result()$generation_stats), "Breeding_generation_summary"),
-      lpsi_trait = list(list(Trait_summary = lpsi_result()$trait_info), "LPSI_trait_summary"),
-      lpsi_anova = list(list(ANOVA = lpsi_result()$anova_full), "LPSI_ANOVA"),
-      lpsi_lsd = list(list(Mean_comparison = lpsi_result()$lsd_wide), "LPSI_mean_comparison"),
-      lpsi_superiority = list(list(Superiority = lpsi_result()$superiority_index), "LPSI_superiority"),
-      lpsi_heritability = list(list(Heritability_gain = lpsi_result()$heritability_gain), "LPSI_heritability_gain"),
-      lpsi_ranking = list(list(Recommendation = lpsi_result()$final_decision), "LPSI_recommendation"),
-      lpsi_direct = list(list(Direct_selection = lpsi_direct_selection_r()), "LPSI_direct_selection"),
-      lpsi_compare = list(list(Method_comparison = lpsi_method_comparison_r()), "LPSI_method_comparison"),
+      breeding_stats = list(list(Genetic_parameters = breeding_result()$genetic_stats), "Pre-Breeding_genetic_parameters"),
+      breeding_response = list(list(Response_per_year = breeding_result()$response_per_year), "Pre-Breeding_response_per_year"),
+      breeding_realized = list(list(Realized_gain = breeding_result()$realized_gain), "Pre-Breeding_realized_gain"),
+      breeding_generation = list(list(Generation_summary = breeding_result()$generation_stats), "Pre-Breeding_generation_summary"),
+      lpsi_trait = list(list(Trait_summary = lpsi_result()$trait_info), "Single-Location_Trial_trait_summary"),
+      lpsi_index_summary = list(list(Index_summary = lpsi_result()$weight_table), "Single-Location_Trial_index_summary"),
+      lpsi_correlation = list(
+        list(Trait_correlation = tibble::rownames_to_column(as.data.frame(lpsi_result()$trait_correlation), "Trait")),
+        "Single-Location_Trial_trait_correlation"
+      ),
+      lpsi_anova = list(list(ANOVA = lpsi_result()$anova_full), "Single-Location_Trial_ANOVA"),
+      lpsi_lsd = {
+        comparison <- lpsi_all_traits_mean_comparison()
+        list(
+          list(Mean_comparison = comparison),
+          paste0("Single-Location_Trial_mean_comparison_", lpsi_mean_comparison_method_r())
+        )
+      },
+      lpsi_superiority = list(list(Superiority = lpsi_result()$superiority_index), "Single-Location_Trial_superiority"),
+      lpsi_heritability = list(list(Heritability_gain = lpsi_result()$heritability_gain), "Single-Location_Trial_heritability_gain"),
+      lpsi_ranking = list(list(Recommendation = lpsi_result()$final_decision), "Single-Location_Trial_recommendation"),
+      lpsi_direct = list(list(Direct_selection = lpsi_direct_selection_r()), "Single-Location_Trial_direct_selection"),
+      lpsi_compare = list(list(Method_comparison = lpsi_method_comparison_r()), "Single-Location_Trial_method_comparison"),
       met_summary = list(list(Summary = met_result_for_table()$genotype_summary), paste0("MET_summary_", safe_name(trait))),
       met_qc = list(list(Quality_control = build_met_qc_table(met_result_for_table())), paste0("MET_quality_control_", safe_name(trait))),
       met_variance = list(list(Variance = met_result_for_table()$variance_components), paste0("MET_variance_", safe_name(trait))),
@@ -5345,7 +5514,7 @@ server <- function(input, output, session) {
     if (chart_module == "selection_index") {
       lpsi_mode <- input$chart_lpsi_mode %||% "single"
       lpsi_views <- if (identical(lpsi_mode, "multi")) {
-        c("lpsi_ranking_plot", "lpsi_heatmap")
+        c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot")
       } else {
         c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot")
       }
@@ -5368,6 +5537,7 @@ server <- function(input, output, session) {
       lpsi_mean_comparison_plot = "lpsi_mean_comparison_plot",
       lpsi_ranking_plot = "ranking_plot",
       lpsi_heatmap = "heatmap_plot",
+      lpsi_correlation_plot = "lpsi_correlation_plot",
       lpsi_gain_curve = "gain_curve_plot",
       breeding_trend = "breeding_trend_plot",
       breeding_gam = "breeding_gam_plot",
@@ -5485,12 +5655,14 @@ server <- function(input, output, session) {
       mating_gca = "GCA parent effects",
       mating_sca = "SCA cross effects",
       mating_variance = "Variance breakdown",
-      breeding_stats = "Breeding genetic parameters",
+      breeding_stats = "Pre-Breeding genetic parameters",
       breeding_response = "Response per year",
       breeding_realized = "Realized gain",
       breeding_generation = "Generation summary",
       lpsi_trait = "Trait summary",
-      lpsi_anova = "LPSI analysis of variance",
+      lpsi_index_summary = "Selection Index summary",
+      lpsi_correlation = "Trait correlation",
+      lpsi_anova = "Single-Location Trial analysis of variance",
       lpsi_lsd = "Mean comparison",
       lpsi_superiority = "Trait superiority vs mean check benchmark",
       lpsi_heritability = "Heritability and genetic gain",
@@ -5521,6 +5693,15 @@ server <- function(input, output, session) {
   output$result_header_trait_control <- renderUI({
     module <- input$result_module %||% "mating"
     if (identical(module, "selection_index") && identical(input$result_lpsi_mode %||% "single", "single")) {
+      view <- input$result_view %||% ""
+      if (identical(view, "lpsi_lsd")) {
+        return(selectInput(
+          "lpsi_mean_comparison_method", NULL,
+          choices = c("LSD" = "lsd", "Tukey HSD" = "tukey"),
+          selected = lpsi_mean_comparison_method_r()
+        ))
+      }
+      if (view %in% c("lpsi_trait", "lpsi_anova")) return(NULL)
       data <- safe_uploaded_data()
       prepared <- tryCatch(prepare_excel_input(data), error = function(e) NULL)
       if (is.null(prepared) || length(prepared$trait_cols) == 0) return(NULL)
@@ -5547,6 +5728,27 @@ server <- function(input, output, session) {
       return(selectInput("met_plot_trait", "Trait", choices = traits, selected = selected))
     }
     if (identical(module, "selection_index") && identical(input$chart_lpsi_mode %||% "single", "single")) {
+      if (identical(input$plot_view %||% "", "lpsi_mean_comparison_plot")) {
+        result <- tryCatch(lpsi_result(), error = function(e) NULL)
+        selected_trait <- input$lpsi_chart_trait %||% ""
+        test_name <- if (!is.null(result) && nrow(as.data.frame(result$anova_full)) > 0) {
+          rows <- as.data.frame(result$anova_full)
+          hit <- rows[as.character(rows$Trait) == selected_trait & trimws(as.character(rows$Source)) == "ID", , drop = FALSE]
+          if (nrow(hit) > 0) as.character(hit$Test[1]) else ""
+        } else ""
+        return(tagList(
+          if (identical(test_name, "Kruskal-Wallis")) {
+            tags$div(class = "form-group", tags$strong("Method: "), "Dunn-Holm")
+          } else {
+            selectInput(
+              "lpsi_chart_mean_comparison_method", "Method",
+              choices = c("LSD" = "lsd", "Tukey HSD" = "tukey"),
+              selected = input$lpsi_chart_mean_comparison_method %||% lpsi_mean_comparison_method_r()
+            )
+          },
+          uiOutput("lpsi_chart_trait_control")
+        ))
+      }
       return(uiOutput("lpsi_chart_trait_control"))
     }
     NULL
@@ -5560,7 +5762,7 @@ server <- function(input, output, session) {
       ),
       export_row(
         if (is.null(saved_results$BREEDING)) "pending" else "ready",
-        "Breeding_analysis_results.xlsx",
+        "Pre-Breeding_analysis_results.xlsx",
         "download_breeding"
       ),
       export_row(
@@ -5570,7 +5772,7 @@ server <- function(input, output, session) {
       ),
       export_row(
         if (is.null(saved_results$LPSI)) "pending" else "ready",
-        "LPSI_selection_results.xlsx",
+        "Single-Location_Trial_results.xlsx",
         "download_lpsi"
       ),
       export_row(
@@ -5635,6 +5837,7 @@ server <- function(input, output, session) {
             "diversity_values", "diversity_clusters", "diversity_superiority", "diversity_corr",
             "lpsi_direct", "lpsi_compare", "lpsi_trait", "lpsi_anova", "lpsi_lsd",
             "lpsi_superiority", "lpsi_heritability", "lpsi_ranking",
+            "lpsi_index_summary", "lpsi_correlation",
             "met_summary", "met_qc", "met_variance", "met_blup", "met_fw",
             "met_ammi", "met_gge", "met_selection", "met_integrated"
           ),
@@ -5657,7 +5860,7 @@ server <- function(input, output, session) {
       tags$div(
         class = "side-subpanel result-analysis-section",
         selectInput(
-          "result_breeding_view", "BREEDING PROCESS",
+          "result_breeding_view", "PRE-BREEDING PROCESS",
           choices = c(
             "Genetic parameters" = "breeding_stats",
             "Response per year" = "breeding_response",
@@ -5687,10 +5890,10 @@ server <- function(input, output, session) {
       tags$div(
         class = "side-subpanel result-analysis-section",
         selectInput(
-          "result_lpsi_mode", "SELECTION INDEX (LPSI)",
+          "result_lpsi_mode", "SINGLE-LOCATION TRIAL",
           choices = c(
-            "Single trait selection" = "single",
-            "Multi trait selection" = "multi"
+            "Single-Trait Analysis" = "single",
+            "Selection Index" = "multi"
           ),
           selected = input$result_lpsi_mode %||% "single"
         ),
@@ -5717,17 +5920,16 @@ server <- function(input, output, session) {
     mode <- input$result_lpsi_mode %||% "single"
     choices <- if (identical(mode, "multi")) {
       c(
+        "Summary" = "lpsi_index_summary",
         "Superiority" = "lpsi_superiority",
-        "Heritability & gain" = "lpsi_heritability",
-        "Recommendation" = "lpsi_ranking"
+        "Trait Correlation" = "lpsi_correlation"
       )
     } else {
       c(
         "Summary" = "lpsi_trait",
         "ANOVA" = "lpsi_anova",
-        "Mean comparison" = "lpsi_lsd",
-        "Selection" = "lpsi_direct",
-        "Compare with LPSI" = "lpsi_compare"
+        "Genetic gain" = "lpsi_heritability",
+        "Mean comparison" = "lpsi_lsd"
       )
     }
     current <- input$result_lpsi_view %||% ""
@@ -5760,10 +5962,10 @@ server <- function(input, output, session) {
   # Hybrid result navigation: persistent analysis choices with contextual dropdowns.
   output$result_sidebar_menu <- renderUI({
     choices <- c(
-      "Breeding" = "breeding",
+      "Pre-Breeding" = "breeding",
       "Genetic Diversity Analysis" = "diversity",
       "Mating" = "mating",
-      "Selection Index" = "selection_index",
+      "Single-Location Trial" = "selection_index",
       "Multi-Environment Trial" = "met"
     )
     module <- input$result_module %||% "mating"
@@ -5788,12 +5990,12 @@ server <- function(input, output, session) {
         selection_index = tagList(
           tags$div(
             class = "side-subpanel result-analysis-section",
-            tags$div(class = "side-subpanel-title", "Selection type"),
+            tags$div(class = "side-subpanel-title", "Analysis workflow"),
             sidebar_button_menu(
               input_id = "result_lpsi_mode",
               choices = c(
-                "Single trait selection" = "single",
-                "Multi-trait selection" = "multi"
+                "Single-Trait Analysis" = "single",
+                "Selection Index" = "multi"
               ),
               selected = input$result_lpsi_mode %||% "single",
               style = "module"
@@ -5812,10 +6014,10 @@ server <- function(input, output, session) {
   })
   output$chart_sidebar_menu <- renderUI({
     choices <- c(
-      "Breeding" = "breeding",
+      "Pre-Breeding" = "breeding",
       "Genetic Diversity Analysis" = "diversity",
       "Mating" = "mating",
-      "Selection Index" = "selection_index",
+      "Single-Location Trial" = "selection_index",
       "Multi-Environment Trial" = "met"
     )
     module <- input$chart_module %||% "selection_index"
@@ -5868,7 +6070,7 @@ server <- function(input, output, session) {
     )
     current <- input$result_view %||% ""
     sidebar_detail_panel(
-      "Breeding process",
+      "Pre-Breeding process",
       choices = choices,
       input_id = "result_view",
       selected = if (current %in% choices) current else "breeding_stats"
@@ -5878,31 +6080,30 @@ server <- function(input, output, session) {
     choices <- c(
       "Summary" = "lpsi_trait",
       "ANOVA" = "lpsi_anova",
-      "Mean comparison" = "lpsi_lsd",
-      "Selection" = "lpsi_direct",
-      "Compare with LPSI" = "lpsi_compare"
+      "Genetic gain" = "lpsi_heritability",
+      "Mean comparison" = "lpsi_lsd"
     )
     current <- input$result_view %||% ""
     sidebar_detail_panel(
-      "Single trait selection",
+      "Single-Trait Analysis",
       choices = choices,
       input_id = "result_view",
-      selected = if (current %in% choices) current else "lpsi_direct",
+      selected = if (current %in% choices) current else "lpsi_trait",
       controls = uiOutput("lpsi_direct_controls")
     )
   })
   output$result_lpsi_multi_detail <- renderUI({
     choices <- c(
+      "Summary" = "lpsi_index_summary",
       "Superiority" = "lpsi_superiority",
-      "Heritability & gain" = "lpsi_heritability",
-      "Recommendation" = "lpsi_ranking"
+      "Trait Correlation" = "lpsi_correlation"
     )
     current <- input$result_view %||% ""
     sidebar_detail_panel(
-      "Multi trait selection",
+      "Selection Index",
       choices = choices,
       input_id = "result_view",
-      selected = if (current %in% choices) current else "lpsi_superiority"
+      selected = if (current %in% choices) current else "lpsi_index_summary"
     )
   })
   output$result_lpsi_threshold_detail <- renderUI({
@@ -5976,7 +6177,7 @@ server <- function(input, output, session) {
       trait_selected <- if (length(traits) > 0) traits[1] else character(0)
     }
     sidebar_detail_panel(
-      "Breeding",
+      "Pre-Breeding",
       choices = choices,
       input_id = "plot_view",
       selected = if (current %in% choices) current else "breeding_trend"
@@ -5985,27 +6186,27 @@ server <- function(input, output, session) {
   output$chart_lpsi_detail <- renderUI({
     mode <- input$chart_lpsi_mode %||% "single"
     mode_choices <- c(
-      "Single trait selection" = "single",
-      "Multi-trait selection" = "multi"
+      "Single-Trait Analysis" = "single",
+      "Selection Index" = "multi"
     )
     if (!(mode %in% mode_choices)) mode <- "single"
     current <- input$plot_view %||% ""
     choices <- if (identical(mode, "multi")) {
       c(
         "Ranking" = "lpsi_ranking_plot",
-        "Superiority" = "lpsi_heatmap"
+        "Superiority" = "lpsi_heatmap",
+        "Trait Correlation" = "lpsi_correlation_plot"
       )
     } else {
       c(
         "Mean comparison" = "lpsi_mean_comparison_plot",
-        "Genetic gain" = "lpsi_gain_curve",
-        "Ranking" = "lpsi_direct_plot"
+        "Single-Trait Ranking" = "lpsi_direct_plot"
       )
     }
     tagList(
       tags$div(
         class = "side-subpanel result-analysis-section",
-        tags$div(class = "side-subpanel-title", "Selection type"),
+        tags$div(class = "side-subpanel-title", "Analysis workflow"),
         sidebar_button_menu(
           input_id = "chart_lpsi_mode",
           choices = mode_choices,
@@ -6014,7 +6215,7 @@ server <- function(input, output, session) {
         )
       ),
       sidebar_detail_panel(
-        if (identical(mode, "multi")) "Multi-trait selection" else "Single trait selection",
+        if (identical(mode, "multi")) "Selection Index" else "Single-Trait Analysis",
         choices = choices,
         input_id = "plot_view",
         selected = if (current %in% choices) current else unname(choices)[1],
@@ -6264,7 +6465,7 @@ server <- function(input, output, session) {
     tagList(
       selectizeInput(
         inputId = "lpsi_run_benchmark_checks",
-        label = "Benchmark check",
+        label = "Check Variety",
         choices = choices,
         selected = selected,
         multiple = TRUE,
@@ -6280,7 +6481,17 @@ server <- function(input, output, session) {
             paste(prepared$detected_check_varieties, collapse = ", ")
           )
         )
-      }
+      },
+      selectInput(
+        inputId = "lpsi_trial_model",
+        label = "Model",
+        choices = c(
+          "CRD" = "CRD",
+          "LMM" = "LMM",
+          "RCBD" = "RCBD"
+        ),
+        selected = input$lpsi_trial_model %||% "RCBD"
+      )
     )
   })
   output$lpsi_direct_controls <- renderUI({
@@ -6792,7 +7003,7 @@ server <- function(input, output, session) {
         check_label <- NULL
       }
       
-      analysis_message("Running Breeding Analysis...")
+      analysis_message("Running Pre-Breeding Analysis...")
       res <- tryCatch({
         out <- breeding_run_gain_pipeline(
           data = uploaded_data(),
@@ -6833,7 +7044,7 @@ server <- function(input, output, session) {
         out
       }, error = function(e) {
         showNotification(
-          paste("Breeding Analysis failed:", e$message),
+          paste("Pre-Breeding Analysis failed:", e$message),
           type = "error",
           duration = NULL
         )
@@ -6848,18 +7059,19 @@ server <- function(input, output, session) {
           choices = input$breeding_trait_cols,
           selected = input$breeding_trait_cols[1]
         )
-        analysis_message("Breeding Analysis complete. Check the Result and Chart navbars.")
-        showNotification("Breeding Analysis complete.", type = "message")
+        analysis_message("Pre-Breeding Analysis complete. Check the Result and Chart navbars.")
+        showNotification("Pre-Breeding Analysis complete.", type = "message")
       } else {
-        analysis_message("Breeding Analysis failed. Please check the error message.")
+        analysis_message("Pre-Breeding Analysis failed. Please check the error message.")
       }
     } else if (input$analysis_method == "LPSI") {
-      analysis_message("Running LPSI analysis...")
+      req(input$lpsi_trial_model)
+      analysis_message("Running Single-Location Trial analysis...")
       res <- tryCatch({
         run_lpsi_with_settings()
       }, error = function(e) {
         showNotification(
-          paste("LPSI pipeline failed:", e$message),
+          paste("Single-Location Trial pipeline failed:", e$message),
           type = "error",
           duration = NULL
         )
@@ -6875,10 +7087,10 @@ server <- function(input, output, session) {
           choices = chart_traits,
           selected = chart_traits[1]
         )
-        analysis_message("LPSI analysis complete. Check the Result and Chart navbars.")
-        showNotification("LPSI analysis complete.", type = "message")
+        analysis_message("Single-Location Trial analysis complete. Check the Result and Chart navbars.")
+        showNotification("Single-Location Trial analysis complete.", type = "message")
       } else {
-        analysis_message("LPSI analysis failed. Please check the error message.")
+        analysis_message("Single-Location Trial analysis failed. Please check the error message.")
       }
     } else if (input$analysis_method == "MET") {
       met_traits <- input$met_trait_cols
@@ -7068,7 +7280,7 @@ server <- function(input, output, session) {
   })
   output$breeder_recommendation_table <- renderDT({
     rec <- breeder_recommendation()
-    validate(need(nrow(rec) > 0, "Run LPSI or MET to create a breeder recommendation table."))
+    validate(need(nrow(rec) > 0, "Run Single-Location Trial or MET to create a breeder recommendation table."))
     datatable(
       rec,
       options = list(pageLength = 50, scrollX = TRUE)
@@ -7102,23 +7314,354 @@ server <- function(input, output, session) {
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
+  output$lpsi_index_summary_table <- renderDT({
+    result <- lpsi_result()
+    datatable(
+      result$weight_table,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$lpsi_correlation_table <- renderDT({
+    result <- lpsi_result()
+    correlation <- tibble::rownames_to_column(
+      as.data.frame(result$trait_correlation),
+      "Trait"
+    )
+    datatable(correlation, options = list(pageLength = 50, scrollX = TRUE))
+  })
+  lpsi_all_traits_mean_comparison <- reactive({
+    result <- lpsi_result()
+    model_type <- as.character(result$decision_settings$Model[1] %||% "RCBD")
+    method <- lpsi_mean_comparison_method_r()
+    if (identical(method, "lsd")) {
+      return(as.data.frame(result$lsd_wide %||% data.frame()))
+    }
+
+    raw <- as.data.frame(result$cleaned_data %||% data.frame())
+    trait_info <- as.data.frame(result$trait_info %||% data.frame())
+    anova_rows <- as.data.frame(result$anova_full %||% data.frame())
+    id_lookup <- unique(raw[, c("ID", "Original_ID"), drop = FALSE])
+    id_lookup$ID <- as.character(id_lookup$ID)
+    tukey_long <- map_dfr(as.character(trait_info$Trait), function(trait) {
+      model_data <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
+      trait_test <- anova_rows[
+        as.character(anova_rows$Trait) == trait & trimws(as.character(anova_rows$Source)) == "ID",
+        , drop = FALSE
+      ]
+      is_anova <- nrow(trait_test) > 0 && identical(as.character(trait_test$Test[1]), "ANOVA")
+      out <- tryCatch({
+        model <- fit_single_location_model(model_data, trait, model_type)
+        em <- emmeans(model, ~ ID)
+        if (is_anova && df.residual(model) > 0) {
+          higher_better <- as.character(trait_info$Direction[trait_info$Trait == trait][1]) == "Higher better"
+          comparison <- multcomp::cld(
+            em,
+            Letters = c(letters, LETTERS),
+            adjust = "tukey",
+            alpha = lsd_significance_alpha,
+            sort = TRUE,
+            reversed = higher_better
+          ) %>% as.data.frame()
+          comparison$Group <- trimws(as.character(comparison$.group))
+          omnibus_p <- suppressWarnings(as.numeric(trait_test$p_value[1]))
+          if (!is.finite(omnibus_p) || omnibus_p >= lsd_significance_alpha) {
+            comparison$Group <- ""
+          }
+        } else {
+          comparison <- as.data.frame(em)
+          comparison$Group <- ""
+        }
+        comparison %>%
+          mutate(
+            ID = as.character(ID), Trait = trait,
+            Mean_Group = ifelse(
+              trimws(Group) == "",
+              as.character(round(emmean, 3)),
+              paste(round(emmean, 3), Group)
+            )
+          ) %>%
+          left_join(id_lookup, by = "ID") %>%
+          dplyr::select(ID, Original_ID, Trait, Mean_Group)
+      }, error = function(e) {
+        data.frame(
+          ID = character(0), Original_ID = character(0), Trait = character(0),
+          Mean_Group = character(0)
+        )
+      })
+      out
+    })
+    validate(need(nrow(tukey_long) > 0, "Tukey HSD table could not be generated."))
+    tukey_long %>%
+      pivot_wider(names_from = Trait, values_from = Mean_Group) %>%
+      arrange(suppressWarnings(as.numeric(as.character(ID))))
+  })
+  lpsi_selected_mean_comparison <- reactive({
+    result <- lpsi_result()
+    model_type <- as.character(result$decision_settings$Model[1] %||% "RCBD")
+    raw <- as.data.frame(result$cleaned_data %||% data.frame())
+    available_traits <- as.character(as.data.frame(result$trait_info %||% data.frame())$Trait)
+    trait <- input$lpsi_chart_trait
+    validate(need(
+      !is.null(trait) && length(trait) == 1 && trait %in% available_traits,
+      "Choose a valid trait in the Charts trait selector."
+    ))
+    validate(need(trait %in% names(raw), "Choose a valid trait for mean comparison."))
+
+    anova_rows <- as.data.frame(result$anova_full %||% data.frame())
+    trait_test <- anova_rows[
+      as.character(anova_rows$Trait) == trait & trimws(as.character(anova_rows$Source)) == "ID",
+      , drop = FALSE
+    ]
+    validate(need(nrow(trait_test) > 0, "No omnibus test is available for this trait."))
+    id_lookup <- unique(raw[, c("ID", "Original_ID"), drop = FALSE])
+    id_lookup$ID <- as.character(id_lookup$ID)
+    if (identical(as.character(trait_test$Test[1]), "Kruskal-Wallis")) {
+      model_data <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
+      omnibus_p <- suppressWarnings(as.numeric(trait_test$p_value[1]))
+      summaries <- model_data %>%
+        mutate(ID = as.character(ID)) %>%
+        group_by(ID) %>%
+        summarise(emmean = median(.data[[trait]], na.rm = TRUE), SE = NA_real_, .groups = "drop") %>%
+        left_join(id_lookup, by = "ID")
+      summaries$LSD_group <- ""
+      pairwise <- data.frame()
+      if (is.finite(omnibus_p) && omnibus_p < lsd_significance_alpha) {
+        dunn <- dunn_holm_test(model_data, trait, "ID", lsd_significance_alpha)
+        summaries$LSD_group <- unname(dunn$letters[summaries$ID])
+        pairwise <- dunn$pairwise
+      }
+      plot_data <- summaries %>%
+        mutate(Trait = trait, emmean = round(emmean, 3)) %>%
+        dplyr::select(Trait, ID, Original_ID, emmean, SE, LSD_group)
+      return(list(
+        table = pairwise, plot_data = plot_data, trait = trait,
+        method = "Dunn_Holm", checks = character(0)
+      ))
+    }
+    validate(need(
+      identical(as.character(trait_test$Test[1]), "ANOVA"),
+      "Mean comparison is not available for this trait."
+    ))
+    method <- input$lpsi_chart_mean_comparison_method
+    validate(need(
+      !is.null(method) && length(method) == 1 && method %in% c("lsd", "tukey"),
+      "Choose LSD or Tukey HSD in the Charts method selector."
+    ))
+
+    model_data <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
+    model <- fit_single_location_model(model_data, trait, model_type)
+    validate(need(df.residual(model) > 0, "Residual degrees of freedom is zero; mean comparison cannot be calculated."))
+    em <- emmeans(model, ~ ID)
+    em_df <- as.data.frame(em)
+    em_df$ID <- as.character(em_df$ID)
+    direction_row <- as.data.frame(result$trait_info)[as.data.frame(result$trait_info)$Trait == trait, , drop = FALSE]
+    higher_better <- nrow(direction_row) == 0 || as.character(direction_row$Direction[1]) == "Higher better"
+
+    if (method %in% c("lsd", "tukey")) {
+      adjustment <- if (identical(method, "tukey")) "tukey" else "none"
+      cld_tbl <- multcomp::cld(
+        em,
+        Letters = c(letters, LETTERS),
+        adjust = adjustment,
+        alpha = lsd_significance_alpha,
+        sort = TRUE,
+        reversed = higher_better
+      ) %>% as.data.frame()
+      cld_tbl$.group <- trimws(as.character(cld_tbl$.group))
+      if (!is.finite(suppressWarnings(as.numeric(trait_test$p_value[1]))) ||
+          suppressWarnings(as.numeric(trait_test$p_value[1])) >= lsd_significance_alpha) {
+        cld_tbl$.group <- ""
+      }
+      long <- cld_tbl %>%
+        mutate(
+          Trait = trait,
+          ID = as.character(ID),
+          emmean = round(emmean, 3),
+          SE = round(SE, 3),
+          LSD_group = .group
+        ) %>%
+        left_join(id_lookup, by = "ID") %>%
+        dplyr::select(Trait, ID, Original_ID, emmean, SE, LSD_group)
+      table <- long %>%
+        transmute(
+          ID,
+          Entry = Original_ID,
+          `Adjusted mean` = emmean,
+          SE,
+          Group = LSD_group
+        )
+      return(list(
+        table = table, plot_data = long, trait = trait,
+        method = if (identical(method, "tukey")) "Tukey_HSD" else "LSD",
+        checks = character(0)
+      ))
+    }
+
+    selected_checks <- unique(as.character(result$selected_checks %||% character(0)))
+    check_lookup <- id_lookup[
+      id_lookup$Original_ID %in% selected_checks | id_lookup$ID %in% selected_checks,
+      , drop = FALSE
+    ]
+    check_lookup <- check_lookup[!duplicated(check_lookup$ID), , drop = FALSE]
+    validate(need(nrow(check_lookup) > 0, "Select at least one benchmark check before using Dunnett."))
+
+    em_ids <- em_df$ID
+    check_lookup <- check_lookup[check_lookup$ID %in% em_ids, , drop = FALSE]
+    candidate_ids <- setdiff(em_ids, check_lookup$ID)
+    validate(need(length(candidate_ids) > 0, "No candidate entries remain after excluding the selected checks."))
+    contrast_vectors <- list()
+    contrast_map <- data.frame()
+    for (check_index in seq_len(nrow(check_lookup))) {
+      check_id <- check_lookup$ID[check_index]
+      check_code <- paste0("C", check_index)
+      for (candidate_id in candidate_ids) {
+        vector <- rep(0, length(em_ids))
+        vector[match(candidate_id, em_ids)] <- 1
+        vector[match(check_id, em_ids)] <- -1
+        contrast_name <- paste(candidate_id, check_code, sep = "__")
+        contrast_vectors[[contrast_name]] <- vector
+        contrast_map <- bind_rows(contrast_map, data.frame(
+          contrast = contrast_name, Candidate_ID = candidate_id,
+          Check_ID = check_id, Check = check_lookup$Original_ID[check_index],
+          Check_code = check_code, stringsAsFactors = FALSE
+        ))
+      }
+    }
+    dunnett <- as.data.frame(summary(
+      contrast(em, method = contrast_vectors),
+      infer = c(TRUE, TRUE), adjust = "mvt"
+    )) %>%
+      left_join(contrast_map, by = "contrast") %>%
+      left_join(id_lookup %>% rename(Candidate_ID = ID, Candidate = Original_ID), by = "Candidate_ID") %>%
+      left_join(em_df %>% transmute(Candidate_ID = ID, Candidate_mean = emmean), by = "Candidate_ID")
+    directed_difference <- if (higher_better) dunnett$estimate else -dunnett$estimate
+    dunnett$Status <- ifelse(
+      dunnett$p.value >= lsd_significance_alpha, "Similar",
+      ifelse(directed_difference > 0, "Better", "Worse")
+    )
+    dunnett$Badge <- paste0(
+      ifelse(dunnett$Status == "Better", "+", ifelse(dunnett$Status == "Worse", "-", "=")),
+      dunnett$Check_code
+    )
+    table <- dunnett %>% transmute(
+      Candidate,
+      `Adjusted mean` = round(Candidate_mean, 3),
+      Check_code,
+      Check,
+      Difference = round(estimate, 3),
+      `Adjusted p-value` = round(p.value, 5),
+      Status,
+      Badge
+    )
+    badge_summary <- dunnett %>%
+      group_by(Candidate_ID, Candidate) %>%
+      summarise(LSD_group = paste(Badge, collapse = " "), .groups = "drop")
+    plot_data <- em_df %>%
+      transmute(ID, emmean = round(emmean, 3), SE = round(SE, 3)) %>%
+      left_join(id_lookup, by = "ID") %>%
+      left_join(badge_summary, by = c("ID" = "Candidate_ID", "Original_ID" = "Candidate")) %>%
+      mutate(Trait = trait, LSD_group = ifelse(is.na(LSD_group), "", LSD_group)) %>%
+      dplyr::select(Trait, ID, Original_ID, emmean, SE, LSD_group)
+    list(
+      table = table, plot_data = plot_data, trait = trait, method = "Dunnett",
+      checks = paste0("C", seq_len(nrow(check_lookup)), " = ", check_lookup$Original_ID)
+    )
+  })
+  lpsi_selected_anova_table <- reactive({
+    result <- lpsi_result()
+    full <- as.data.frame(result$anova_full %||% data.frame())
+    validate(need(nrow(full) > 0, "ANOVA table was not generated."))
+
+    available_traits <- unique(as.character(full$Trait))
+    trait <- input$lpsi_direct_trait %||% input$eval_trait %||% available_traits[1]
+    if (!trait %in% available_traits) trait <- available_traits[1]
+    selected <- full[as.character(full$Trait) == trait, , drop = FALSE]
+    test <- as.character(selected$Test[1] %||% "ANOVA")
+    normality_p <- suppressWarnings(as.numeric(selected$Normality_p[1]))
+
+    if (identical(test, "ANOVA")) {
+      table <- data.frame(
+        `Source of variation` = trimws(as.character(selected$Source)),
+        `Sum of squares (SS)` = suppressWarnings(as.numeric(selected$Sum_Sq)),
+        df = suppressWarnings(as.numeric(selected$Df)),
+        `Mean square (MS)` = suppressWarnings(as.numeric(selected$Mean_Sq)),
+        F = suppressWarnings(as.numeric(selected$F_value)),
+        `p-value` = suppressWarnings(as.numeric(selected$p_value)),
+        Significance = as.character(selected$Sig),
+        check.names = FALSE
+      )
+      table <- rbind(
+        table,
+        data.frame(
+          `Source of variation` = "Total",
+          `Sum of squares (SS)` = round(sum(table[["Sum of squares (SS)"]], na.rm = TRUE), 4),
+          df = sum(table$df, na.rm = TRUE),
+          `Mean square (MS)` = NA_real_, F = NA_real_, `p-value` = NA_real_,
+          Significance = "", check.names = FALSE
+        )
+      )
+    } else {
+      table <- data.frame(
+        `Source of variation` = as.character(selected$Source),
+        `Chi-square` = suppressWarnings(as.numeric(selected$F_value)),
+        df = suppressWarnings(as.numeric(selected$Df)),
+        `p-value` = suppressWarnings(as.numeric(selected$p_value)),
+        Significance = as.character(selected$Sig),
+        check.names = FALSE
+      )
+    }
+    list(
+      table = table,
+      trait = trait,
+      test = test,
+      normality_p = normality_p
+    )
+  })
+  output$lpsi_anova_note <- renderUI({
+    selected <- lpsi_selected_anova_table()
+    p_text <- if (is.finite(selected$normality_p)) {
+      format(selected$normality_p, digits = 5, scientific = FALSE, trim = TRUE)
+    } else {
+      "not available"
+    }
+    tags$div(
+      class = "small-note",
+      style = "margin: 0 0 12px 0;",
+      tags$strong(paste0(selected$trait, " — ", selected$test)),
+      paste0(" (residual normality p-value: ", p_text, ").")
+    )
+  })
   output$anova_full_table <- renderDT({
     result <- lpsi_result()
-    validate(
-      need(nrow(result$anova_full) > 0, "ANOVA table was not generated.")
-    )
+    validate(need(nrow(result$anova_full) > 0, "ANOVA table was not generated."))
     datatable(
       result$anova_full,
       options = list(pageLength = 100, scrollX = TRUE)
     )
   })
-  output$lsd_wide_table <- renderDT({
-    result <- lpsi_result()
-    validate(
-      need(nrow(result$lsd_wide) > 0, "LSD table was not generated.")
+  output$lpsi_mean_comparison_note <- renderUI({
+    comparison <- lpsi_selected_mean_comparison()
+    method_label <- gsub("_", " ", comparison$method)
+    detail <- if (identical(comparison$method, "Dunnett")) {
+      paste0(
+        " Joint multiplicity adjustment across candidate-check contrasts. ",
+        paste(comparison$checks, collapse = "; "),
+        ". Badges: + better, = similar, - worse."
+      )
+    } else {
+      " Compact letters that overlap indicate means that are not significantly different."
+    }
+    tags$div(
+      class = "small-note", style = "margin: 0 0 12px 0;",
+      tags$strong(paste0(comparison$trait, " - ", method_label, " (alpha = ", lsd_significance_alpha, ")")),
+      detail
     )
+  })
+  output$lsd_wide_table <- renderDT({
+    comparison <- lpsi_all_traits_mean_comparison()
+    validate(need(nrow(comparison) > 0, "Mean comparison table was not generated."))
     datatable(
-      result$lsd_wide,
+      comparison,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
@@ -7134,12 +7677,12 @@ server <- function(input, output, session) {
   })
   output$lpsi_direct_table <- renderDT({
     direct <- lpsi_direct_selection_r()
-    validate(need(nrow(direct) > 0, "Run LPSI and choose a primary trait to view direct selection."))
+    validate(need(nrow(direct) > 0, "Run Single-Location Trial and choose a primary trait to view direct selection."))
     datatable(direct, options = list(pageLength = 50, scrollX = TRUE))
   })
   output$lpsi_compare_table <- renderDT({
     comparison <- lpsi_method_comparison_r()
-    validate(need(nrow(comparison) > 0, "Run LPSI to compare selection methods."))
+    validate(need(nrow(comparison) > 0, "Run Single-Location Trial to compare selection methods."))
     datatable(comparison, options = list(pageLength = 50, scrollX = TRUE))
   })
   output$adjusted_means_table <- renderDT({
@@ -7161,7 +7704,10 @@ server <- function(input, output, session) {
   output$lpsi_mean_comparison_plot <- renderPlot({
     result <- lpsi_result()
     validate(need(!is.null(input$lpsi_chart_trait) && input$lpsi_chart_trait != "", "Choose a trait."))
-    print(plot_lpsi_mean_comparison(result, input$lpsi_chart_trait))
+    comparison <- lpsi_selected_mean_comparison()
+    result$lsd_long <- comparison$plot_data
+    result$mean_comparison_method <- comparison$method
+    print(plot_lpsi_mean_comparison(result, comparison$trait))
   }, res = 96, execOnResize = TRUE)
   output$ranking_plot <- renderPlot({
     result <- lpsi_result()
@@ -7175,6 +7721,10 @@ server <- function(input, output, session) {
     } else {
       draw_chart(result$heatmap_plot)
     }
+  }, res = 96, execOnResize = TRUE)
+  output$lpsi_correlation_plot <- renderPlot({
+    result <- lpsi_result()
+    print(result$trait_correlation_plot)
   }, res = 96, execOnResize = TRUE)
   output$gain_curve_plot <- renderPlot({
     result <- lpsi_result()
@@ -7429,14 +7979,14 @@ server <- function(input, output, session) {
     }
   )
   output$download_breeding <- downloadHandler(
-    filename = function() paste0("Breeding_analysis_results_", Sys.Date(), ".xlsx"),
+    filename = function() paste0("Pre-Breeding_analysis_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
       req(saved_results$BREEDING)
       write_analysis_workbook("BREEDING", saved_results$BREEDING, file)
     }
   )
   output$download_lpsi <- downloadHandler(
-    filename = function() paste0("LPSI_selection_results_", Sys.Date(), ".xlsx"),
+    filename = function() paste0("Single-Location_Trial_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
       req(saved_results$LPSI)
       result <- if (identical(analysis_used(), "LPSI")) {
@@ -7499,9 +8049,9 @@ server <- function(input, output, session) {
       export_files <- character()
       export_names <- c(
         MATING = "Mating_analysis_results.xlsx",
-        BREEDING = "Breeding_analysis_results.xlsx",
+        BREEDING = "Pre-Breeding_analysis_results.xlsx",
         DIVERSITY = "Genetic_diversity_results.xlsx",
-        LPSI = "LPSI_selection_results.xlsx",
+        LPSI = "Single-Location_Trial_results.xlsx",
         MET = "MET_across_locations_results.xlsx"
       )
       for (analysis_type in names(available)[available]) {
