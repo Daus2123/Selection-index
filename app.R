@@ -33,7 +33,6 @@ source(file.path("modules", "module_5_met.R"), local = TRUE)
 # User settings
 id_col  <- "Variety"
 rep_col <- "Rep"
-remove_cols <- c("Sex", "FsC", "Pr", "Gs", "DM")
 weight_row_labels <- c("WEIGHT", "WEIGHTS", "IMPORTANCE", "IMPORTANT")
 direction_row_labels <- c("DIRECTION", "DIRECTIONS", "TRAIT_DIRECTION")
 type_col_candidates <- c("Type", "TYPE", "Entry_Type", "Entry type", "EntryType")
@@ -249,17 +248,40 @@ build_export_tables <- function(analysis_type, results) {
       if (!is.null(result)) {
         add_sheet("01_summary", trait, result$genotype_summary)
         add_sheet("01b_qc", trait, build_met_qc_table(result))
-        add_sheet("02_lmm", trait, result$model_summary)
-        add_sheet("03_variance", trait, result$variance_components)
-        add_sheet("04_blup", trait, result$blups_main)
+        add_sheet("02_model_summary", trait, result$model_summary)
+        model_result_name <- if (
+          nrow(as.data.frame(result$model_summary)) > 0 &&
+          grepl("^ANOVA", as.character(result$model_summary$Model[1] %||% ""), ignore.case = TRUE)
+        ) "joint_anova" else "lmm_variance"
+        add_sheet("03_model", paste(model_result_name, trait, sep = "_"), result$variance_components)
+        estimate_result_name <- if (met_result_uses_anova(result)) "blue" else "blup"
+        add_sheet(
+          "04_genotype_estimates",
+          paste(estimate_result_name, trait, sep = "_"),
+          met_genotype_estimates_table(result)
+        )
+        add_sheet(
+          "04b_genotype_location",
+          trait,
+          met_location_estimates_table(result)
+        )
         add_sheet("05_fw", trait, result$fw_results)
         add_sheet("06_ammi", trait, result$ammi_genotype)
         add_sheet("07_gge", trait, result$gge_genotype)
+        add_sheet("07b_gge_decision_notes", trait, result$gge_decision_notes)
+        add_sheet("07c_gge_mean_stability", trait, result$gge_mean_stability_decision)
+        add_sheet("07d_gge_which_won", trait, result$gge_winner_decision)
+        add_sheet("07e_gge_environment", trait, result$gge_environment_decision)
+        add_sheet("07f_gge_pc_variance", trait, result$gge_pc_variance)
         add_sheet("08_selection", trait, result$met_selection)
-        add_sheet("08b_ammi_gge_notes", trait, result$ammi_notes)
+        add_sheet("08b_ammi_notes", trait, result$ammi_notes)
       }
     }
     add_sheet("09_overall", "selection", results$met_integrated_ranking)
+    if (!is.null(results$met_decision_board)) {
+      add_sheet("09b_decision", "board", results$met_decision_board$board)
+      add_sheet("09c_decision_rules", "thresholds", results$met_decision_board$thresholds)
+    }
     add_sheet("10", "pipeline_review", si_met_pipeline_review(results))
     add_sheet("11", "trait_quality", si_met_trait_quality(results))
   } else if (analysis_type == "DIVERSITY") {
@@ -442,7 +464,7 @@ prepare_excel_input <- function(df_raw, require_rep = FALSE) {
   check_original_name <- as.character(df_data[[id_col]][1])
   candidate_cols <- setdiff(
     names(df_data),
-    c(id_col, rep_col, type_col, remove_cols)
+    c(id_col, rep_col, type_col)
   )
   trait_numeric_count <- sapply(candidate_cols, function(tr) {
     sum(!is.na(to_number(df_data[[tr]])))
@@ -2663,1069 +2685,15 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
 
 
 
-# MET function
-MET_W_YIELD <- 0.50
-MET_W_FW <- 0.25
-MET_W_ASV <- 0.25
-MET_MIN_ENVS_FOR_BIPLOT <- 2
-met_rep_col_candidates <- c("Rep", "REP", "Replication", "Replicate", "Rep_No", "RepNo", "Replication_No")
-met_block_col_candidates <- c("Block", "BLOCK", "Blk", "Block_No", "BlockNo", "Incomplete_Block")
-prepare_met_input_frame <- function(df_raw) {
-  df <- as.data.frame(df_raw)
-  names(df) <- make.unique(trimws(names(df)), sep = "_")
-  if (!"Environment" %in% names(df) && "Location" %in% names(df)) {
-    names(df)[names(df) == "Location"] <- "Environment"
-  }
-  if (!"Genotype" %in% names(df) && id_col %in% names(df)) {
-    names(df)[names(df) == id_col] <- "Genotype"
-  }
-  if (!"Genotype" %in% names(df)) {
-    stop("MET requires a Genotype column. If your file uses Variety, it will be converted automatically.")
-  }
-  if (!"Environment" %in% names(df)) {
-    stop("MET requires an Environment column. If your file uses Location, it will be converted automatically.")
-  }
-  df
-}
-pick_met_numeric_traits <- function(df, protected_cols) {
-  candidate_cols <- setdiff(names(df), protected_cols)
-  numeric_count <- sapply(candidate_cols, function(tr) sum(!is.na(to_number(df[[tr]]))))
-  trait_cols <- candidate_cols[numeric_count > 0]
-  if (length(trait_cols) == 0) {
-    stop("MET requires at least one numeric trait column.")
-  }
-  trait_cols
-}
-get_met_trait_cols <- function(df_raw) {
-  prepare_met_trait_settings(df_raw)$trait_cols
-}
-prepare_met_trait_settings <- function(df_raw) {
-  df <- prepare_met_input_frame(df_raw)
-  genotype_values_upper <- toupper(clean_text(df$Genotype))
-  weight_rows <- which(genotype_values_upper %in% weight_row_labels)
-  direction_rows <- which(genotype_values_upper %in% direction_row_labels)
-  weight_row <- if (length(weight_rows) > 0) tail(weight_rows, 1) else integer(0)
-  direction_row <- if (length(direction_rows) > 0) tail(direction_rows, 1) else integer(0)
-  metadata_rows <- sort(unique(c(weight_rows, direction_rows)))
-  df_data <- df
-  if (length(metadata_rows) > 0) {
-    df_data <- df_data[-metadata_rows, , drop = FALSE]
-  }
-  trait_cols <- pick_met_numeric_traits(
-    df_data,
-    c("Genotype", "Environment", met_rep_col_candidates, met_block_col_candidates, remove_cols)
-  )
-  weights_raw_used <- setNames(rep(1, length(trait_cols)), trait_cols)
-  if (length(weight_row) > 0) {
-    weight_values <- to_number(unlist(
-      df[weight_row, trait_cols, drop = FALSE],
-      use.names = FALSE
-    ))
-    names(weight_values) <- trait_cols
-    weights_raw_used <- weight_values
-    weights_raw_used[is.na(weights_raw_used)] <- 1
-    weights_raw_used[weights_raw_used < 0] <- 0
-    if (sum(weights_raw_used, na.rm = TRUE) <= 0) {
-      weights_raw_used <- setNames(rep(1, length(trait_cols)), trait_cols)
-    }
-  }
-  trait_direction <- setNames(rep("Higher better", length(trait_cols)), trait_cols)
-  target_traits <- numeric(0)
-  if (length(direction_row) > 0) {
-    direction_values <- unlist(
-      df[direction_row, trait_cols, drop = FALSE],
-      use.names = FALSE
-    )
-    names(direction_values) <- trait_cols
-    for (tr in trait_cols) {
-      parsed <- parse_trait_direction(direction_values[[tr]])
-      trait_direction[[tr]] <- parsed$direction
-      if (parsed$direction == "Target trait") {
-        target_traits[[tr]] <- parsed$target_value
-      }
-    }
-  }
-  trait_info <- data.frame(
-    Trait = trait_cols,
-    Direction = as.character(trait_direction[trait_cols]),
-    Target_value = ifelse(
-      trait_cols %in% names(target_traits),
-      as.numeric(target_traits[trait_cols]),
-      NA_real_
-    ),
-    Raw_weight = as.numeric(weights_raw_used[trait_cols]),
-    stringsAsFactors = FALSE
-  )
-  list(
-    data = df_data,
-    trait_cols = trait_cols,
-    weights_raw_used = weights_raw_used,
-    trait_direction = trait_direction,
-    target_traits = target_traits,
-    trait_info = trait_info
-  )
-}
-make_met_data <- function(df_raw, trait_used = NULL, replication_col = NULL, block_col = NULL) {
-  prepared <- prepare_met_trait_settings(df_raw)
-  df <- prepared$data
-  trait_cols <- prepared$trait_cols
-  if (is.null(trait_used)) {
-    trait_used <- if ("Weight" %in% trait_cols) "Weight" else trait_cols[1]
-  }
-  if (!trait_used %in% trait_cols) {
-    stop("Selected MET trait was not found or is not numeric: ", trait_used)
-  }
-  df$Weight <- to_number(df[[trait_used]])
-  use_replication <- !is.null(replication_col) && replication_col != "" && replication_col %in% names(df)
-  if (!use_replication) {
-    stop("MET requires a replication column. Select a valid Rep/Replication column before running MET.")
-  }
-  use_block <- !is.null(block_col) && block_col != "" && block_col %in% names(df)
-  dat <- df %>%
-    mutate(
-      Genotype = trimws(as.character(Genotype)),
-      Environment = trimws(as.character(Environment)),
-      Rep = if (use_replication) trimws(as.character(.data[[replication_col]])) else NA_character_,
-      Block = if (use_block) trimws(as.character(.data[[block_col]])) else NA_character_
-    ) %>%
-    filter(
-      !is.na(Genotype), Genotype != "",
-      !is.na(Environment), Environment != "",
-      !is.na(Weight)
-    )
-  dat <- dat %>% filter(!is.na(Rep), Rep != "")
-  if (use_block) {
-    dat <- dat %>% filter(!is.na(Block), Block != "")
-  }
-  dat <- dat %>%
-    mutate(
-      Genotype = factor(Genotype),
-      Environment = factor(Environment),
-      Rep = factor(Rep),
-      Block = if (use_block) factor(Block) else factor("B1")
-    )
-  if (nrow(dat) == 0) {
-    stop("No valid MET rows remained after cleaning Genotype, Environment, and Weight.")
-  }
-  if (n_distinct(dat$Genotype) < 2) {
-    stop("MET requires at least 2 genotypes.")
-  }
-  if (n_distinct(dat$Environment) < 2) {
-    stop("MET requires at least 2 environments.")
-  }
-  list(
-    data = dat,
-    trait_used = trait_used,
-    replication_col = replication_col,
-    block_col = if (use_block) block_col else NULL
-  )
-}
-met_safe_lrt <- function(model_a, model_b, test_name) {
-  if (inherits(model_a, "met_model_error") || inherits(model_b, "met_model_error")) {
-    note_parts <- character(0)
-    if (inherits(model_a, "met_model_error")) note_parts <- c(note_parts, model_a$error)
-    if (inherits(model_b, "met_model_error")) note_parts <- c(note_parts, model_b$error)
-    note <- paste(note_parts, collapse = " | ")
-    return(data.frame(Test = test_name, Model = "LRT model failed", npar = NA, AIC = NA, BIC = NA, logLik = NA, deviance = NA, Chisq = NA, Df = NA, `Pr(>Chisq)` = NA, Note = note, check.names = FALSE))
-  }
-  tryCatch({
-    as.data.frame(anova(model_a, model_b)) %>% rownames_to_column("Model") %>% mutate(Test = test_name, .before = 1)
-  }, error = function(e) {
-    data.frame(Test = test_name, Model = "LRT failed", npar = NA, AIC = NA, BIC = NA, logLik = NA, deviance = NA, Chisq = NA, Df = NA, `Pr(>Chisq)` = NA, Note = e$message, check.names = FALSE)
-  })
-}
-build_met_qc_table <- function(result) {
-  if (is.null(result)) {
-    return(data.frame())
-  }
-  rows <- list()
-  add_qc <- function(area, metric, value, status = "OK", note = "") {
-    rows[[length(rows) + 1]] <<- data.frame(
-      QC_area = area,
-      Metric = metric,
-      Value = as.character(value),
-      Status = status,
-      Note = as.character(note),
-      stringsAsFactors = FALSE
-    )
-  }
-  presence <- as.data.frame(result$presence)
-  genotype_summary <- as.data.frame(result$genotype_summary)
-  outliers <- as.data.frame(result$outlier_summary)
-  model_summary <- as.data.frame(result$model_summary)
-  ammi_notes <- as.data.frame(result$ammi_notes)
-  env_cols <- setdiff(names(presence), c("Genotype", "n_envs"))
-  n_genotypes <- nrow(presence)
-  n_envs <- length(env_cols)
-  if (n_genotypes > 0 && n_envs > 0) {
-    presence_matrix <- as.matrix(presence[, env_cols, drop = FALSE])
-    observed_cells <- sum(suppressWarnings(as.numeric(presence_matrix)) == 1, na.rm = TRUE)
-    expected_cells <- n_genotypes * n_envs
-    missing_cells <- expected_cells - observed_cells
-    missing_pct <- if (expected_cells > 0) round(100 * missing_cells / expected_cells, 1) else NA_real_
-    coverage_status <- if (missing_cells == 0) "OK" else if (missing_pct <= 20) "Review" else "High risk"
-    add_qc(
-      "Coverage",
-      "Observed genotype-location cells",
-      paste0(observed_cells, " of ", expected_cells, " (", round(100 - missing_pct, 1), "%)"),
-      coverage_status,
-      "Missing cells are predicted in the BLUP matrix used by AMMI/GGE."
-    )
-    min_envs_observed <- min(presence$n_envs, na.rm = TRUE)
-    max_envs_observed <- max(presence$n_envs, na.rm = TRUE)
-    add_qc(
-      "Coverage",
-      "Locations observed per genotype",
-      paste0(min_envs_observed, " to ", max_envs_observed, " of ", n_envs),
-      if (min_envs_observed < n_envs) "Review" else "OK",
-      "Large differences mean some genotypes have weaker across-location evidence."
-    )
-    if (missing_cells > 0) {
-      missing_examples <- presence %>%
-        dplyr::select(Genotype, dplyr::all_of(env_cols)) %>%
-        tidyr::pivot_longer(-Genotype, names_to = "Environment", values_to = "Present") %>%
-        mutate(Present = suppressWarnings(as.numeric(Present))) %>%
-        filter(is.na(Present) | Present == 0) %>%
-        transmute(Cell = paste0(Genotype, "@", Environment)) %>%
-        pull(Cell)
-      add_qc(
-        "Coverage",
-        "Missing cells",
-        missing_cells,
-        coverage_status,
-        if (length(missing_examples) == 0) "" else paste(head(missing_examples, 12), collapse = " | ")
-      )
-    }
-  }
-  min_required <- suppressWarnings(as.integer(ammi_notes$Min_locations_required[1] %||% NA_integer_))
-  if (nrow(presence) > 0 && is.finite(min_required)) {
-    low_conf <- presence %>%
-      filter(n_envs < min_required) %>%
-      pull(Genotype) %>%
-      as.character()
-    add_qc(
-      "AMMI/GGE confidence",
-      "Minimum observed locations required",
-      min_required,
-      "OK",
-      "Genotypes below this threshold are shown as low confidence in AMMI/GGE."
-    )
-    add_qc(
-      "AMMI/GGE confidence",
-      "Low-confidence genotypes",
-      length(low_conf),
-      if (length(low_conf) == 0) "OK" else "Review",
-      if (length(low_conf) == 0) "" else paste(low_conf, collapse = ", ")
-    )
-  }
-  if (nrow(ammi_notes) > 0 && "Data_source" %in% names(ammi_notes)) {
-    add_qc(
-      "AMMI/GGE confidence",
-      "Biplot data source",
-      ammi_notes$Data_source[1],
-      "Review",
-      ammi_notes$Imputed_cell_warning[1] %||% ""
-    )
-  }
-  if (nrow(outliers) > 0) {
-    removed <- suppressWarnings(as.numeric(outliers$Removed_total[1] %||% NA_real_))
-    original <- suppressWarnings(as.numeric(outliers$Rows_original[1] %||% NA_real_))
-    removed_pct <- if (is.finite(original) && original > 0) round(100 * removed / original, 1) else NA_real_
-    outlier_status <- if (!is.finite(removed) || removed == 0) "OK" else if (removed_pct <= 5) "Review" else "High risk"
-    add_qc(
-      "Outliers",
-      "Rows removed by automatic filtering",
-      paste0(removed, " of ", original, " (", removed_pct, "%)"),
-      outlier_status,
-      "High removal changes may affect BLUP and ranking decisions."
-    )
-  }
-  if (nrow(genotype_summary) > 0 && "N_observations" %in% names(genotype_summary)) {
-    n_obs <- suppressWarnings(as.numeric(genotype_summary$N_observations))
-    add_qc(
-      "Replication balance",
-      "Observations per genotype",
-      paste0(min(n_obs, na.rm = TRUE), " to ", max(n_obs, na.rm = TRUE)),
-      if (length(unique(stats::na.omit(n_obs))) > 1) "Review" else "OK",
-      "Unequal observations can increase shrinkage differences among genotype BLUPs."
-    )
-  }
-  if (nrow(model_summary) > 0) {
-    add_qc(
-      "Controls",
-      "Controls used",
-      model_summary$Controls_used[1] %||% "",
-      "Review",
-      model_summary$Notes[1] %||% ""
-    )
-    add_qc(
-      "Model",
-      "Model formula",
-      model_summary$Model_formula[1] %||% "",
-      "OK",
-      paste0("Broad-sense H2 = ", model_summary$Broad_sense_H2[1] %||% "")
-    )
-  }
-  if (length(rows) == 0) {
-    return(data.frame())
-  }
-  dplyr::bind_rows(rows)
-}
-met_fill_rank <- function(x) {
-  if (length(x) == 0) return(x)
-  if (all(is.na(x))) return(rep((length(x) + 1) / 2, length(x)))
-  replace(x, is.na(x), max(x, na.rm = TRUE) + 1)
-}
-normalize_met_component_weights <- function(mean_weight, fw_weight, asv_weight) {
-  scalar_weight <- function(value) {
-    value <- suppressWarnings(as.numeric(value))
-    if (length(value) == 0 || !is.finite(value[1]) || value[1] < 0) {
-      return(0)
-    }
-    value[1]
-  }
-  weights <- c(
-    mean = scalar_weight(mean_weight),
-    fw = scalar_weight(fw_weight),
-    asv = scalar_weight(asv_weight)
-  )
-  if (sum(weights) <= 0) {
-    weights <- c(mean = 50, fw = 25, asv = 25)
-  }
-  weights / sum(weights)
-}
-build_met_selection_ranking <- function(result, component_weights = c(mean = 0.5, fw = 0.25, asv = 0.25)) {
-  asv_table <- if (nrow(result$ammi_genotype) > 0) {
-    result$ammi_genotype[, c("Genotype", "ASV"), drop = FALSE]
-  } else {
-    data.frame(Genotype = character(), ASV = numeric())
-  }
-  selection_base <- result$blups_main %>%
-    left_join(result$fw_results[, c("Genotype", "Sens", "b_interp")], by = "Genotype") %>%
-    left_join(asv_table, by = "Genotype")
-  rank_blup <- rank(-selection_base$BLUP_G, ties.method = "average")
-  rank_stability <- met_fill_rank(rank(abs(selection_base$Sens - 1), ties.method = "average", na.last = "keep"))
-  rank_asv <- met_fill_rank(rank(selection_base$ASV, ties.method = "average", na.last = "keep"))
-  selection_base %>%
-    mutate(
-      Rank_BLUP = rank_blup,
-      Rank_stability = rank_stability,
-      Rank_ASV = rank_asv,
-      Mean_weight = round(component_weights[["mean"]] * 100, 1),
-      FW_weight = round(component_weights[["fw"]] * 100, 1),
-      ASV_weight = round(component_weights[["asv"]] * 100, 1),
-      Combined_score = component_weights[["mean"]] * Rank_BLUP +
-        component_weights[["fw"]] * Rank_stability +
-        component_weights[["asv"]] * Rank_ASV,
-      Final_rank = rank(Combined_score, ties.method = "first")
-    ) %>%
-    arrange(Final_rank) %>%
-    mutate(CI_overlap_flag = CI_upper > lead(CI_lower))
-}
-plot_met_selection_ranking <- function(selection, trait_used) {
-  ggplot(selection, aes(x = reorder(Genotype, -BLUP_G), y = BLUP_G, fill = b_interp)) +
-    geom_bar(stat = "identity", width = 0.7) +
-    geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.3, color = "#2C3E50", linewidth = 0.6) +
-    geom_text(aes(y = BLUP_G / 2, label = paste0("#", Final_rank)), vjust = 0.5, size = 3.5, fontface = "bold", color = "white") +
-    scale_fill_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71"), na.value = "gray70") +
-    labs(
-      title = paste0("Hybrid selection - ", trait_used, " performance & stability"),
-      subtitle = paste0(
-        "Weights: Mean=", round(unique(selection$Mean_weight)[1], 1),
-        "%, FW=", round(unique(selection$FW_weight)[1], 1),
-        "%, ASV=", round(unique(selection$ASV_weight)[1], 1), "%"
-      ),
-      x = "Genotype",
-      y = paste0("BLUP for ", trait_used),
-      fill = "Stability (FW)"
-    ) +
-    theme_bw() +
-    theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 8), plot.margin = margin(t = 10, r = 24, b = 24, l = 12))
-}
-build_met_integrated_ranking <- function(df_raw, met_results, component_weights = c(mean = 1, fw = 0, asv = 0)) {
-  prepared <- prepare_met_trait_settings(df_raw)
-  successful_traits <- intersect(prepared$trait_cols, names(met_results))
-  if (length(successful_traits) == 0) {
-    return(list(
-      ranking = data.frame(),
-      trait_weights = data.frame(),
-      adjusted_performance = data.frame(),
-      standardized_scores = data.frame(),
-      plot = empty_plot("Integrated ranking needs at least one successful MET trait.")
-    ))
-  }
-  weights_raw <- prepared$weights_raw_used[successful_traits]
-  weights_raw[is.na(weights_raw)] <- 1
-  weights_raw[weights_raw < 0] <- 0
-  if (sum(weights_raw, na.rm = TRUE) <= 0) {
-    weights_raw <- setNames(rep(1, length(successful_traits)), successful_traits)
-  }
-  weights <- weights_raw / sum(weights_raw)
-  trait_blups <- purrr::map_dfr(successful_traits, function(tr) {
-    fw_scores <- met_results[[tr]]$fw_results %>%
-      transmute(
-        Genotype = as.character(Genotype),
-        FW_stability_raw = -abs(as.numeric(Sens) - 1)
-      )
-    asv_scores <- if (nrow(met_results[[tr]]$ammi_genotype) > 0) {
-      met_results[[tr]]$ammi_genotype %>%
-        transmute(
-          Genotype = as.character(Genotype),
-          ASV_stability_raw = -as.numeric(ASV)
-        )
-    } else {
-      data.frame(Genotype = character(), ASV_stability_raw = numeric())
-    }
-    met_results[[tr]]$blups_main %>%
-      transmute(
-        Genotype = as.character(Genotype),
-        Trait = tr,
-        Raw_BLUP = as.numeric(BLUP_G)
-      ) %>%
-      left_join(fw_scores, by = "Genotype") %>%
-      left_join(asv_scores, by = "Genotype")
-  })
-  adjust_value <- function(value, trait_name) {
-    if (trait_name %in% names(prepared$target_traits)) {
-      return(-abs(value - prepared$target_traits[[trait_name]]))
-    }
-    if (prepared$trait_direction[[trait_name]] == "Lower better") {
-      return(-value)
-    }
-    value
-  }
-  trait_blups$Adjusted_performance <- mapply(
-    adjust_value,
-    trait_blups$Raw_BLUP,
-    trait_blups$Trait
-  )
-  trait_blups <- trait_blups %>%
-    group_by(Trait) %>%
-    mutate(
-      Mean_component = standardize_trait(Adjusted_performance),
-      FW_component = standardize_trait(FW_stability_raw),
-      ASV_component = standardize_trait(ASV_stability_raw),
-      Component_weight_coverage =
-        ifelse(!is.na(Mean_component), component_weights[["mean"]], 0) +
-        ifelse(!is.na(FW_component), component_weights[["fw"]], 0) +
-        ifelse(!is.na(ASV_component), component_weights[["asv"]], 0),
-      Standardized_score = ifelse(
-        Component_weight_coverage > 0,
-        (
-          replace_na(Mean_component, 0) * ifelse(!is.na(Mean_component), component_weights[["mean"]], 0) +
-            replace_na(FW_component, 0) * ifelse(!is.na(FW_component), component_weights[["fw"]], 0) +
-            replace_na(ASV_component, 0) * ifelse(!is.na(ASV_component), component_weights[["asv"]], 0)
-        ) / Component_weight_coverage,
-        NA_real_
-      )
-    ) %>%
-    ungroup()
-  adjusted_wide <- trait_blups %>%
-    dplyr::select(Genotype, Trait, Adjusted_performance) %>%
-    pivot_wider(
-      names_from = Trait,
-      values_from = Adjusted_performance
-    )
-  standardized_wide <- trait_blups %>%
-    dplyr::select(Genotype, Trait, Standardized_score) %>%
-    pivot_wider(
-      names_from = Trait,
-      values_from = Standardized_score
-    )
-  score_long <- trait_blups %>%
-    dplyr::select(Genotype, Trait, Standardized_score) %>%
-    mutate(Normalized_weight = as.numeric(weights[Trait]))
-  integrated <- score_long %>%
-    group_by(Genotype) %>%
-    summarise(
-      N_traits_used = sum(!is.na(Standardized_score)),
-      Weight_coverage = sum(Normalized_weight[!is.na(Standardized_score)], na.rm = TRUE),
-      Integrated_MET_Index = ifelse(
-        Weight_coverage > 0,
-        sum(Standardized_score * Normalized_weight, na.rm = TRUE) / Weight_coverage,
-        NA_real_
-      ),
-      .groups = "drop"
-    ) %>%
-    arrange(desc(Integrated_MET_Index)) %>%
-    mutate(Integrated_rank = row_number(), .before = 1)
-  adjusted_output <- adjusted_wide %>%
-    rename_with(~ paste0("Perf_", .x), all_of(successful_traits))
-  standardized_output <- standardized_wide %>%
-    rename_with(~ paste0("Std_", .x), all_of(successful_traits))
-  ranking <- integrated %>%
-    left_join(adjusted_output, by = "Genotype") %>%
-    left_join(standardized_output, by = "Genotype") %>%
-    mutate(
-      Mean_weight = round(component_weights[["mean"]] * 100, 1),
-      FW_weight = round(component_weights[["fw"]] * 100, 1),
-      ASV_weight = round(component_weights[["asv"]] * 100, 1),
-      Integrated_MET_Index = round(Integrated_MET_Index, 4),
-      Weight_coverage = round(Weight_coverage, 4)
-    )
-  trait_weights <- prepared$trait_info %>%
-    filter(Trait %in% successful_traits) %>%
-    mutate(
-      Normalized_weight = round(as.numeric(weights[Trait]), 4),
-      Used_in_integrated_ranking = "YES"
-    )
-  p_integrated <- if (nrow(ranking) == 0) {
-    empty_plot("Integrated ranking needs at least one genotype.")
-  } else {
-    plot_dat <- ranking %>%
-      mutate(
-        Rank_group = case_when(
-          Integrated_rank <= ceiling(n() * 0.20) ~ "Top 20%",
-          Integrated_MET_Index >= 0 ~ "Above average",
-          TRUE ~ "Below average"
-        )
-      )
-    ggplot(
-      plot_dat,
-      aes(
-        x = reorder(Genotype, Integrated_MET_Index),
-        y = Integrated_MET_Index,
-        fill = Rank_group
-      )
-    ) +
-      geom_col(width = 0.62) +
-      geom_hline(yintercept = 0, linetype = "dashed", color = "gray45", linewidth = 0.7) +
-      geom_text(
-        aes(
-          label = paste0("#", Integrated_rank, " | ", sprintf("%.2f", Integrated_MET_Index)),
-          hjust = ifelse(Integrated_MET_Index >= 0, -0.08, 1.08)
-        ),
-        size = 3.0
-      ) +
-      scale_fill_manual(
-        values = c(
-          "Top 20%" = "#1D9E75",
-          "Above average" = "#3C78D8",
-          "Below average" = "#999999"
-        )
-      ) +
-      scale_y_continuous(expand = expansion(mult = c(0.12, 0.25))) +
-      coord_flip() +
-      labs(
-        title = "Integrated MET ranking",
-        subtitle = paste0(
-          length(successful_traits),
-          " parameter(s), Mean/FW/ASV weights = ",
-          round(component_weights[["mean"]] * 100, 1), "/",
-          round(component_weights[["fw"]] * 100, 1), "/",
-          round(component_weights[["asv"]] * 100, 1)
-        ),
-        x = "Genotype",
-        y = "Weighted standardized MET performance index",
-        fill = NULL
-      ) +
-      theme_bw(base_size = 12) +
-      theme(
-        plot.title = element_text(face = "bold", size = 15, margin = margin(b = 2)),
-        plot.subtitle = element_text(color = "gray40", margin = margin(b = 6)),
-        axis.title.x = element_text(size = 12, margin = margin(t = 6)),
-        axis.title.y = element_text(size = 12, margin = margin(r = 6)),
-        axis.text.y = element_text(size = 10),
-        axis.text.x = element_text(size = 10),
-        legend.position = "bottom"
-      )
-  }
-  list(
-    ranking = ranking,
-    trait_weights = trait_weights,
-    adjusted_performance = adjusted_output,
-    standardized_scores = standardized_output,
-    plot = p_integrated
-  )
-}
-run_met_pipeline <- function(
-    df_raw,
-    trait_used = NULL,
-    check_varieties = NULL,
-    replication_col = NULL,
-    block_col = NULL,
-    min_envs_for_biplot = NULL) {
-  input <- make_met_data(
-    df_raw,
-    trait_used,
-    replication_col = replication_col,
-    block_col = block_col
-  )
-  dat <- input$data
-  trait_used <- input$trait_used
-  has_replication <- !is.null(input$replication_col)
-  has_block <- !is.null(input$block_col)
-  n_envs_total <- n_distinct(dat$Environment)
-  min_envs_for_biplot <- suppressWarnings(as.integer(min_envs_for_biplot))
-  if (length(min_envs_for_biplot) == 0 || is.na(min_envs_for_biplot) || min_envs_for_biplot < 1) {
-    min_envs_for_biplot <- max(MET_MIN_ENVS_FOR_BIPLOT, ceiling(0.5 * n_envs_total))
-  }
-  min_envs_for_biplot <- min(max(1, min_envs_for_biplot), n_envs_total)
-  notes <- c()
-  cell_bounds <- dat %>% group_by(Genotype, Environment) %>% summarise(Lower_c = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper_c = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
-  dat_stepA <- dat %>% left_join(cell_bounds, by = c("Genotype", "Environment")) %>% filter(!(Weight < Lower_c | Weight > Upper_c)) %>% dplyr::select(-Lower_c, -Upper_c)
-  if (nrow(dat_stepA) == 0) stop("All MET rows were removed by cell-level outlier filtering.")
-  env_bounds <- dat_stepA %>% group_by(Environment) %>% summarise(Lower = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
-  p_before <- ggplot(dat_stepA %>% left_join(env_bounds, by = "Environment") %>% mutate(outlier_env = Weight < Lower | Weight > Upper), aes(x = Weight, fill = outlier_env)) + geom_histogram(bins = 30, color = "white", linewidth = 0.2) + geom_vline(data = env_bounds, aes(xintercept = Lower), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + geom_vline(data = env_bounds, aes(xintercept = Upper), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + facet_wrap(~Environment, scales = "free", ncol = 2) + scale_fill_manual(values = c("FALSE" = "#3498DB", "TRUE" = "#E74C3C"), labels = c("Kept", "Outlier")) + labs(title = paste0(trait_used, " distribution after cell-clean, before env-clean"), x = trait_used, y = "Count", fill = NULL) + theme_bw()
-  dat_clean <- dat_stepA %>% left_join(env_bounds, by = "Environment") %>% filter(!(Weight < Lower | Weight > Upper)) %>% dplyr::select(-Lower, -Upper)
-  if (nrow(dat_clean) == 0) stop("All MET rows were removed by environment-level outlier filtering.")
-  p_after <- ggplot(dat_clean, aes(x = Weight)) + geom_histogram(bins = 30, fill = "#2ECC71", color = "white", linewidth = 0.2) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = paste0(trait_used, " distribution after both outlier steps"), x = trait_used, y = "Count") + theme_bw()
-  outlier_summary <- data.frame(Trait_used = trait_used, Rows_original = nrow(dat), Rows_after_cell_clean = nrow(dat_stepA), Rows_after_environment_clean = nrow(dat_clean), Removed_total = nrow(dat) - nrow(dat_clean), stringsAsFactors = FALSE)
-  presence <- dat_clean %>% distinct(Genotype, Environment) %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment), present = 1) %>% pivot_wider(names_from = Environment, values_from = present, values_fill = 0) %>% mutate(n_envs = rowSums(across(-Genotype))) %>% arrange(desc(n_envs), Genotype)
-  selected_controls <- unique(clean_text(check_varieties))
-  selected_controls <- selected_controls[!is.na(selected_controls) & selected_controls != ""]
-  controls_present <- intersect(selected_controls, as.character(unique(dat_clean$Genotype)))
-  if (length(selected_controls) > 0 && length(controls_present) > 0) {
-    controls_used <- controls_present
-    missing_selected_controls <- setdiff(selected_controls, controls_present)
-    if (length(missing_selected_controls) > 0) {
-      notes <- c(
-        notes,
-        paste0(
-          "Selected controls not found in cleaned MET data: ",
-          paste(missing_selected_controls, collapse = ", "),
-          "."
-        )
-      )
-    }
-  } else {
-    controls_used <- presence %>% filter(n_envs == n_envs_total) %>% pull(Genotype)
-    if (length(selected_controls) > 0) {
-      notes <- c(
-        notes,
-        paste0(
-          "No selected controls were found in cleaned MET data. ",
-          "Genotypes present in all environments were used as the control set."
-        )
-      )
-    } else {
-      notes <- c(
-        notes,
-        "No controls were selected. Genotypes present in all environments were used as the control set."
-      )
-    }
-  }
-  if (length(controls_used) == 0) {
-    controls_used <- as.character(unique(dat_clean$Genotype))
-    notes <- c(notes, "No genotype was present in all environments. All genotypes were used as the control set for percent-of-control calculation.")
-  }
-  low_conf_genos <- presence %>% filter(n_envs == 1) %>% pull(Genotype) %>% as.character()
-  if (length(low_conf_genos) > 0) notes <- c(notes, paste0("Single-environment genotypes have high uncertainty: ", paste(low_conf_genos, collapse = ", ")))
-  met_model_formula <- function(include_environment = TRUE,
-                                include_genotype = TRUE,
-                                include_gxe = TRUE,
-                                include_design = TRUE) {
-    terms <- character(0)
-    if (isTRUE(include_environment)) {
-      terms <- c(terms, "(1|Environment)")
-    }
-    if (isTRUE(include_design) && has_replication) {
-      terms <- c(terms, "(1|Environment:Rep)")
-    }
-    if (isTRUE(include_design) && has_block) {
-      terms <- c(
-        terms,
-        if (has_replication) "(1|Environment:Rep:Block)" else "(1|Environment:Block)"
-      )
-    }
-    if (isTRUE(include_genotype)) {
-      terms <- c(terms, "(1|Genotype)")
-    }
-    if (isTRUE(include_gxe)) {
-      terms <- c(terms, "(1|Genotype:Environment)")
-    }
-    if (length(terms) == 0) {
-      return(Weight ~ 1)
-    }
-    as.formula(paste("Weight ~", paste(terms, collapse = " + ")))
-  }
-  full_formula <- met_model_formula()
-  m_full <- lmer(full_formula, data = dat_clean, control = lmerControl(optimizer = "bobyqa"))
-  vc <- as.data.frame(VarCorr(m_full))
-  total_var <- sum(vc$vcov, na.rm = TRUE)
-  vc$percent <- round((vc$vcov / total_var) * 100, 2)
-  vc$label <- recode(
-    vc$grp,
-    "Environment" = "Environment (E)",
-    "Environment:Rep" = "Replication within environment",
-    "Environment:Block" = "Block within environment",
-    "Environment:Rep:Block" = "Block within replication/environment",
-    "Genotype" = "Genotype (G)",
-    "Genotype:Environment" = "GxE Interaction",
-    "Residual" = "Residual",
-    .default = vc$grp
-  )
-  variance_components <- vc %>% transmute(Source = label, Variance = round(vcov, 5), Percent = percent)
-  get_vc <- function(name) {
-    value <- vc$vcov[vc$grp == name]
-    if (length(value) == 0 || all(is.na(value))) 0 else value[1]
-  }
-  g_var <- get_vc("Genotype")
-  gxe_var <- get_vc("Genotype:Environment")
-  res_var <- get_vc("Residual")
-  n_r <- dat_clean %>% group_by(Genotype, Environment) %>% summarise(n = n(), .groups = "drop") %>% summarise(harmonic_r = 1 / mean(1 / n)) %>% pull(harmonic_r)
-  H2 <- g_var / (g_var + gxe_var / n_envs_total + res_var / (n_r * n_envs_total))
-  stability_ratio <- g_var / (g_var + gxe_var)
-  genotype_summary <- dat_clean %>%
-    mutate(
-      Genotype = as.character(Genotype),
-      Environment = as.character(Environment),
-      Rep = as.character(Rep),
-      Block = as.character(Block)
-    ) %>%
-    group_by(Genotype) %>%
-    summarise(
-      Mean = round(mean(Weight, na.rm = TRUE), 4),
-      Locations_tested = paste(sort(unique(Environment)), collapse = ", "),
-      N_observations = n(),
-      .groups = "drop"
-    )
-  replications_by_location <- dat_clean %>%
-    mutate(
-      Genotype = as.character(Genotype),
-      Environment = as.character(Environment),
-      Rep = as.character(Rep)
-    ) %>%
-    distinct(Genotype, Environment, Rep) %>%
-    arrange(Genotype, Environment, Rep) %>%
-    group_by(Genotype, Environment) %>%
-    summarise(Reps = n_distinct(Rep), .groups = "drop") %>%
-    group_by(Genotype) %>%
-    summarise(
-      Replications_by_location = paste(paste0(Environment, ": ", Reps), collapse = " | "),
-      .groups = "drop"
-    )
-  genotype_summary <- genotype_summary %>%
-    left_join(replications_by_location, by = "Genotype") %>%
-    dplyr::select(Genotype, Mean, Locations_tested, Replications_by_location, N_observations)
-  if (has_block) {
-    blocks_by_location <- dat_clean %>%
-      mutate(
-        Genotype = as.character(Genotype),
-        Environment = as.character(Environment),
-        Rep = as.character(Rep),
-        Block = as.character(Block)
-      ) %>%
-      distinct(Genotype, Environment, Rep, Block) %>%
-      arrange(Genotype, Environment, Rep, Block) %>%
-      group_by(Genotype, Environment, Rep) %>%
-      summarise(Blocks = paste(sort(unique(Block)), collapse = ", "), .groups = "drop") %>%
-      group_by(Genotype, Environment) %>%
-      summarise(
-        Rep_blocks = paste(paste0("Rep ", Rep, " = ", Blocks), collapse = "; "),
-        .groups = "drop"
-      ) %>%
-      group_by(Genotype) %>%
-      summarise(
-        Blocks_by_location = paste(paste0(Environment, ": ", Rep_blocks), collapse = " | "),
-        .groups = "drop"
-      )
-    genotype_summary <- genotype_summary %>%
-      left_join(blocks_by_location, by = "Genotype") %>%
-      dplyr::select(Genotype, Mean, Locations_tested, Replications_by_location, Blocks_by_location, N_observations)
-  }
-  model_summary <- data.frame(Trait_used = trait_used, N_rows_clean = nrow(dat_clean), N_genotypes = n_distinct(dat_clean$Genotype), N_environments = n_distinct(dat_clean$Environment), Replication_column = input$replication_col %||% "", Block_column = input$block_col %||% "", AMMI_GGE_min_observed_locations = min_envs_for_biplot, N_replications = if (has_replication) n_distinct(dat_clean$Rep) else NA_integer_, N_blocks = if (has_block) n_distinct(dat_clean$Block) else NA_integer_, Model_formula = paste(deparse(full_formula), collapse = " "), Harmonic_replication = round(n_r, 3), Stability_ratio_G_over_G_plus_GxE = round(stability_ratio, 4), Broad_sense_H2 = round(H2, 4), Controls_used = paste(controls_used, collapse = ", "), Notes = paste(notes, collapse = " | "), stringsAsFactors = FALSE)
-  p_variance <- ggplot(variance_components %>% mutate(Source = fct_reorder(Source, -Percent)), aes(x = Source, y = Percent, fill = Source)) + geom_bar(stat = "identity", width = 0.6) + geom_text(aes(label = paste0(Percent, "%")), vjust = -0.5, size = 4) + scale_fill_manual(values = c("#9B59B6", "#3498DB", "#E67E22", "#2ECC71")) + labs(title = paste0("Variance partitioning â€” ", trait_used), x = NULL, y = "% of Total Variance") + theme_bw() + theme(legend.position = "none")
-  res_df <- data.frame(fitted = fitted(m_full), residual = residuals(m_full))
-  p_qq <- ggplot(res_df, aes(sample = residual)) + stat_qq(color = "#3498DB", alpha = 0.6) + stat_qq_line(color = "#E74C3C", linewidth = 0.8) + labs(title = "Normal Q-Q", x = "Theoretical", y = "Sample") + theme_bw()
-  p_rvf <- ggplot(res_df, aes(x = fitted, y = residual)) + geom_point(color = "#3498DB", alpha = 0.5, size = 1.5) + geom_hline(yintercept = 0, linetype = "dashed", color = "#E74C3C", linewidth = 0.8) + geom_smooth(method = "loess", se = FALSE, color = "#F39C12", linewidth = 0.8, span = 0.8) + labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residuals") + theme_bw()
-  p_residual <- p_qq + p_rvf
-  met_fit_reduced <- function(formula) {
-    tryCatch(
-      lmer(formula, data = dat_clean, control = lmerControl(optimizer = "bobyqa")),
-      error = function(e) structure(list(error = e$message), class = "met_model_error")
-    )
-  }
-  m_no_e <- met_fit_reduced(met_model_formula(include_environment = FALSE))
-  m_no_gxe <- met_fit_reduced(met_model_formula(include_gxe = FALSE))
-  m_no_g <- met_fit_reduced(met_model_formula(include_genotype = FALSE))
-  m_null <- met_fit_reduced(met_model_formula(include_genotype = FALSE, include_gxe = FALSE))
-  lrt_table <- bind_rows(met_safe_lrt(m_full, m_no_e, "E"), met_safe_lrt(m_full, m_no_gxe, "GxE"), met_safe_lrt(m_full, m_no_g, "G"), met_safe_lrt(m_full, m_null, "G+GxE"))
-  get_lrt_p <- function(test_name) {
-    p_col <- intersect(c("Pr(>Chisq)", "Pr..Chisq."), names(lrt_table))
-    if (length(p_col) == 0) return(NA_real_)
-    p_value <- lrt_table %>%
-      filter(Test == test_name) %>%
-      `[[`(p_col[1])
-    p_value <- as.numeric(p_value)
-    p_value <- p_value[!is.na(p_value)]
-    if (length(p_value) == 0) NA_real_ else p_value[1]
-  }
-  lmm_p_values <- c(
-    "Environment (E)" = get_lrt_p("E"),
-    "Genotype (G)" = get_lrt_p("G"),
-    "GxE Interaction" = get_lrt_p("GxE")
-  )
-  variance_components <- variance_components %>%
-    mutate(
-      P_value = round(as.numeric(lmm_p_values[Source]), 5),
-      Sig = sig_label(P_value)
-    )
-  grand_mean <- fixef(m_full)[["(Intercept)"]]
-  ranef_full <- ranef(m_full, condVar = TRUE)
-  g_re <- ranef_full$Genotype
-  post_var <- attr(ranef_full$Genotype, "postVar")
-  se_g <- if (!is.null(post_var)) sqrt(post_var[1, 1, ]) else rep(NA_real_, nrow(g_re))
-  reliability_g <- if (is.finite(g_var) && g_var > 0) {
-    pmin(pmax(1 - (se_g^2 / g_var), 0), 1)
-  } else {
-    rep(NA_real_, length(se_g))
-  }
-  BLUPs_main <- data.frame(Genotype = rownames(g_re), BLUP_G = grand_mean + g_re[, 1], SE_G = se_g, Reliability = round(reliability_g, 4), CI_lower = grand_mean + g_re[, 1] - 1.96 * se_g, CI_upper = grand_mean + g_re[, 1] + 1.96 * se_g) %>% arrange(desc(BLUP_G)) %>% mutate(Rank_BLUP = row_number())
-  p_blup <- ggplot(BLUPs_main, aes(x = reorder(Genotype, BLUP_G), y = BLUP_G)) + geom_point(color = "#2C3E50", size = 3) + geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.4, color = "#3498DB", linewidth = 0.7) + coord_flip() + labs(title = "Genotype BLUPs with 95% CI", x = "Genotype", y = paste0("BLUP for ", trait_used)) + theme_bw()
-  env_effects <- ranef_full$Environment %>% rownames_to_column("Environment") %>% rename(BLUP_E = `(Intercept)`)
-  BLUPs_GxE <- ranef_full$`Genotype:Environment` %>% rownames_to_column("Geno_Env") %>% rename(BLUP_GxE = `(Intercept)`) %>% separate(Geno_Env, into = c("Genotype", "Environment"), sep = ":", extra = "merge", fill = "right")
-  BLUPs_env_obs <- BLUPs_GxE %>% left_join(BLUPs_main[, c("Genotype", "BLUP_G")], by = "Genotype") %>% left_join(env_effects, by = "Environment") %>% mutate(BLUP_env = grand_mean + (BLUP_G - grand_mean) + BLUP_E + BLUP_GxE, Source = "Observed") %>% arrange(Environment, desc(BLUP_env))
-  all_combos <- expand.grid(Genotype = as.character(unique(dat_clean$Genotype)), Environment = as.character(unique(dat_clean$Environment)), stringsAsFactors = FALSE)
-  imputed_cells <- all_combos %>% anti_join(dat_clean %>% distinct(Genotype = as.character(Genotype), Environment = as.character(Environment)), by = c("Genotype", "Environment")) %>% left_join(BLUPs_main[, c("Genotype", "BLUP_G")], by = "Genotype") %>% left_join(env_effects, by = "Environment") %>% mutate(BLUP_GxE = 0, BLUP_env = grand_mean + (BLUP_G - grand_mean) + BLUP_E, Source = dplyr::if_else(Genotype %in% low_conf_genos, "Imputed_low_confidence", "Imputed"))
-  BLUPs_env_full <- bind_rows(BLUPs_env_obs %>% dplyr::select(Genotype, Environment, BLUP_G, BLUP_E, BLUP_GxE, BLUP_env, Source), imputed_cells %>% dplyr::select(Genotype, Environment, BLUP_G, BLUP_E, BLUP_GxE, BLUP_env, Source)) %>% arrange(Environment, desc(BLUP_env))
-  acc_dat <- dat_clean %>% group_by(Genotype, Environment) %>% summarise(obs = mean(Weight), .groups = "drop") %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment)) %>% left_join(BLUPs_env_full %>% dplyr::select(Genotype, Environment, BLUP_env), by = c("Genotype", "Environment")) %>% filter(!is.na(BLUP_env))
-  r_by_env <- acc_dat %>% group_by(Environment) %>% summarise(r_val = ifelse(n() >= 2, round(cor(obs, BLUP_env, use = "complete.obs"), 4), NA_real_), .groups = "drop") %>% mutate(label = paste0("r = ", r_val))
-  p_accuracy <- ggplot(acc_dat, aes(x = obs, y = BLUP_env, color = Genotype)) + geom_point(size = 3, alpha = 0.85) + geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7, alpha = 0.15) + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40", linewidth = 0.7) + geom_text(data = r_by_env, aes(label = label, x = -Inf, y = Inf), hjust = -0.15, vjust = 1.4, size = 3.5, fontface = "bold", color = "#2C3E50", inherit.aes = FALSE) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = "Prediction accuracy per hybrid by location", x = paste0("Observed mean ", trait_used), y = "Predicted BLUP", color = "Genotype") + theme_bw() + theme(legend.position = "bottom")
-  ctrl_means_env <- BLUPs_env_full %>% filter(Genotype %in% controls_used) %>% group_by(Environment) %>% summarise(Control_mean = mean(BLUP_env, na.rm = TRUE), .groups = "drop")
-  BLUPs_env_full <- BLUPs_env_full %>% left_join(ctrl_means_env, by = "Environment") %>% mutate(Pct_of_controls = round((BLUP_env / Control_mean) * 100, 1))
-  heatmap_dat <- BLUPs_env_full %>% mutate(label = paste0(round(BLUP_env, 1), "\n(", Pct_of_controls, "%)"), alpha_val = ifelse(grepl("Imputed", Source), 0.45, 1.0))
-  p_perf_heatmap <- ggplot(heatmap_dat, aes(x = Environment, y = reorder(Genotype, BLUP_env), fill = Pct_of_controls)) + geom_tile(aes(alpha = alpha_val), color = "white", linewidth = 0.5) + geom_text(aes(label = label), size = 2.5, lineheight = 0.9) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 100) + scale_alpha_identity() + labs(title = "Hybrid performance relative to controls", subtitle = "Faded = LMM-imputed", x = "Environment", y = "Genotype", fill = "% of controls") + theme_bw()
-  GxE_matrix_wide <- BLUPs_env_full %>% dplyr::select(Genotype, Environment, BLUP_env) %>% pivot_wider(names_from = Environment, values_from = BLUP_env) %>% column_to_rownames("Genotype")
-  GxE_long_complete <- GxE_matrix_wide %>% rownames_to_column("Genotype") %>% pivot_longer(-Genotype, names_to = "Environment", values_to = "BLUP_env")
-  n_genos <- nrow(GxE_matrix_wide)
-  FW_dat_loo <- GxE_long_complete %>% group_by(Environment) %>% mutate(EnvIndex = (sum(BLUP_env) - BLUP_env) / (n_genos - 1)) %>% ungroup()
-  FW_results <- FW_dat_loo %>% group_by(Genotype) %>% summarise(GenMean = mean(BLUP_env), Sens = coef(lm(BLUP_env ~ EnvIndex))[2], .groups = "drop") %>% mutate(b_interp = case_when(Sens > 1.1 ~ "Responsive", Sens < 0.9 ~ "Stable", TRUE ~ "Average")) %>% arrange(desc(GenMean))
-  p_fw_mean_sens <- ggplot(FW_results, aes(x = GenMean, y = Sens, color = b_interp, label = Genotype)) + geom_point(size = 3) + geom_text(vjust = -0.8, size = 3) + geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + scale_color_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71")) + labs(title = "Finlay-Wilkinson: mean vs sensitivity", x = "Genotype BLUP mean", y = "Sensitivity (b)", color = "Stability") + theme_bw()
-  env_index_plot <- FW_dat_loo %>% group_by(Environment) %>% summarise(env_mean = mean(EnvIndex), .groups = "drop")
-  p_fw_regression <- ggplot(FW_dat_loo, aes(x = EnvIndex, y = BLUP_env, color = Genotype, group = Genotype)) + geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) + geom_point(shape = 18, size = 3) + geom_vline(xintercept = mean(env_index_plot$env_mean), linetype = "dashed", color = "red", linewidth = 0.7) + geom_vline(data = env_index_plot, aes(xintercept = env_mean), linetype = "solid", color = "gray40", linewidth = 0.3, alpha = 0.5, inherit.aes = FALSE) + geom_text(data = env_index_plot, aes(x = env_mean, y = -Inf, label = Environment), angle = 0, vjust = -1.0, hjust = 0.5, size = 3, color = "gray20", inherit.aes = FALSE) + labs(title = paste0("Finlay & Wilkinson analysis for ", trait_used, " (LOO index)"), x = "LOO environment index", y = "BLUP", color = "Genotype") + scale_x_continuous(expand = expansion(mult = c(0.05, 0.1))) + coord_cartesian(clip = "off") + theme_bw() + theme(plot.margin = margin(t = 8, r = 8, b = 28, l = 8))
-  biplot_confidence <- presence %>%
-    transmute(
-      Genotype = as.character(Genotype),
-      Observed_locations = as.integer(n_envs),
-      Total_locations = n_envs_total,
-      Min_locations_required = min_envs_for_biplot,
-      Coverage_pct = round(Observed_locations / Total_locations * 100, 1),
-      Confidence_flag = ifelse(Observed_locations >= Min_locations_required, "OK", "Low confidence")
-    )
-  low_conf_biplot <- biplot_confidence %>%
-    filter(Confidence_flag == "Low confidence") %>%
-    pull(Genotype)
-  GxE_obs_wide <- GxE_matrix_wide
-  ammi_notes <- data.frame(
-    Data_source = "LMM predicted BLUP matrix",
-    Imputed_cell_warning = "AMMI/GGE uses a full BLUP GxE matrix; unobserved genotype-location cells are model-predicted.",
-    N_genotypes_enter_AMMI_GGE = nrow(GxE_obs_wide),
-    N_genotypes_total = nrow(GxE_matrix_wide),
-    Min_locations_required = min_envs_for_biplot,
-    N_low_confidence_genotypes = length(low_conf_biplot),
-    Low_confidence_genotypes = ifelse(length(low_conf_biplot) > 0, paste(low_conf_biplot, collapse = ", "), "none"),
-    Excluded_genotypes = "none",
-    stringsAsFactors = FALSE
-  )
-  AMMI_geno <- data.frame()
-  AMMI_env <- data.frame()
-  GGE_geno <- data.frame()
-  GGE_env <- data.frame()
-  p_ammi1 <- empty_plot("AMMI needs at least 2 genotypes and 2 environments.")
-  p_ammi2 <- empty_plot("AMMI2 needs at least 2 PCs.")
-  p_gge <- empty_plot("GGE needs at least 2 genotypes and 2 environments.")
-  p_env_cor <- empty_plot("Environment correlation needs at least 2 environments.")
-  if (nrow(GxE_obs_wide) >= 2 && ncol(GxE_obs_wide) >= 2) {
-    row_means <- rowMeans(GxE_obs_wide)
-    col_means <- colMeans(GxE_obs_wide)
-    grand_mn <- mean(as.matrix(GxE_obs_wide))
-    GxE_centered <- as.matrix(GxE_obs_wide) - outer(row_means, rep(1, ncol(GxE_obs_wide))) - outer(rep(1, nrow(GxE_obs_wide)), col_means) + grand_mn
-    svd_result <- svd(GxE_centered)
-    n_pc <- min(nrow(GxE_centered) - 1, ncol(GxE_centered) - 1)
-    SS_pc <- svd_result$d[1:n_pc]^2
-    PC_pct <- SS_pc / sum(SS_pc)
-    AMMI_geno <- as.data.frame(svd_result$u[, 1:min(2, n_pc), drop = FALSE]) %>% setNames(paste0("PC", 1:min(2, n_pc))) %>% mutate(Genotype = rownames(GxE_obs_wide), GenMean = row_means, .before = 1)
-    AMMI_env <- as.data.frame(svd_result$v[, 1:min(2, n_pc), drop = FALSE]) %>% setNames(paste0("PC", 1:min(2, n_pc))) %>% mutate(Environment = colnames(GxE_obs_wide), EnvMean = col_means, .before = 1)
-    for (i in 1:min(2, n_pc)) {
-      AMMI_geno[[paste0("PC", i)]] <- AMMI_geno[[paste0("PC", i)]] * svd_result$d[i]
-      AMMI_env[[paste0("PC", i)]] <- AMMI_env[[paste0("PC", i)]] * svd_result$d[i]
-    }
-    AMMI_geno$ASV <- if (n_pc >= 2) sqrt((PC_pct[1] / PC_pct[2] * AMMI_geno$PC1)^2 + AMMI_geno$PC2^2) else abs(AMMI_geno$PC1)
-    AMMI_geno <- AMMI_geno %>%
-      left_join(biplot_confidence, by = "Genotype") %>%
-      arrange(ASV)
-    p_ammi1 <- ggplot() +
-      geom_point(data = AMMI_geno, aes(x = PC1, y = GenMean, color = Confidence_flag, shape = Confidence_flag), size = 3) +
-      geom_text(data = AMMI_geno, aes(x = PC1, y = GenMean, label = Genotype, color = Confidence_flag), vjust = -0.8, size = 3, show.legend = FALSE) +
-      geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
-      geom_point(data = AMMI_env, aes(x = PC1, y = EnvMean), size = 4, shape = 17, color = "#E74C3C") +
-      geom_text(data = AMMI_env, aes(x = PC1, y = EnvMean, label = Environment), vjust = -0.9, size = 3.5, color = "#E74C3C", fontface = "bold") +
-      scale_color_manual(values = c("OK" = "#2C3E50", "Low confidence" = "#D35400"), breaks = "Low confidence", na.value = "gray60") +
-      scale_shape_manual(values = c("OK" = 16, "Low confidence" = 1), breaks = "Low confidence", na.value = 16) +
-      labs(title = paste0("AMMI1 biplot - ", trait_used, " BLUPs"), x = paste0("IPCA1 (", round(PC_pct[1] * 100, 1), "%)"), y = paste0("Mean BLUP for ", trait_used), color = "Coverage", shape = "Coverage") +
-      theme_bw()
-    if (n_pc >= 2) {
-      scale_ammi <- ifelse(max(abs(AMMI_env$PC1), na.rm = TRUE) == 0, 1, max(abs(AMMI_geno$PC1), na.rm = TRUE) / max(abs(AMMI_env$PC1), na.rm = TRUE) * 0.7)
-      AMMI_env_sc <- AMMI_env %>% mutate(PC1 = PC1 * scale_ammi, PC2 = PC2 * scale_ammi)
-      p_ammi2 <- ggplot() +
-        geom_segment(data = AMMI_env_sc, aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.25, "cm"), type = "closed"), color = "#E74C3C", linewidth = 0.8) +
-        geom_text(data = AMMI_env_sc, aes(x = PC1 * 1.12, y = PC2 * 1.12, label = Environment), color = "#E74C3C", size = 3.5, fontface = "bold") +
-        geom_point(data = AMMI_geno, aes(x = PC1, y = PC2, color = Confidence_flag, shape = Confidence_flag), size = 2.5) +
-        geom_text(data = AMMI_geno, aes(x = PC1, y = PC2, label = Genotype, color = Confidence_flag), vjust = -0.8, size = 2.8, show.legend = FALSE) +
-        geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
-        geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
-        scale_color_manual(values = c("OK" = "#2C3E50", "Low confidence" = "#D35400"), breaks = "Low confidence", na.value = "gray60") +
-        scale_shape_manual(values = c("OK" = 16, "Low confidence" = 1), breaks = "Low confidence", na.value = 16) +
-        labs(title = paste0("AMMI2 biplot - ", trait_used, " BLUPs"), x = paste0("IPCA1 (", round(PC_pct[1] * 100, 1), "%)"), y = paste0("IPCA2 (", round(PC_pct[2] * 100, 1), "%)"), color = "Coverage", shape = "Coverage") +
-        theme_bw()
-    }
-    GGE_centered <- sweep(as.matrix(GxE_obs_wide), 2, col_means)
-    svd_gge <- svd(GGE_centered)
-    n_pc_gge <- min(nrow(GGE_centered) - 1, ncol(GGE_centered) - 1)
-    GGE_pct <- svd_gge$d[1:n_pc_gge]^2 / sum(svd_gge$d[1:n_pc_gge]^2)
-    GGE_geno <- as.data.frame(svd_gge$u[, 1:min(2, n_pc_gge), drop = FALSE]) %>% setNames(paste0("PC", 1:min(2, n_pc_gge))) %>% mutate(Genotype = rownames(GxE_obs_wide), .before = 1)
-    GGE_env <- as.data.frame(svd_gge$v[, 1:min(2, n_pc_gge), drop = FALSE]) %>% setNames(paste0("PC", 1:min(2, n_pc_gge))) %>% mutate(Environment = colnames(GxE_obs_wide), .before = 1)
-    for (i in 1:min(2, n_pc_gge)) {
-      GGE_geno[[paste0("PC", i)]] <- GGE_geno[[paste0("PC", i)]] * svd_gge$d[i]
-      GGE_env[[paste0("PC", i)]] <- GGE_env[[paste0("PC", i)]] * svd_gge$d[i]
-    }
-    gge_pc1_cor <- suppressWarnings(cor(GGE_geno$PC1, row_means[match(GGE_geno$Genotype, names(row_means))], use = "complete.obs"))
-    if (n_pc_gge >= 1 && is.finite(gge_pc1_cor) && gge_pc1_cor < 0) {
-      GGE_geno$PC1 <- -GGE_geno$PC1
-      GGE_env$PC1 <- -GGE_env$PC1
-    }
-    GGE_geno <- GGE_geno %>% left_join(biplot_confidence, by = "Genotype")
-    if (n_pc_gge >= 2) {
-      scale_gge <- ifelse(max(abs(GGE_env$PC1), na.rm = TRUE) == 0, 1, max(abs(GGE_geno$PC1), na.rm = TRUE) / max(abs(GGE_env$PC1), na.rm = TRUE) * 0.7)
-      GGE_env_sc <- GGE_env %>% mutate(PC1 = PC1 * scale_gge, PC2 = PC2 * scale_gge, label_x = PC1 * 1.15, label_y = PC2 * 1.15)
-      p_gge <- ggplot() +
-        geom_segment(data = GGE_env_sc, aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.25, "cm"), type = "closed"), color = "#E74C3C", linewidth = 0.8) +
-        geom_text(data = GGE_env_sc, aes(x = label_x, y = label_y, label = Environment), color = "#E74C3C", size = 3.5, fontface = "bold") +
-        geom_point(data = GGE_geno, aes(x = PC1, y = PC2, color = Confidence_flag, shape = Confidence_flag), size = 2.5) +
-        geom_text(data = GGE_geno, aes(x = PC1, y = PC2, label = Genotype, color = Confidence_flag), vjust = -0.8, size = 2.8, show.legend = FALSE) +
-        geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
-        geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
-        scale_color_manual(values = c("OK" = "#2C3E50", "Low confidence" = "#D35400"), breaks = "Low confidence", na.value = "gray60") +
-        scale_shape_manual(values = c("OK" = 16, "Low confidence" = 1), breaks = "Low confidence", na.value = 16) +
-        labs(title = paste0("GGE biplot - ", trait_used, " BLUPs"), x = paste0("PC1 (", round(GGE_pct[1] * 100, 1), "%)"), y = paste0("PC2 (", round(GGE_pct[2] * 100, 1), "%)"), color = "Coverage", shape = "Coverage") +
-        theme_bw()
-    }
-    cor_mat <- cor(GxE_obs_wide, use = "pairwise.complete.obs")
-    cor_long <- as.data.frame(cor_mat) %>% rownames_to_column("Env1") %>% pivot_longer(-Env1, names_to = "Env2", values_to = "r")
-    p_env_cor <- ggplot(cor_long, aes(x = Env1, y = Env2, fill = r)) + geom_tile(color = "white") + geom_text(aes(label = round(r, 2)), size = 4.5) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 0, limits = c(-1, 1)) + labs(title = "Genotype BLUP correlation across environments", x = NULL, y = NULL, fill = "r") + theme_bw()
-  }
-  selection <- build_met_selection_ranking(
-    list(
-      blups_main = BLUPs_main,
-      fw_results = FW_results,
-      ammi_genotype = AMMI_geno
-    ),
-    component_weights = c(mean = MET_W_YIELD, fw = MET_W_FW, asv = MET_W_ASV)
-  )
-  p_met_selection <- plot_met_selection_ranking(selection, trait_used)
-  return(list(raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean, outlier_summary = outlier_summary, presence = presence, genotype_summary = genotype_summary, model_summary = model_summary, variance_components = variance_components, lrt_table = lrt_table, blups_main = BLUPs_main, blups_environment = BLUPs_env_full, gxe_matrix = GxE_matrix_wide %>% rownames_to_column("Genotype"), fw_results = FW_results, ammi_notes = ammi_notes, ammi_genotype = AMMI_geno, ammi_environment = AMMI_env, gge_genotype = GGE_geno, gge_environment = GGE_env, met_selection = selection, p_before = p_before, p_after = p_after, p_variance = p_variance, p_residual = p_residual, p_blup = p_blup, p_accuracy = p_accuracy, p_perf_heatmap = p_perf_heatmap, p_fw_mean_sens = p_fw_mean_sens, p_fw_regression = p_fw_regression, p_ammi1 = p_ammi1, p_ammi2 = p_ammi2, p_gge = p_gge, p_env_cor = p_env_cor, p_met_selection = p_met_selection))
-}
-run_met_all_traits <- function(
-    df_raw,
-    check_varieties = NULL,
-    trait_cols = NULL,
-    replication_col = NULL,
-    block_col = NULL,
-    min_envs_for_biplot = NULL) {
-  available_traits <- get_met_trait_cols(df_raw)
-  if (is.null(trait_cols) || length(trait_cols) == 0) {
-    trait_cols <- available_traits
-  } else {
-    trait_cols <- intersect(as.character(trait_cols), available_traits)
-  }
-  if (length(trait_cols) == 0) {
-    stop("Choose at least one valid MET trait to run.")
-  }
-  results <- list()
-  failures <- data.frame(Trait = character(), Error = character(), stringsAsFactors = FALSE)
-  for (trait in trait_cols) {
-    result <- tryCatch({
-      run_met_pipeline(
-        df_raw,
-        trait,
-        check_varieties = check_varieties,
-        replication_col = replication_col,
-        block_col = block_col,
-        min_envs_for_biplot = min_envs_for_biplot
-      )
-    }, error = function(e) {
-      failures <<- bind_rows(
-        failures,
-        data.frame(Trait = trait, Error = e$message, stringsAsFactors = FALSE)
-      )
-      NULL
-    })
-    if (!is.null(result)) {
-      results[[trait]] <- result
-    }
-  }
-  if (length(results) == 0) {
-    stop("MET pipeline failed for all numeric traits: ", paste(failures$Error, collapse = " | "))
-  }
-  integrated <- build_met_integrated_ranking(df_raw, results)
-  list(
-    settings = data.frame(
-      Trait = trait_cols,
-      Ran_MET = trait_cols %in% names(results),
-      Replication_column = replication_col %||% "",
-      Block_column = block_col %||% "",
-      AMMI_GGE_min_observed_locations = min_envs_for_biplot %||% "",
-      stringsAsFactors = FALSE
-    ),
-    met_by_trait = results,
-    met_trait_names = names(results),
-    met_failed_traits = failures,
-    met_integrated_ranking = integrated$ranking,
-    met_integrated_trait_weights = integrated$trait_weights,
-    met_integrated_adjusted = integrated$adjusted_performance,
-    met_integrated_standardized = integrated$standardized_scores,
-    p_met_integrated_ranking = integrated$plot
-  )
-}
+# MET pipeline functions are defined in modules/module_5_met.R.
+
+
 
 
 
 # UI helpers
-sidebar_radio_menu <- function(input_id, groups, selected, group_controls = list()) {
-  tags$div(
-    id = input_id,
-    class = "form-group shiny-input-radiogroup shiny-input-container split-radio-menu",
-    role = "radiogroup",
-    lapply(names(groups), function(group_name) {
-      choices <- groups[[group_name]]
-      tags$div(
-        class = "side-subpanel",
-        tags$div(class = "side-subpanel-title", group_name),
-        group_controls[[group_name]],
-        lapply(names(choices), function(label) {
-          value <- unname(choices[[label]])
-          radio_id <- paste(input_id, value, sep = "_")
-          tags$div(
-            class = paste(
-              "form-check",
-              if (value %in% c("met_integrated", "met_integrated_plot")) {
-                "integrated-choice"
-              } else {
-                ""
-              }
-            ),
-            tags$input(
-              id = radio_id,
-              type = "radio",
-              name = input_id,
-              value = value,
-              class = "form-check-input",
-              checked = if (identical(value, selected)) "checked" else NULL
-            ),
-            tags$label(
-              class = "form-check-label",
-              `for` = radio_id,
-              label
-            )
-          )
-        })
-      )
-    })
-  )
-}
 
-sidebar_button_menu <- function(input_id, choices, selected = NULL, style = "module", children = list()) {
+sidebar_button_menu <- function(input_id, choices, selected = NULL, style = "module") {
   if (is.null(selected) || !selected %in% unname(choices)) {
     selected <- unname(choices)[1]
   }
@@ -3756,14 +2724,14 @@ sidebar_button_menu <- function(input_id, choices, selected = NULL, style = "mod
             `for` = radio_id,
             label
           )
-        ),
-        children[[value]]
+        )
       )
     })
   )
 }
 
-sidebar_detail_panel <- function(title, choices = NULL, input_id = NULL, selected = NULL, controls = NULL, style = "slicer") {
+sidebar_detail_panel <- function(title, choices = NULL, input_id = NULL, selected = NULL,
+                                 controls = NULL, style = "slicer") {
   tags$div(
     class = "side-subpanel detail-subpanel",
     if (!is.null(choices) && !is.null(input_id)) {
@@ -4073,9 +3041,6 @@ ui <- page_navbar(
       white-space: pre-wrap;
       margin: 0;
     }
-    .split-radio-menu {
-      width: 100%;
-    }
     .side-subpanel {
       border: 0;
       border-bottom: 1px solid #E5DFD0;
@@ -4124,11 +3089,6 @@ ui <- page_navbar(
     .side-subpanel .form-check:last-child {
       margin-bottom: 0;
     }
-    .side-subpanel .integrated-choice {
-      border-top: 1px solid #DEE2E6;
-      margin-top: 18px;
-      padding-top: 14px;
-    }
     .side-subpanel .form-group {
       margin-bottom: 14px;
     }
@@ -4176,17 +3136,6 @@ ui <- page_navbar(
       background: #EAF2E3;
       border-color: #4E7A43;
       color: #174313;
-    }
-    .detail-button-menu > .button-menu-item > .form-check > .form-check-label {
-      border-color: #C9D5BE;
-      color: #3D5038;
-      background: #FFFFFF;
-      text-align: left;
-    }
-    .detail-button-menu > .button-menu-item > .form-check:has(> input:checked) > .form-check-label {
-      background: #EAF2E3;
-      border-color: #4E7A43;
-      color: #315F28;
     }
     .analysis-output-workspace .analysis-output-controls,
     .analysis-output-workspace .analysis-output-main {
@@ -4327,23 +3276,6 @@ ui <- page_navbar(
     .slicer-button-menu > .button-menu-item > .form-check:has(> input:checked) > .form-check-label {
       color: #315F28;
       font-weight: 700;
-    }
-    .button-menu-child {
-      margin: 0 0 8px 42px;
-      background: #F3F8EF;
-      border-left: 3px solid #315F28;
-      padding: 8px 8px 2px 12px;
-    }
-    .module-button-menu > .button-menu-item > .button-menu-child {
-      margin-left: 42px;
-    }
-    .sub-button-menu > .button-menu-item > .button-menu-child {
-      margin-left: 34px;
-    }
-    .button-menu-child .side-subpanel,
-    .button-menu-child .detail-subpanel {
-      border-bottom: 0;
-      padding: 0 0 8px;
     }
     .sidebar-empty-note {
       background: #F7F9F3;
@@ -4755,6 +3687,11 @@ ui <- page_navbar(
           tags$div(
             class = "side-subpanel met-weight-panel",
             tags$div(class = "side-subpanel-title", "Weight"),
+            tags$div(
+              class = "side-subpanel-hint",
+              style = "font-size: 11px; color: #888; margin-bottom: 6px;",
+              "Tip: check each trait's Broad-sense H2 in the Variance table before assigning it heavy weight — low-H2 traits are noisier and less reliable to select on."
+            ),
             sliderInput(
               inputId = "met_weight_mean",
               label = "Mean",
@@ -4783,8 +3720,23 @@ ui <- page_navbar(
               post = "%"
             )
           )
+        ),
+        conditionalPanel(
+          "input.result_module == 'met' && (input.result_view == 'met_decision_board' || (input.result_view == 'met_integrated' && input.met_multi_selection_view == 'mgidi'))",
+          tags$div(
+            class = "side-subpanel met-selection-pct-panel",
+            tags$div(class = "side-subpanel-title", "Selection intensity"),
+            numericInput(
+              inputId = "met_selection_pct",
+              label = "Top genotypes to flag as selected (%)",
+              value = 20,
+              min = 1,
+              max = 100,
+              step = 1
+            )
+          )
         )
-      ),
+        ),
         card(
           class = "analysis-output-main",
         card_header(
@@ -4849,17 +3801,39 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'met_qc'", DTOutput("met_qc_table")),
         conditionalPanel("input.result_view == 'met_variance'", DTOutput("met_variance_table")),
         conditionalPanel("input.result_view == 'met_blup'", DTOutput("met_blup_table")),
+        conditionalPanel("input.result_view == 'met_env_blup'", DTOutput("met_env_blup_table")),
         conditionalPanel("input.result_view == 'met_fw'", DTOutput("met_fw_table")),
         conditionalPanel(
           "input.result_view == 'met_ammi'",
           tagList(DTOutput("met_ammi_notes_table"), DTOutput("met_ammi_table"))
         ),
         conditionalPanel(
-          "input.result_view == 'met_gge'",
+          "input.result_view == 'met_gge' && (input.result_met_gge_view == 'met_gge' || input.result_met_gge_view == '' || input.result_met_gge_view == null)",
           tagList(DTOutput("met_gge_notes_table"), DTOutput("met_gge_table"))
+        ),
+        conditionalPanel(
+          "input.result_view == 'met_gge' && input.result_met_gge_view == 'met_gge_mean_stability'",
+          tagList(DTOutput("met_gge_decision_notes_table"), DTOutput("met_gge_mean_stability_table"))
+        ),
+        conditionalPanel(
+          "input.result_view == 'met_gge' && input.result_met_gge_view == 'met_gge_winners'",
+          DTOutput("met_gge_winner_table")
+        ),
+        conditionalPanel(
+          "input.result_view == 'met_gge' && input.result_met_gge_view == 'met_gge_environment'",
+          DTOutput("met_gge_environment_table")
         ),
         conditionalPanel("input.result_view == 'met_selection'", DTOutput("met_selection_table")),
         conditionalPanel("input.result_view == 'met_integrated'", DTOutput("met_integrated_table")),
+        conditionalPanel(
+          "input.result_view == 'met_decision_board'",
+          tagList(
+            tags$div(class = "side-subpanel-title", "Candidate decision board - ADVANCE, RETEST, or DISCARD"),
+            DTOutput("met_decision_board_table"),
+            tags$div(class = "side-subpanel-title", style = "margin-top: 16px;", "Decision rules used"),
+            DTOutput("met_decision_thresholds_table")
+          )
+        ),
         conditionalPanel("input.result_view == 'diversity_values'", DTOutput("diversity_values_table")),
         conditionalPanel("input.result_view == 'diversity_clusters'", DTOutput("diversity_clusters_table")),
         conditionalPanel("input.result_view == 'diversity_superiority'", DTOutput("diversity_superiority_table")),
@@ -4903,7 +3877,8 @@ ui <- page_navbar(
                 tags$div(
                   class = "chart-download-panel chart-download-popover",
                   numericInput("chart_width", "Width (in)", value = 12, min = 4, max = 30, step = 0.5),
-                  numericInput("chart_height", "Height (in)", value = 7, min = 4, max = 30, step = 0.5),
+                  numericInput("chart_height", "Height (in)", value = 8, min = 4, max = 30, step = 0.5),
+                  numericInput("met_selection_pct", "Selection intensity (%)", value = 20, min = 1, max = 100, step = 1),
                   selectInput(
                     "chart_format",
                     "File format",
@@ -4960,10 +3935,7 @@ server <- function(input, output, session) {
     }, error = function(e) {
       validate(need(FALSE, e$message))
     })
-    report <- si_validate_uploaded_file(
-      df,
-      remove_cols = remove_cols
-    )
+    report <- si_validate_uploaded_file(df)
     validate(
       need(report$ok, paste(report$errors, collapse = "\n"))
     )
@@ -5144,6 +4116,30 @@ server <- function(input, output, session) {
       component_weights = met_component_weights()
     )
   })
+  met_selection_pct <- reactive({
+    pct <- suppressWarnings(as.numeric(input$met_selection_pct))
+    if (length(pct) == 0 || !is.finite(pct)) pct <- 20
+    min(max(pct, 1), 100)
+  })
+  weighted_met_decision_board <- reactive({
+    req(analysis_results(), uploaded_data())
+    validate(need(analysis_used() == "MET", "Run MET analysis to view this result."))
+    methods <- build_met_multitrait_methods(
+      uploaded_data(),
+      analysis_results()$met_by_trait,
+      weighted_met_integrated()$ranking,
+      selection_pct = met_selection_pct()
+    )
+    build_met_decision_board(
+      uploaded_data(),
+      analysis_results()$met_by_trait,
+      weighted_met_integrated()$ranking,
+      method_membership = methods$method_membership,
+      check_genotypes = input$met_reference_checks,
+      thresholds = list(selection_pct = met_selection_pct()),
+      primary_trait = input$met_result_trait
+    )
+  })
   breeder_recommendation <- reactive({
     lpsi_res <- if (!is.null(saved_results$LPSI)) saved_results$LPSI else NULL
     met_res <- if (!is.null(saved_results$MET)) saved_results$MET else NULL
@@ -5253,7 +4249,7 @@ server <- function(input, output, session) {
     if (chart_module == "breeding" && !(view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution"))) {
       view <- "breeding_trend"
     }
-    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_fw_plot", "met_fw_regression", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_integrated_plot"))) {
+    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
       view <- "met_env_cor"
     }
     if (chart_module == "diversity" && !(view %in% c("diversity_superiority_plot", "diversity_dendrogram_plot", "diversity_corr_heatmap_plot"))) {
@@ -5395,10 +4391,23 @@ server <- function(input, output, session) {
     
     req(analysis_results())
     validate(need(analysis_used() == "MET", "Run MET analysis before downloading this chart."))
-    if (view == "met_integrated_plot") {
+    if (view == "met_multi_selection_plot") {
+      multi_view <- input$met_multi_selection_view %||% "integrated"
+      if (identical(multi_view, "mgidi")) {
+        methods <- build_met_multitrait_methods(
+          uploaded_data(),
+          analysis_results()$met_by_trait,
+          weighted_met_integrated()$ranking,
+          selection_pct = met_selection_pct()
+        )
+        return(list(
+          plot = plot_met_mgidi_ranking(methods),
+          name = "MET_multi_selection_MGIDI"
+        ))
+      }
       return(list(
         plot = weighted_met_integrated()$plot,
-        name = "MET_overall_ranking"
+        name = "MET_multi_selection_integrated_ranking"
       ))
     }
     
@@ -5408,16 +4417,23 @@ server <- function(input, output, session) {
       met_selection_plot = list(
         plot_met_selection_ranking(
           weighted_met_selection_for_plot(),
-          input$met_plot_trait
+          input$met_plot_trait,
+          estimate_label = if (met_result_uses_anova(result)) "Adjusted mean (BLUE)" else "BLUP"
         ),
         "MET_ranking"
       ),
-      met_fw_plot = list(result$p_fw_mean_sens, "MET_FW_sensitivity"),
-      met_fw_regression = list(result$p_fw_regression, "MET_FW_regression"),
+      met_fw_plot = list(
+        met_plot_fw_selected(result, input$met_fw_view),
+        met_fw_chart_file_slug(input$met_fw_view)
+      ),
       met_ammi1 = list(result$p_ammi1, "MET_AMMI1"),
       met_ammi2 = list(result$p_ammi2, "MET_AMMI2"),
-      met_gge = list(result$p_gge, "MET_GGE"),
+      met_gge = list(met_plot_gge_selected(result, input$met_gge_view), met_gge_chart_file_slug(input$met_gge_view)),
       met_env_cor = list(result$p_env_cor, "MET_environment_correlation"),
+      met_performance_heatmap = list(
+        met_plot_performance_heatmap(result, input$met_performance_heatmap_view),
+        met_performance_heatmap_file_slug(input$met_performance_heatmap_view)
+      ),
       NULL
     )
     validate(need(!is.null(chart_details), "Select a chart to download."))
@@ -5463,18 +4479,54 @@ server <- function(input, output, session) {
       lpsi_compare = list(list(Method_comparison = lpsi_method_comparison_r()), "Single-Location_Trial_method_comparison"),
       met_summary = list(list(Summary = met_result_for_table()$genotype_summary), paste0("MET_summary_", safe_name(trait))),
       met_qc = list(list(Quality_control = build_met_qc_table(met_result_for_table())), paste0("MET_quality_control_", safe_name(trait))),
-      met_variance = list(list(Variance = met_result_for_table()$variance_components), paste0("MET_variance_", safe_name(trait))),
-      met_blup = list(list(BLUP = met_result_for_table()$blups_main), paste0("MET_BLUP_", safe_name(trait))),
+      met_variance = {
+        model_result <- met_result_for_table()
+        model_name <- as.character(model_result$model_summary$Model[1] %||% "LMM")
+        is_anova <- grepl("^ANOVA", model_name, ignore.case = TRUE)
+        table_name <- if (is_anova) "Joint_ANOVA" else "LMM_variance_components"
+        tables <- stats::setNames(list(model_result$variance_components), table_name)
+        list(tables, paste0("MET_", table_name, "_", safe_name(trait)))
+      },
+      met_blup = {
+        estimate_result <- met_result_for_table()
+        estimate_is_anova <- met_result_uses_anova(estimate_result)
+        table_name <- if (estimate_is_anova) "Adjusted_means_BLUE" else "Genotype_BLUPs"
+        tables <- stats::setNames(list(met_genotype_estimates_table(estimate_result)), table_name)
+        list(tables, paste0("MET_", table_name, "_", safe_name(trait)))
+      },
+      met_env_blup = list(
+        list(Genotype_by_location = met_location_estimates_table(met_result_for_table())),
+        paste0("MET_genotype_by_location_", safe_name(trait))
+      ),
       met_fw = list(list(FW_stability = met_result_for_table()$fw_results), paste0("MET_FW_stability_", safe_name(trait))),
       met_ammi = list(
         list(Notes = met_result_for_table()$ammi_notes, AMMI = met_result_for_table()$ammi_genotype),
         paste0("MET_AMMI_", safe_name(trait))
       ),
       met_gge = list(
-        list(Notes = met_result_for_table()$ammi_notes, GGE = met_result_for_table()$gge_genotype),
+        list(Decision_guide = met_result_for_table()$gge_decision_notes, PC_variance = met_result_for_table()$gge_pc_variance, GGE = met_result_for_table()$gge_genotype),
         paste0("MET_GGE_", safe_name(trait))
       ),
+      met_gge_mean_stability = list(
+        list(Decision_guide = met_result_for_table()$gge_decision_notes, Mean_stability = met_result_for_table()$gge_mean_stability_decision),
+        paste0("MET_GGE_mean_stability_", safe_name(trait))
+      ),
+      met_gge_winners = list(
+        list(Location_winners = met_result_for_table()$gge_winner_decision),
+        paste0("MET_GGE_which_won_where_", safe_name(trait))
+      ),
+      met_gge_environment = list(
+        list(Environment_value = met_result_for_table()$gge_environment_decision),
+        paste0("MET_GGE_environment_value_", safe_name(trait))
+      ),
       met_selection = list(list(Selection = weighted_met_selection_for_table()), paste0("MET_selection_", safe_name(trait))),
+      met_decision_board = {
+        decision <- weighted_met_decision_board()
+        list(
+          list(Decision_board = decision$board, Breeder_passport = decision$passport, Decision_rules = decision$thresholds),
+          "MET_decision_board"
+        )
+      },
       met_integrated = list(list(Integrated_selection = weighted_met_integrated()$ranking), "MET_integrated_selection"),
       diversity_values = list(list(Genotypic_values = diversity_result()$genotype_values), "GDA_genotypic_values"),
       diversity_clusters = list(list(Clusters = diversity_result()$clusters), "GDA_clusters"),
@@ -5525,7 +4577,7 @@ server <- function(input, output, session) {
     if (chart_module == "breeding" && !(view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution"))) {
       view <- "breeding_trend"
     }
-    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_fw_plot", "met_fw_regression", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_integrated_plot"))) {
+    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
       view <- "met_env_cor"
     }
     if (chart_module == "diversity" && !(view %in% c("diversity_superiority_plot", "diversity_dendrogram_plot", "diversity_corr_heatmap_plot"))) {
@@ -5545,12 +4597,12 @@ server <- function(input, output, session) {
       breeding_distribution = "breeding_distribution_plot",
       met_selection_plot = "met_selection_plot",
       met_fw_plot = "met_fw_plot",
-      met_fw_regression = "met_fw_regression_plot",
       met_ammi1 = "met_ammi1_plot",
       met_ammi2 = "met_ammi2_plot",
       met_gge = "met_gge_plot",
       met_env_cor = "met_env_cor_plot",
-      met_integrated_plot = "met_integrated_plot",
+      met_performance_heatmap = "met_performance_heatmap",
+      met_multi_selection_plot = "met_multi_selection_plot",
       diversity_dendrogram_plot = "diversity_dendrogram_plot",
       diversity_superiority_plot = "diversity_superiority_plot",
       diversity_corr_heatmap_plot = "diversity_corr_heatmap_plot",
@@ -5648,6 +4700,21 @@ server <- function(input, output, session) {
     if (is.null(trait) || trait == "") {
       trait <- "selected trait"
     }
+    met_model_is_anova <- FALSE
+    if (identical(view, "met_variance")) {
+      active_met_result <- tryCatch(met_result_for_table(), error = function(e) NULL)
+      active_model <- if (!is.null(active_met_result) && nrow(as.data.frame(active_met_result$model_summary)) > 0) {
+        as.character(active_met_result$model_summary$Model[1] %||% "LMM")
+      } else {
+        "LMM"
+      }
+      met_model_is_anova <- grepl("^ANOVA", active_model, ignore.case = TRUE)
+    }
+    met_estimate_is_anova <- FALSE
+    if (identical(view, "met_blup")) {
+      active_estimate_result <- tryCatch(met_result_for_table(), error = function(e) NULL)
+      met_estimate_is_anova <- !is.null(active_estimate_result) && met_result_uses_anova(active_estimate_result)
+    }
     
     title <- switch(
       view,
@@ -5671,23 +4738,44 @@ server <- function(input, output, session) {
       lpsi_compare = "Selection method comparison",
       met_summary = paste("MET summary -", trait),
       met_qc = paste("MET quality control -", trait),
-      met_variance = paste("Variance -", trait),
-      met_blup = paste("BLUP -", trait),
+      met_variance = if (met_model_is_anova) paste("Joint ANOVA -", trait) else paste("LMM variance components -", trait),
+      met_blup = if (met_estimate_is_anova) paste("Genotype adjusted means (BLUEs) -", trait) else paste("Genotype BLUPs -", trait),
+      met_env_blup = paste("Genotype x location estimates -", trait),
       met_fw = paste("Finlay-Wilkinson stability -", trait),
       met_ammi = paste("AMMI -", trait),
-      met_gge = paste("GGE -", trait),
-      met_selection = paste("Selection -", trait),
-      met_integrated = "Integrated MET selection",
+      met_gge = paste("GGE technical overview -", trait),
+      met_gge_mean_stability = paste("GGE broad adaptation -", trait),
+      met_gge_winners = paste("GGE location winners -", trait),
+      met_gge_environment = paste("GGE environment value -", trait),
+      met_selection = paste("Single Selection -", trait),
+      met_integrated = "Multi Selection",
       diversity_values = "Genotypic values for diversity",
       diversity_clusters = "Diversity clusters",
       diversity_superiority = "Trait superiority",
       diversity_corr = "Trait correlation",
       "Analysis results"
     )
+    subtitle <- if (identical(view, "met_variance")) {
+      if (met_model_is_anova) {
+        "Combined fixed-effect ANOVA across environments"
+      } else {
+        "Variance partitioning with likelihood-ratio P-values for major random effects"
+      }
+    } else if (identical(view, "met_blup")) {
+      if (met_estimate_is_anova) {
+        "Fixed-effect estimated marginal means adjusted for the MET design"
+      } else {
+        "Mixed-model genotype predictions with shrinkage and reliability"
+      }
+    } else if (identical(view, "met_env_blup")) {
+      "Every genotype-location combination; untested cells are explicitly flagged model predictions"
+    } else {
+      "Results from the selected analysis view"
+    }
     tags$div(
       class = "panel-heading",
       tags$div(class = "panel-title", title),
-      tags$div(class = "panel-subtitle", "Results from the selected analysis view")
+      tags$div(class = "panel-subtitle", subtitle)
     )
   })
   output$result_header_trait_control <- renderUI({
@@ -5720,7 +4808,11 @@ server <- function(input, output, session) {
       if (is.null(selected) || !selected %in% traits) selected <- traits[1]
       return(selectInput("breeding_plot_trait", "Trait", choices = traits, selected = selected))
     }
-    if (identical(module, "met") && !identical(input$plot_view %||% "", "met_integrated_plot")) {
+    if (identical(module, "met")) {
+      view <- input$plot_view %||% ""
+      if (identical(view, "met_multi_selection_plot")) {
+        return(NULL)
+      }
       traits <- safe_met_traits()
       if (length(traits) == 0) return(NULL)
       selected <- input$met_plot_trait
@@ -5820,145 +4912,7 @@ server <- function(input, output, session) {
     if (is.null(data)) return(character(0))
     tryCatch(get_met_trait_cols(data), error = function(e) character(0))
   }
-  output$result_sidebar_menu <- renderUI({
-    tagList(
-      tags$div(
-        style = "display:none;",
-        selectInput(
-          "result_module", NULL,
-          choices = c("mating", "breeding", "diversity", "selection_index", "met"),
-          selected = "mating"
-        ),
-        selectInput(
-          "result_view", NULL,
-          choices = c(
-            "mating_anova", "mating_gca", "mating_sca", "mating_variance",
-            "breeding_stats", "breeding_response", "breeding_realized", "breeding_generation",
-            "diversity_values", "diversity_clusters", "diversity_superiority", "diversity_corr",
-            "lpsi_direct", "lpsi_compare", "lpsi_trait", "lpsi_anova", "lpsi_lsd",
-            "lpsi_superiority", "lpsi_heritability", "lpsi_ranking",
-            "lpsi_index_summary", "lpsi_correlation",
-            "met_summary", "met_qc", "met_variance", "met_blup", "met_fw",
-            "met_ammi", "met_gge", "met_selection", "met_integrated"
-          ),
-          selected = "mating_anova"
-        )
-      ),
-      tags$div(
-        class = "side-subpanel result-analysis-section",
-        selectInput(
-          "result_mating_view", "WHICH CROSS BEST",
-          choices = c(
-            "ANOVA" = "mating_anova",
-            "GCA - parent effects" = "mating_gca",
-            "SCA - cross effects" = "mating_sca",
-            "Variance breakdown" = "mating_variance"
-          ),
-          selected = input$result_mating_view %||% "mating_anova"
-        )
-      ),
-      tags$div(
-        class = "side-subpanel result-analysis-section",
-        selectInput(
-          "result_breeding_view", "PRE-BREEDING PROCESS",
-          choices = c(
-            "Genetic parameters" = "breeding_stats",
-            "Response per year" = "breeding_response",
-            "Realized gain" = "breeding_realized",
-            "Generation summary" = "breeding_generation"
-          ),
-          selected = input$result_breeding_view %||% "breeding_stats"
-        )
-      ),
-      tags$div(
-        class = "side-subpanel result-analysis-section",
-        selectInput(
-          "result_diversity_view", "GENETIC DIVERSITY",
-          choices = c(
-            "Genotypic values" = "diversity_values",
-            "Clusters" = "diversity_clusters",
-            "Superiority" = "diversity_superiority",
-            "Trait correlation" = "diversity_corr"
-          ),
-          selected = input$result_diversity_view %||% "diversity_values"
-        ),
-        conditionalPanel(
-          "input.result_diversity_view == 'diversity_superiority'",
-          uiOutput("diversity_result_benchmark_controls")
-        )
-      ),
-      tags$div(
-        class = "side-subpanel result-analysis-section",
-        selectInput(
-          "result_lpsi_mode", "SINGLE-LOCATION TRIAL",
-          choices = c(
-            "Single-Trait Analysis" = "single",
-            "Selection Index" = "multi"
-          ),
-          selected = input$result_lpsi_mode %||% "single"
-        ),
-        uiOutput("result_lpsi_view_slicer"),
-        uiOutput("result_lpsi_threshold_detail")
-      ),
-      tags$div(
-        class = "side-subpanel result-analysis-section",
-        selectInput(
-          "result_met_view", "Choose result",
-          choices = c(
-            "Summary" = "met_summary", "QC" = "met_qc",
-            "Variance" = "met_variance", "BLUP" = "met_blup",
-            "Stability (FW)" = "met_fw", "AMMI" = "met_ammi",
-            "GGE" = "met_gge", "Selection" = "met_selection",
-            "Integrated Selection" = "met_integrated"
-          ),
-          selected = input$result_met_view %||% "met_summary"
-        )
-      )
-    )
-  })
-  output$result_lpsi_view_slicer <- renderUI({
-    mode <- input$result_lpsi_mode %||% "single"
-    choices <- if (identical(mode, "multi")) {
-      c(
-        "Summary" = "lpsi_index_summary",
-        "Superiority" = "lpsi_superiority",
-        "Trait Correlation" = "lpsi_correlation"
-      )
-    } else {
-      c(
-        "Summary" = "lpsi_trait",
-        "ANOVA" = "lpsi_anova",
-        "Genetic gain" = "lpsi_heritability",
-        "Mean comparison" = "lpsi_lsd"
-      )
-    }
-    current <- input$result_lpsi_view %||% ""
-    selectInput(
-      "result_lpsi_view", "Choose result",
-      choices = choices,
-      selected = if (current %in% choices) current else unname(choices)[1]
-    )
-  })
-  observeEvent(input$result_mating_view, {
-    updateSelectInput(session, "result_module", selected = "mating")
-    updateSelectInput(session, "result_view", selected = input$result_mating_view)
-  }, ignoreInit = TRUE)
-  observeEvent(input$result_breeding_view, {
-    updateSelectInput(session, "result_module", selected = "breeding")
-    updateSelectInput(session, "result_view", selected = input$result_breeding_view)
-  }, ignoreInit = TRUE)
-  observeEvent(input$result_diversity_view, {
-    updateSelectInput(session, "result_module", selected = "diversity")
-    updateSelectInput(session, "result_view", selected = input$result_diversity_view)
-  }, ignoreInit = TRUE)
-  observeEvent(input$result_lpsi_view, {
-    updateSelectInput(session, "result_module", selected = "selection_index")
-    updateSelectInput(session, "result_view", selected = input$result_lpsi_view)
-  }, ignoreInit = TRUE)
-  observeEvent(input$result_met_view, {
-    updateSelectInput(session, "result_module", selected = "met")
-    updateSelectInput(session, "result_view", selected = input$result_met_view)
-  }, ignoreInit = TRUE)
+  # Result navigation: persistent analysis choices with contextual lists.
   # Hybrid result navigation: persistent analysis choices with contextual dropdowns.
   output$result_sidebar_menu <- renderUI({
     choices <- c(
@@ -6099,11 +5053,31 @@ server <- function(input, output, session) {
       "Trait Correlation" = "lpsi_correlation"
     )
     current <- input$result_view %||% ""
-    sidebar_detail_panel(
-      "Selection Index",
-      choices = choices,
-      input_id = "result_view",
-      selected = if (current %in% choices) current else "lpsi_index_summary"
+    selected_view <- if (current %in% choices) current else "met_summary"
+    sub_content <- if (identical(selected_view, "met_gge")) {
+      sidebar_detail_panel(
+        "GGE tables",
+        choices = c(
+          "Technical Overview" = "met_gge",
+          "Broad Adaptation" = "met_gge_mean_stability",
+          "Location Winners" = "met_gge_winners",
+          "Environment Value" = "met_gge_environment"
+        ),
+        input_id = "result_met_gge_view",
+        selected = if (input$result_met_gge_view %in% c("met_gge", "met_gge_mean_stability", "met_gge_winners", "met_gge_environment")) input$result_met_gge_view else "met_gge",
+        style = "slicer"
+      )
+    } else {
+      NULL
+    }
+    tagList(
+      sidebar_detail_panel(
+        "Across Location",
+        choices = choices,
+        input_id = "result_view",
+        selected = selected_view
+      ),
+      sub_content
     )
   })
   output$result_lpsi_threshold_detail <- renderUI({
@@ -6114,15 +5088,17 @@ server <- function(input, output, session) {
   })
   output$result_met_detail <- renderUI({
     choices <- c(
+      "Decision Board" = "met_decision_board",
       "Summary" = "met_summary",
       "QC" = "met_qc",
-      "Variance" = "met_variance",
-      "BLUP" = "met_blup",
+      "Model" = "met_variance",
+      "Genotype Estimates" = "met_blup",
+      "Genotype x Location" = "met_env_blup",
       "Stability (FW)" = "met_fw",
       "AMMI" = "met_ammi",
       "GGE" = "met_gge",
-      "Selection" = "met_selection",
-      "Integrated Selection" = "met_integrated"
+      "Single Selection" = "met_selection",
+      "Multi Selection" = "met_integrated"
     )
     current <- input$result_view %||% ""
     met_traits <- safe_met_traits()
@@ -6130,11 +5106,31 @@ server <- function(input, output, session) {
     if (is.null(met_selected) || !met_selected %in% met_traits) {
       met_selected <- if (length(met_traits) > 0) met_traits[1] else character(0)
     }
-    sidebar_detail_panel(
-      "Across Location",
-      choices = choices,
-      input_id = "result_view",
-      selected = if (current %in% choices) current else "met_summary"
+    selected_view <- if (current %in% choices) current else "met_summary"
+    sub_content <- if (identical(selected_view, "met_gge")) {
+      sidebar_detail_panel(
+        "GGE tables",
+        choices = c(
+          "Technical Overview" = "met_gge",
+          "Broad Adaptation" = "met_gge_mean_stability",
+          "Location Winners" = "met_gge_winners",
+          "Environment Value" = "met_gge_environment"
+        ),
+        input_id = "result_met_gge_view",
+        selected = if (isTRUE((input$result_met_gge_view %||% "") %in% c("met_gge", "met_gge_mean_stability", "met_gge_winners", "met_gge_environment"))) input$result_met_gge_view else "met_gge",
+        style = "slicer"
+      )
+    } else {
+      NULL
+    }
+    tagList(
+      sidebar_detail_panel(
+        "Across Location",
+        choices = choices,
+        input_id = "result_view",
+        selected = selected_view
+      ),
+      sub_content
     )
   })
   output$result_diversity_detail <- renderUI({
@@ -6226,13 +5222,13 @@ server <- function(input, output, session) {
   output$chart_met_detail <- renderUI({
     choices <- c(
       "Environment Correlation" = "met_env_cor",
-      "FW Sensitivity" = "met_fw_plot",
-      "FW Regression" = "met_fw_regression",
-      "AMMI1" = "met_ammi1",
-      "AMMI2" = "met_ammi2",
+      "Genotype x Location" = "met_performance_heatmap",
+      "FW" = "met_fw_plot",
+      "AMMI-1" = "met_ammi1",
+      "AMMI-2" = "met_ammi2",
       "GGE" = "met_gge",
-      "Ranking" = "met_selection_plot",
-      "Integrated Ranking" = "met_integrated_plot"
+      "Single Selection" = "met_selection_plot",
+      "Multi Selection" = "met_multi_selection_plot"
     )
     current <- input$plot_view %||% ""
     traits <- safe_met_traits()
@@ -6240,11 +5236,56 @@ server <- function(input, output, session) {
     if (is.null(trait_selected) || !trait_selected %in% traits) {
       trait_selected <- if (length(traits) > 0) traits[1] else character(0)
     }
-    sidebar_detail_panel(
-      "MET",
-      choices = choices,
-      input_id = "plot_view",
-      selected = if (current %in% choices) current else "met_env_cor"
+    heatmap_result <- if (
+      length(trait_selected) > 0 && !is.null(analysis_results()) &&
+        identical(analysis_used(), "MET")
+    ) {
+      analysis_results()$met_by_trait[[trait_selected]]
+    } else {
+      NULL
+    }
+    selected_view <- if (current %in% choices) current else "met_env_cor"
+    sub_content <- switch(
+      selected_view,
+      met_fw_plot = sidebar_detail_panel(
+        "FW charts",
+        choices = met_fw_chart_choices(),
+        input_id = "met_fw_view",
+        selected = met_fw_selected_view(input$met_fw_view),
+        style = "slicer"
+      ),
+      met_performance_heatmap = sidebar_detail_panel(
+        "Display values",
+        choices = met_performance_heatmap_choices(heatmap_result),
+        input_id = "met_performance_heatmap_view",
+        selected = met_performance_heatmap_selected_view(input$met_performance_heatmap_view),
+        style = "slicer"
+      ),
+      met_gge = sidebar_detail_panel(
+        "GGE charts",
+        choices = met_gge_chart_choices(),
+        input_id = "met_gge_view",
+        selected = met_gge_selected_view(input$met_gge_view),
+        style = "slicer"
+      ),
+      met_multi_selection_plot = sidebar_detail_panel(
+        "Multi Selection",
+        choices = c("Integrated Ranking" = "integrated", "MGIDI" = "mgidi"),
+        input_id = "met_multi_selection_view",
+        selected = input$met_multi_selection_view %||% "integrated",
+        style = "slicer"
+      ),
+      NULL
+    )
+    tagList(
+      sidebar_detail_panel(
+        "MET",
+        choices = choices,
+        input_id = "plot_view",
+        selected = selected_view,
+        style = "slicer"
+      ),
+      sub_content
     )
   })
   output$chart_diversity_detail <- renderUI({
@@ -6383,9 +5424,14 @@ server <- function(input, output, session) {
     if (length(selected_traits) == 0) selected_traits <- prepared$trait_cols[1]
     n_met_envs <- n_distinct(prepared$data$Environment)
     default_min_envs <- max(MET_MIN_ENVS_FOR_BIPLOT, ceiling(0.5 * n_met_envs))
-    default_min_envs <- min(max(1, default_min_envs), max(1, n_met_envs))
+    if (n_met_envs >= MET_MIN_ENVS_FOR_BIPLOT) {
+      default_min_envs <- min(default_min_envs, n_met_envs)
+    }
     selected_min_envs <- suppressWarnings(as.integer(input$met_min_envs_for_biplot %||% default_min_envs))
-    if (is.na(selected_min_envs) || selected_min_envs < 1 || selected_min_envs > n_met_envs) {
+    if (
+      is.na(selected_min_envs) || selected_min_envs < MET_MIN_ENVS_FOR_BIPLOT ||
+        (n_met_envs >= MET_MIN_ENVS_FOR_BIPLOT && selected_min_envs > n_met_envs)
+    ) {
       selected_min_envs <- default_min_envs
     }
     
@@ -6405,6 +5451,15 @@ server <- function(input, output, session) {
         selected = choose_required_col(input$met_rep_col, met_rep_col_candidates)
       ),
       selectInput(
+        inputId = "met_model_type",
+        label = "Model",
+        choices = c(
+          "LMM" = "LMM",
+          "ANOVA (RCBD)" = "ANOVA_RCBD"
+        ),
+        selected = input$met_model_type %||% "LMM"
+      ),
+      selectInput(
         inputId = "met_block_col",
         label = "Block column",
         choices = c("No block column" = "", all_cols),
@@ -6414,10 +5469,20 @@ server <- function(input, output, session) {
         inputId = "met_min_envs_for_biplot",
         label = "Min observed locations for AMMI/GGE flag",
         value = selected_min_envs,
-        min = 1,
-        max = max(1, n_met_envs),
+        min = MET_MIN_ENVS_FOR_BIPLOT,
+        max = max(MET_MIN_ENVS_FOR_BIPLOT, n_met_envs),
         step = 1
       ),
+      if (n_met_envs < MET_MIN_ENVS_FOR_BIPLOT) {
+        tags$p(
+          class = "small-note",
+          paste0(
+            "The core MET model will run with ", n_met_envs,
+            " locations. AMMI and GGE require at least ", MET_MIN_ENVS_FOR_BIPLOT,
+            " locations and will be marked unavailable."
+          )
+        )
+      },
       selectizeInput(
         inputId = "met_reference_checks",
         label = "Reference check",
@@ -6643,7 +5708,7 @@ server <- function(input, output, session) {
     numeric_cols <- all_cols[vapply(trait_detection_data, function(column) {
       sum(!is.na(to_number(column))) > 0
     }, logical(1))]
-    trait_choices <- setdiff(numeric_cols, c(genotype_col, rep_default, remove_cols))
+    trait_choices <- setdiff(numeric_cols, c(genotype_col, rep_default))
     if (length(trait_choices) == 0) trait_choices <- numeric_cols
     check_choices <- unique(clean_text(trait_detection_data[[genotype_col]]))
     check_choices <- check_choices[!is.na(check_choices) & check_choices != ""]
@@ -7112,7 +6177,8 @@ server <- function(input, output, session) {
           trait_cols = met_traits,
           replication_col = met_rep_col,
           block_col = met_block_col,
-          min_envs_for_biplot = met_min_envs_for_biplot
+          min_envs_for_biplot = met_min_envs_for_biplot,
+          model_type = input$met_model_type %||% "LMM"
         )
       }, error = function(e) {
         showNotification(
@@ -7787,10 +6853,14 @@ server <- function(input, output, session) {
     datatable(met_result_for_table()$variance_components, options = list(pageLength = 20, scrollX = TRUE))
   })
   output$met_blup_table <- renderDT({
-    datatable(met_result_for_table()$blups_main, options = list(pageLength = 50, scrollX = TRUE))
+    datatable(met_genotype_estimates_table(met_result_for_table()), options = list(pageLength = 50, scrollX = TRUE))
   })
   output$met_env_blup_table <- renderDT({
-    datatable(met_result_for_table()$blups_environment, options = list(pageLength = 100, scrollX = TRUE))
+    datatable(
+      met_location_estimates_table(met_result_for_table()),
+      rownames = FALSE,
+      options = list(pageLength = 100, scrollX = TRUE)
+    )
   })
   output$met_fw_table <- renderDT({
     datatable(met_result_for_table()$fw_results, options = list(pageLength = 50, scrollX = TRUE))
@@ -7799,13 +6869,25 @@ server <- function(input, output, session) {
     datatable(met_result_for_table()$ammi_notes, options = list(dom = "t", scrollX = TRUE))
   })
   output$met_gge_notes_table <- renderDT({
-    datatable(met_result_for_table()$ammi_notes, options = list(dom = "t", scrollX = TRUE))
+    datatable(met_result_for_table()$gge_decision_notes, options = list(dom = "t", scrollX = TRUE))
+  })
+  output$met_gge_decision_notes_table <- renderDT({
+    datatable(met_result_for_table()$gge_decision_notes, options = list(dom = "t", scrollX = TRUE))
   })
   output$met_ammi_table <- renderDT({
     datatable(met_result_for_table()$ammi_genotype, options = list(pageLength = 50, scrollX = TRUE))
   })
   output$met_gge_table <- renderDT({
     datatable(met_result_for_table()$gge_genotype, options = list(pageLength = 50, scrollX = TRUE))
+  })
+  output$met_gge_mean_stability_table <- renderDT({
+    datatable(met_result_for_table()$gge_mean_stability_decision, options = list(pageLength = 50, scrollX = TRUE))
+  })
+  output$met_gge_winner_table <- renderDT({
+    datatable(met_result_for_table()$gge_winner_decision, options = list(pageLength = 50, scrollX = TRUE))
+  })
+  output$met_gge_environment_table <- renderDT({
+    datatable(met_result_for_table()$gge_environment_decision, options = list(pageLength = 50, scrollX = TRUE))
   })
   output$met_selection_table <- renderDT({
     datatable(weighted_met_selection_for_table(), options = list(pageLength = 50, scrollX = TRUE))
@@ -7816,6 +6898,30 @@ server <- function(input, output, session) {
     datatable(
       weighted_met_integrated()$ranking,
       options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$met_decision_board_table <- renderDT({
+    req(analysis_results())
+    validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
+    datatable(
+      weighted_met_decision_board()$board,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$met_decision_passport_table <- renderDT({
+    req(analysis_results())
+    validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
+    datatable(
+      weighted_met_decision_board()$passport,
+      options = list(pageLength = 50, scrollX = TRUE)
+    )
+  })
+  output$met_decision_thresholds_table <- renderDT({
+    req(analysis_results())
+    validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
+    datatable(
+      weighted_met_decision_board()$thresholds,
+      options = list(dom = "t", scrollX = TRUE)
     )
   })
   output$diversity_values_table <- renderDT({
@@ -7846,7 +6952,9 @@ server <- function(input, output, session) {
   }, res = 96, execOnResize = TRUE)
   output$met_selection_plot <- renderPlot({
     selection <- weighted_met_selection_for_plot()
-    print(plot_met_selection_ranking(selection, input$met_plot_trait))
+    estimate_result <- met_result_for_plot()
+    estimate_label <- if (met_result_uses_anova(estimate_result)) "Adjusted mean (BLUE)" else "BLUP"
+    print(plot_met_selection_ranking(selection, input$met_plot_trait, estimate_label = estimate_label))
   }, res = 96, execOnResize = TRUE)
   output$met_integrated_plot <- renderPlot({
     validate(need(
@@ -7856,17 +6964,31 @@ server <- function(input, output, session) {
     integrated <- weighted_met_integrated()
     print(integrated$plot)
   }, res = 96, execOnResize = TRUE)
+  output$met_multi_selection_plot <- renderPlot({
+    validate(need(
+      !is.null(analysis_results()) && identical(analysis_used(), "MET"),
+      "Run MET analysis to view this plot."
+    ))
+    method <- input$met_multi_selection_view %||% "integrated"
+    if (identical(method, "mgidi")) {
+      methods <- build_met_multitrait_methods(
+        uploaded_data(),
+        analysis_results()$met_by_trait,
+        weighted_met_integrated()$ranking,
+        selection_pct = met_selection_pct()
+      )
+      print(plot_met_mgidi_ranking(methods))
+    } else {
+      print(weighted_met_integrated()$plot)
+    }
+  }, res = 96, execOnResize = TRUE)
   output$met_performance_heatmap <- renderPlot({
     result <- met_result_for_plot()
-    print(result$p_perf_heatmap)
-  })
+    print(met_plot_performance_heatmap(result, input$met_performance_heatmap_view))
+  }, res = 96, execOnResize = TRUE)
   output$met_fw_plot <- renderPlot({
     result <- met_result_for_plot()
-    print(result$p_fw_mean_sens)
-  }, res = 96, execOnResize = TRUE)
-  output$met_fw_regression_plot <- renderPlot({
-    result <- met_result_for_plot()
-    print(result$p_fw_regression)
+    print(met_plot_fw_selected(result, input$met_fw_view))
   }, res = 96, execOnResize = TRUE)
   output$met_ammi1_plot <- renderPlot({
     result <- met_result_for_plot()
@@ -7876,9 +6998,21 @@ server <- function(input, output, session) {
     result <- met_result_for_plot()
     print(result$p_ammi2)
   }, res = 96, execOnResize = TRUE)
+  output$met_gge_mean_stability_plot <- renderPlot({
+    result <- met_result_for_plot()
+    print(result$p_gge_mean_stability)
+  }, res = 96, execOnResize = TRUE)
+  output$met_gge_which_won_plot <- renderPlot({
+    result <- met_result_for_plot()
+    print(result$p_gge_which_won)
+  }, res = 96, execOnResize = TRUE)
+  output$met_gge_environment_plot <- renderPlot({
+    result <- met_result_for_plot()
+    print(result$p_gge_environment)
+  }, res = 96, execOnResize = TRUE)
   output$met_gge_plot <- renderPlot({
     result <- met_result_for_plot()
-    print(result$p_gge)
+    print(met_plot_gge_selected(result, input$met_gge_view))
   }, res = 96, execOnResize = TRUE)
   output$met_env_cor_plot <- renderPlot({
     result <- met_result_for_plot()
@@ -8008,6 +7142,7 @@ server <- function(input, output, session) {
         result$met_integrated_trait_weights <- integrated$trait_weights
         result$met_integrated_adjusted <- integrated$adjusted_performance
         result$met_integrated_standardized <- integrated$standardized_scores
+        result$met_decision_board <- weighted_met_decision_board()
         result
       } else {
         saved_results$MET
@@ -8067,6 +7202,7 @@ server <- function(input, output, session) {
           result$met_integrated_trait_weights <- integrated$trait_weights
           result$met_integrated_adjusted <- integrated$adjusted_performance
           result$met_integrated_standardized <- integrated$standardized_scores
+          result$met_decision_board <- weighted_met_decision_board()
         }
         if (analysis_type == "DIVERSITY") {
           checks <- get_diversity_selected_checks("diversity_result_benchmark_checks")
