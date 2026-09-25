@@ -15,6 +15,7 @@ library(writexl)
 library(grid)
 library(lme4)
 library(lmerTest)
+library(sommer)
 library(patchwork)
 options(shiny.maxRequestSize = 50 * 1024^2)
 
@@ -26,6 +27,7 @@ source(file.path("modules", "advanced_analysis_extensions.R"), local = TRUE)
 source(file.path("modules", "module_1_breeding.R"), local = TRUE)
 source(file.path("modules", "module_2_genetic_diversity.R"), local = TRUE)
 source(file.path("modules", "module_3_mating.R"), local = TRUE)
+source(file.path("modules", "module_multi_factor.R"), local = TRUE)
 source(file.path("modules", "module_4_selection_index.R"), local = TRUE)
 source(file.path("modules", "module_5_met.R"), local = TRUE)
 
@@ -222,12 +224,25 @@ build_export_tables <- function(analysis_type, results) {
     if (!is.null(results$generation_stats) && nrow(results$generation_stats) > 0) {
       add_sheet("04", "generation", results$generation_stats)
     }
+  } else if (analysis_type == "MULTIFACTOR") {
+    add_sheet("00", "settings", results$settings)
+    add_sheet("01", "summary", results$summary)
+    add_sheet("02", "anova", results$anova)
+    add_sheet("03", "mean_comparison", results$effect_comparison)
+    add_sheet("04", "pairwise", results$effect_pairwise)
+    add_sheet("05", "superiority", results$superiority)
+    add_sheet("06", "notes", results$notes)
   } else if (analysis_type == "LPSI") {
+    mean_comparison <- si_lpsi_mean_comparison_view(
+      results,
+      method = results$mean_comparison_method %||% "lsd",
+      spread = results$mean_comparison_spread %||% "se"
+    )
     add_sheet("00", "decision_settings", results$decision_settings)
     add_sheet("00b", "breeder_recommendation", si_breeder_recommendation_table(lpsi_results = results))
     add_sheet("01", "summary", results$trait_info)
     add_sheet("02", "anova", results$anova_full)
-    add_sheet("03", "mean_comparison", results$lsd_wide)
+    add_sheet("03", "mean_comparison", mean_comparison$combined)
     add_sheet("04", "superiority_mean", results$superiority_index)
     add_sheet("05", "selection_index", results$index_ranking)
     add_sheet("05a", "original_scale_means", results$actual_adjusted_means)
@@ -254,6 +269,7 @@ build_export_tables <- function(analysis_type, results) {
           grepl("^ANOVA", as.character(result$model_summary$Model[1] %||% ""), ignore.case = TRUE)
         ) "joint_anova" else "lmm_variance"
         add_sheet("03_model", paste(model_result_name, trait, sep = "_"), result$variance_components)
+        add_sheet("03b_model_tests", trait, result$lrt_table)
         estimate_result_name <- if (met_result_uses_anova(result)) "blue" else "blup"
         add_sheet(
           "04_genotype_estimates",
@@ -395,6 +411,176 @@ fit_single_location_model <- function(data, trait, model_type = "RCBD") {
   }
   aov(make_model_formula(trait, data, model_type), data = data)
 }
+
+# Build one display/export table for all traits without mixing summary rows
+# into the sortable variety data.
+si_lpsi_format_raw_mean <- function(summaries, spread = "se") {
+  spread <- match.arg(spread, c("se", "sd"))
+  variation <- if (identical(spread, "sd")) summaries$SD else summaries$SE
+  value <- ifelse(
+    is.finite(variation),
+    sprintf("%.3f \u00b1 %.3f", summaries$Mean, variation),
+    sprintf("%.3f (%s unavailable)", summaries$Mean, toupper(spread))
+  )
+  trimws(paste(value, ifelse(is.na(summaries$Group), "", summaries$Group)))
+}
+
+si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se") {
+  method <- match.arg(method, c("lsd", "tukey"))
+  spread <- match.arg(spread, c("se", "sd"))
+  raw <- as.data.frame(results$cleaned_data)
+  trait_info <- as.data.frame(results$trait_info)
+  anova_rows <- as.data.frame(results$anova_full)
+  gain <- as.data.frame(results$heritability_gain)
+  model_type <- as.character(results$decision_settings$Model[1] %||% "RCBD")
+  id_lookup <- unique(raw[, c("ID", "Original_ID"), drop = FALSE])
+  id_lookup$ID <- as.character(id_lookup$ID)
+  traits <- as.character(trait_info$Trait)
+  value_columns <- list()
+  summary_columns <- list()
+
+  for (trait in traits) {
+    trait_rows <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
+    test_row <- anova_rows[
+      as.character(anova_rows$Trait) == trait &
+        trimws(as.character(anova_rows$Source)) == "ID",
+      , drop = FALSE
+    ]
+    test <- if (nrow(test_row) > 0) as.character(test_row$Test[1]) else "Failed"
+    p_value <- if (nrow(test_row) > 0) suppressWarnings(as.numeric(test_row$p_value[1])) else NA_real_
+    gain_row <- gain[as.character(gain$Trait) == trait, , drop = FALSE]
+    cv <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$CV_pct[1])) else NA_real_
+    h2 <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$Broad_sense_H2[1])) else NA_real_
+    critical_difference <- ""
+    p_label <- if (!is.finite(p_value)) {
+      "p unavailable"
+    } else if (p_value <= 0) {
+      "p<0.00001"
+    } else {
+      paste0("p=", format(signif(p_value, 3), scientific = FALSE, trim = TRUE))
+    }
+    means <- data.frame(ID = character(0), Value = character(0))
+
+    raw_means <- trait_rows %>%
+      mutate(ID = as.character(ID)) %>%
+      group_by(ID) %>%
+      summarise(
+        Mean = mean(.data[[trait]], na.rm = TRUE),
+        SD = stats::sd(.data[[trait]], na.rm = TRUE),
+        N = dplyr::n(),
+        .groups = "drop"
+      )
+    raw_means$SE <- raw_means$SD / sqrt(raw_means$N)
+
+    if (identical(test, "Kruskal-Wallis") && nrow(trait_rows) > 0) {
+      raw_means$Group <- ""
+      critical_difference <- if (is.finite(p_value) && p_value < lsd_significance_alpha) {
+        paste0(p_label, " (KW; Dunn unavailable)")
+      } else if (is.finite(p_value)) {
+        paste0(p_label, " (KW; Dunn not run)")
+      } else {
+        "p unavailable (KW; Dunn not run)"
+      }
+      if (is.finite(p_value) && p_value < lsd_significance_alpha && nrow(raw_means) > 1) {
+        dunn <- tryCatch(
+          dunn_holm_test(trait_rows, trait, "ID", lsd_significance_alpha),
+          error = function(e) NULL
+        )
+        if (!is.null(dunn)) {
+          significant_pairs <- sum(dunn$pairwise$Significant, na.rm = TRUE)
+          critical_difference <- if (significant_pairs > 0) {
+            paste0(p_label, " (KW; Dunn: ", significant_pairs, " significant pair(s))")
+          } else {
+            paste0(p_label, " (KW; Dunn: no significant pairs)")
+          }
+          if (significant_pairs > 0) {
+            raw_means$Group <- unname(dunn$letters[raw_means$ID])
+          }
+        }
+      }
+      means <- data.frame(
+        ID = raw_means$ID,
+        Value = si_lpsi_format_raw_mean(raw_means, spread)
+      )
+    } else if (identical(test, "ANOVA") && nrow(trait_rows) > 0) {
+      model_view <- tryCatch({
+        model <- fit_single_location_model(trait_rows, trait, model_type)
+        em <- emmeans(model, ~ ID)
+        estimates <- as.data.frame(em)
+        estimates$ID <- as.character(estimates$ID)
+        estimates$Group <- ""
+        if (is.finite(p_value) && p_value < lsd_significance_alpha &&
+            nrow(estimates) > 1 && df.residual(model) > 0) {
+          higher_better <- as.character(trait_info$Direction[trait_info$Trait == trait][1]) == "Higher better"
+          letters_table <- as.data.frame(multcomp::cld(
+            em,
+            Letters = c(letters, LETTERS),
+            adjust = if (identical(method, "tukey")) "tukey" else "none",
+            alpha = lsd_significance_alpha,
+            sort = TRUE,
+            reversed = higher_better
+          ))
+          estimates$Group <- trimws(as.character(letters_table$.group)[match(estimates$ID, as.character(letters_table$ID))])
+        }
+        differences <- as.data.frame(summary(pairs(em, adjust = "none")))
+        thresholds <- if (identical(method, "tukey")) {
+          stats::qtukey(1 - lsd_significance_alpha, nrow(estimates), differences$df) *
+            differences$SE / sqrt(2)
+        } else {
+          stats::qt(1 - lsd_significance_alpha / 2, differences$df) * differences$SE
+        }
+        thresholds <- thresholds[is.finite(thresholds)]
+        critical <- if (length(thresholds) == 0) {
+          "Not available"
+        } else if (max(thresholds) - min(thresholds) <= 1e-6 * max(1, max(abs(thresholds)))) {
+          sprintf("%.3f", thresholds[1])
+        } else {
+          "Varies by pair"
+        }
+        list(estimates = estimates, critical = critical)
+      }, error = function(e) NULL)
+      if (!is.null(model_view)) {
+        estimates <- model_view$estimates
+        raw_means$Group <- estimates$Group[match(raw_means$ID, estimates$ID)]
+        means <- data.frame(
+          ID = raw_means$ID,
+          Value = si_lpsi_format_raw_mean(raw_means, spread)
+        )
+        critical_difference <- model_view$critical
+      } else {
+        raw_means$Group <- ""
+        means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread))
+        critical_difference <- "Model comparison unavailable"
+      }
+    } else if (nrow(trait_rows) > 0) {
+      raw_means$Group <- ""
+      means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread))
+    }
+
+    value_columns[[trait]] <- means$Value[match(id_lookup$ID, means$ID)]
+    value_columns[[trait]][is.na(value_columns[[trait]])] <- "Not available"
+    summary_columns[[trait]] <- c(
+      if (is.finite(cv)) sprintf("%.2f%%", cv) else "Not available",
+      if (is.finite(h2)) sprintf("%.3f", h2) else "Not estimated",
+      critical_difference
+    )
+  }
+
+  means_table <- data.frame(id_lookup, value_columns, check.names = FALSE)
+  critical_label <- if (identical(method, "tukey")) "Tukey HSD (0.05)" else "LSD (0.05)"
+  summary_table <- data.frame(
+    ID = rep("", 3),
+    Original_ID = c("CV (%)", "Broad-sense H\u00b2", critical_label),
+    summary_columns,
+    check.names = FALSE
+  )
+  list(
+    means = means_table,
+    summary = summary_table,
+    combined = rbind(means_table, summary_table)
+  )
+}
+
 single_location_anova_table <- function(model) {
   sm <- as.data.frame(anova(model))
   sm$Source <- trimws(rownames(sm))
@@ -1699,29 +1885,32 @@ plot_lpsi_mean_comparison <- function(results, trait) {
   label_levels <- unique(c(label_levels, setdiff(unique(plot_dat$Label), label_levels)))
   plot_dat$Label <- factor(plot_dat$Label, levels = label_levels)
   letters_dat$Label <- factor(letters_dat$Label, levels = label_levels)
-  value_range <- diff(range(plot_dat$Value, na.rm = TRUE))
-  label_gap <- max(value_range * 0.06, max(abs(plot_dat$Value), na.rm = TRUE) * 0.015, 0.03)
-  label_y <- aggregate(Value ~ Label, plot_dat, max, na.rm = TRUE)
-  letters_dat <- merge(letters_dat, label_y, by = "Label", all.x = TRUE, sort = FALSE)
+  bar_dat <- plot_dat %>%
+    group_by(Label) %>%
+    summarise(Mean = mean(Value), SD = sd(Value), N = n(), .groups = "drop") %>%
+    mutate(SE = SD / sqrt(N))
+  letters_dat <- merge(letters_dat, bar_dat[, c("Label", "Mean", "SE")], by = "Label", all.x = TRUE, sort = FALSE)
   letters_dat$Label <- factor(letters_dat$Label, levels = label_levels)
+  value_range <- diff(range(c(bar_dat$Mean - bar_dat$SE, bar_dat$Mean + bar_dat$SE), na.rm = TRUE))
+  label_gap <- max(value_range * 0.05, max(abs(bar_dat$Mean), na.rm = TRUE) * 0.015, 0.03)
 
-  ggplot(plot_dat, aes(x = Label, y = Value, fill = Label)) +
-    geom_jitter(width = 0.12, height = 0, alpha = 0.45, size = 1.4, show.legend = FALSE) +
-    geom_boxplot(width = 0.68, linewidth = 0.45, outlier.size = 1.5, show.legend = FALSE) +
+  ggplot(bar_dat, aes(x = Label, y = Mean, fill = Label)) +
+    geom_col(width = 0.7, show.legend = FALSE) +
+    geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.18, na.rm = TRUE) +
     geom_text(
       data = letters_dat[letters_dat$Group != "" & !is.na(letters_dat$Group), , drop = FALSE],
-      aes(x = Label, y = Value + label_gap, label = Group),
+      aes(x = Label, y = Mean + SE + label_gap, label = Group),
       fontface = "bold", vjust = 0, size = 4, inherit.aes = FALSE
     ) +
-    scale_fill_hue(c = 85, l = 62) +
+    scale_fill_manual(values = rep("#3498DB", nlevels(bar_dat$Label))) +
     labs(
-      title = "Distribution of Phenotypic Values",
+      title = "Mean comparison",
       subtitle = paste(
         gsub("_", " ", results$mean_comparison_method %||% "Mean comparison"),
         "for", trait
       ),
       x = "Entry",
-      y = trait
+      y = paste(trait, "raw mean ± SE")
     ) +
     theme_bw(base_size = 12) +
     theme(
@@ -1732,7 +1921,7 @@ plot_lpsi_mean_comparison <- function(results, trait) {
       panel.grid.major.x = element_blank(),
       legend.position = "none"
     ) +
-    expand_limits(y = max(plot_dat$Value, na.rm = TRUE) + 2.5 * label_gap)
+    expand_limits(y = max(bar_dat$Mean + bar_dat$SE, na.rm = TRUE) + 2.5 * label_gap)
 }
 
 
@@ -2792,12 +2981,10 @@ ui <- page_navbar(
   title = tags$span(
     class = "app-brand",
     tags$span(
-      class = "brand-mark",
-      tags$span(class = "brand-bar bar-one"),
-      tags$span(class = "brand-bar bar-two"),
-      tags$span(class = "brand-bar bar-three")
+      class = "brand-logo-window",
+      tags$img(src = "Logo.png", alt = "", class = "brand-logo")
     ),
-    tags$span("Selection Analysis Pipeline")
+    tags$span("PhenoSelect Analysis")
   ),
   navbar_options = navbar_options(
     bg = "#FFFFFF",
@@ -2810,7 +2997,7 @@ ui <- page_navbar(
     fg = "#263123",
     primary = "#315F28"
   ),
-  header = tags$style(HTML("
+  header = tagList(tags$head(tags$title("PhenoSelect Analysis")), tags$style(HTML("
     body, .bslib-page-navbar {
       background: #F8F6F0 !important;
       color: #263123;
@@ -2858,26 +3045,22 @@ ui <- page_navbar(
       gap: 10px;
       white-space: nowrap;
     }
-    .brand-mark {
-      align-items: flex-end;
-      background: #315F28;
-      border-radius: 6px;
-      display: inline-flex;
-      gap: 2px;
-      height: 25px;
-      justify-content: center;
-      padding: 6px;
-      width: 25px;
-    }
-    .brand-bar {
-      border: 1px solid #FFFFFF;
-      border-radius: 1px;
+    .brand-logo-window {
       display: inline-block;
-      width: 3px;
+      flex: 0 0 36px;
+      height: 40px;
+      overflow: hidden;
+      width: 36px;
     }
-    .bar-one { height: 6px; }
-    .bar-two { height: 10px; }
-    .bar-three { height: 14px; }
+    .brand-logo {
+      display: block;
+      height: 47px;
+      left: -1px;
+      max-width: none;
+      position: relative;
+      top: -4px;
+      width: auto;
+    }
     .navbar-brand {
       margin-right: 28px;
       padding: 0;
@@ -3509,7 +3692,7 @@ ui <- page_navbar(
         padding-right: 0;
       }
     }
-  ")),
+  "))),
   # Upload data navbar
   nav_panel(
     title = "Data",
@@ -3584,6 +3767,7 @@ ui <- page_navbar(
                   "Pre-Breeding" = "BREEDING",
                   "Genetic Diversity Analysis" = "DIVERSITY",
                   "Mating" = "MATING",
+                  "Multi-factor" = "MULTIFACTOR",
                   "Single-Location Trial" = "LPSI",
                   "Multi-Environment Trial" = "MET"
                 ),
@@ -3616,6 +3800,10 @@ ui <- page_navbar(
                 class = "control-section",
                 uiOutput("breeding_column_inputs")
               )
+            ),
+            conditionalPanel(
+              condition = "input.analysis_method == 'MULTIFACTOR'",
+              tags$div(class = "control-section", uiOutput("multifactor_controls"))
             ),
             conditionalPanel(
               condition = "input.analysis_method == 'LPSI'",
@@ -3787,13 +3975,28 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'breeding_response'", DTOutput("breeding_response_table")),
         conditionalPanel("input.result_view == 'breeding_realized'", DTOutput("breeding_realized_table")),
         conditionalPanel("input.result_view == 'breeding_generation'", DTOutput("breeding_generation_table")),
+        conditionalPanel("input.result_view == 'mf_summary'", tagList(DTOutput("mf_settings_table"), DTOutput("mf_summary_table"), DTOutput("mf_notes_table"))),
+        conditionalPanel("input.result_view == 'mf_anova'", DTOutput("mf_anova_table")),
+        conditionalPanel("input.result_view == 'mf_means'", tagList(
+          tags$div(class = "small-note", style = "margin: 0 0 12px 0;",
+                   "Values are raw mean ± raw SD. Compact letters come from adjusted model comparisons and appear only when the corresponding ANOVA effect is significant (p < 0.05). CV uses the residual error. Heritability is shown as not estimated until a genotype variance model is specified."),
+          DTOutput("mf_means_table"), DTOutput("mf_pairwise_table"))),
+        conditionalPanel("input.result_view == 'mf_superiority'", DTOutput("mf_superiority_table")),
         conditionalPanel("input.result_view == 'lpsi_trait'", DTOutput("trait_table")),
         conditionalPanel("input.result_view == 'lpsi_index_summary'", DTOutput("lpsi_index_summary_table")),
         conditionalPanel("input.result_view == 'lpsi_correlation'", DTOutput("lpsi_correlation_table")),
         conditionalPanel("input.result_view == 'lpsi_ranking'", DTOutput("index_table")),
         conditionalPanel("input.result_view == 'lpsi_superiority'", DTOutput("superiority_table")),
         conditionalPanel("input.result_view == 'lpsi_anova'", DTOutput("anova_full_table")),
-        conditionalPanel("input.result_view == 'lpsi_lsd'", DTOutput("lsd_wide_table")),
+        conditionalPanel(
+          "input.result_view == 'lpsi_lsd'",
+          tags$div(
+            class = "small-note",
+            style = "margin: 0 0 12px 0;",
+            "Trait cells show arithmetic mean \u00b1 raw SD or SE, calculated within each variety. Letters and critical differences come from the selected model comparison. For nonparametric traits, the LSD/HSD row shows the Kruskal-Wallis p-value and Dunn-Holm outcome; it is not a numerical critical difference. Shared letters mean a difference was not detected at alpha = 0.05."
+          ),
+          DTOutput("lsd_wide_table")
+        ),
         conditionalPanel("input.result_view == 'lpsi_heritability'", DTOutput("heritability_gain_table")),
         conditionalPanel("input.result_view == 'lpsi_direct'", DTOutput("lpsi_direct_table")),
         conditionalPanel("input.result_view == 'lpsi_compare'", DTOutput("lpsi_compare_table")),
@@ -3957,9 +4160,71 @@ server <- function(input, output, session) {
     MATING = NULL,
     BREEDING = NULL,
     DIVERSITY = NULL,
+    MULTIFACTOR = NULL,
     LPSI = NULL,
     MET = NULL
   )
+  multifactor_saved_result <- reactive({
+    result <- if (identical(analysis_used(), "MULTIFACTOR")) analysis_results() else saved_results$MULTIFACTOR
+    validate(need(!is.null(result), "Run Multi-factor analysis to view this result."))
+    result
+  })
+  multifactor_result <- reactive({
+    mf_refresh_result(multifactor_saved_result(),
+                      method = input$mf_result_method %||% "tukey",
+                      direction = input$mf_result_direction %||% "Higher better",
+                      effect = input$mf_result_effect %||% "All effects")
+  })
+  output$multifactor_controls <- renderUI({
+    data <- tryCatch(uploaded_data(), error = function(e) NULL)
+    if (is.null(data)) return(tags$div("Upload trial data to configure factors."))
+    columns <- names(data)
+    choose <- function(value, choices, fallback = 1L) {
+      if (!is.null(value) && value %in% choices) value else if (length(choices) >= fallback) choices[fallback] else ""
+    }
+    traits <- columns[vapply(data, function(x) {
+      values <- si_to_number(x)
+      sum(is.finite(values)) > 0
+    }, logical(1))]
+    count <- as.integer(input$mf_factor_count %||% 2)
+    design <- input$mf_design %||% "factorial"
+    randomization <- input$mf_randomization %||% "RCBD"
+    factor_a <- choose(input$mf_factor_a, columns, if (id_col %in% columns) match(id_col, columns) else 1L)
+    factor_b_choices <- setdiff(columns, factor_a)
+    factor_b_default <- setdiff(factor_b_choices, rep_col)
+    factor_b <- choose(input$mf_factor_b, factor_b_choices,
+                       if (length(factor_b_default)) match(factor_b_default[1], factor_b_choices) else 1L)
+    factor_c_choices <- setdiff(columns, c(factor_a, factor_b))
+    factor_c_default <- setdiff(factor_c_choices, rep_col)
+    factor_c <- choose(input$mf_factor_c, factor_c_choices,
+                       if (length(factor_c_default)) match(factor_c_default[1], factor_c_choices) else 1L)
+    model_choices <- if (design == "split_plot") c("LMM" = "LMM") else if (randomization == "CRD") c("ANOVA" = "ANOVA") else c("ANOVA" = "ANOVA", "LMM" = "LMM")
+    tagList(
+      selectInput("mf_factor_count", "Number of factors", c("Two" = 2, "Three" = 3), selected = count),
+      selectInput("mf_design", "Treatment design", c("Factorial" = "factorial", "Split plot" = "split_plot"), selected = design),
+      selectInput("mf_factor_a", if (design == "split_plot") "Factor A / main plot" else "Factor A", columns, selected = factor_a),
+      selectInput("mf_factor_b", if (design == "split_plot") "Factor B / subplot" else "Factor B", factor_b_choices, selected = factor_b),
+      if (count == 3) selectInput("mf_factor_c", if (design == "split_plot") "Factor C / sub-subplot" else "Factor C", factor_c_choices, selected = factor_c),
+      selectInput("mf_response", "Response trait", traits,
+                  selected = choose(input$mf_response, traits,
+                                    if (length(setdiff(traits, c(factor_a, factor_b, if (count == 3) factor_c, rep_col))))
+                                      match(setdiff(traits, c(factor_a, factor_b, if (count == 3) factor_c, rep_col))[1], traits) else 1L)),
+      selectInput("mf_randomization", "Base randomization", c("CRD" = "CRD", "RCBD" = "RCBD"), selected = randomization),
+      selectInput("mf_model", "Model", model_choices, selected = choose(input$mf_model, model_choices, 1)),
+      if (randomization == "RCBD" || design == "split_plot") selectInput("mf_rep", "Block / whole-plot replicate", columns, selected = choose(input$mf_rep, columns, if (rep_col %in% columns) match(rep_col, columns) else 1L)),
+      uiOutput("mf_check_control")
+    )
+  })
+  output$mf_check_control <- renderUI({
+    data <- tryCatch(uploaded_data(), error = function(e) NULL)
+    if (is.null(data)) return(NULL)
+    factor_col <- input$mf_factor_a
+    if (is.null(factor_col) || !factor_col %in% names(data)) return(NULL)
+    values <- unique(trimws(as.character(data[[factor_col]])))
+    values <- values[!is.na(values) & nzchar(values)]
+    prior <- intersect(input$mf_checks %||% character(0), values)
+    selectInput("mf_checks", "Check level(s)", values, selected = if (length(prior)) prior else head(values, 1), multiple = TRUE)
+  })
   observeEvent(input$excel_file, {
     si_reset_analysis_state(
       analysis_results,
@@ -3992,10 +4257,17 @@ server <- function(input, output, session) {
     analysis_results()
   })
   lpsi_mean_comparison_method_r <- reactiveVal("lsd")
+  lpsi_mean_spread_r <- reactiveVal("se")
   observeEvent(input$lpsi_mean_comparison_method, {
     method <- input$lpsi_mean_comparison_method
     if (!is.null(method) && method %in% c("lsd", "tukey")) {
       lpsi_mean_comparison_method_r(method)
+    }
+  }, ignoreNULL = TRUE)
+  observeEvent(input$lpsi_mean_spread, {
+    spread <- input$lpsi_mean_spread
+    if (!is.null(spread) && spread %in% c("se", "sd")) {
+      lpsi_mean_spread_r(spread)
     }
   }, ignoreNULL = TRUE)
   lpsi_settings <- reactive({
@@ -4235,6 +4507,14 @@ server <- function(input, output, session) {
       validate(need(FALSE, "No chart view is available for this module yet."))
     }
     view <- input$plot_view
+    if (chart_module == "multifactor") {
+      if (!view %in% c("mf_superiority_plot", "mf_mean_plot", "mf_interaction_plot")) view <- "mf_superiority_plot"
+      result <- multifactor_result()
+      plot <- switch(view, mf_superiority_plot = mf_plot_superiority(result),
+                     mf_mean_plot = mf_plot_mean_comparison(result),
+                     mf_interaction_plot = mf_plot_interaction(result))
+      return(list(plot = plot, name = paste0("Multi-factor_", view, "_", gsub("[^A-Za-z0-9_-]+", "_", result$response))))
+    }
     if (chart_module == "selection_index") {
       lpsi_mode <- input$chart_lpsi_mode %||% "single"
       lpsi_views <- if (identical(lpsi_mode, "multi")) {
@@ -4458,6 +4738,12 @@ server <- function(input, output, session) {
       breeding_response = list(list(Response_per_year = breeding_result()$response_per_year), "Pre-Breeding_response_per_year"),
       breeding_realized = list(list(Realized_gain = breeding_result()$realized_gain), "Pre-Breeding_realized_gain"),
       breeding_generation = list(list(Generation_summary = breeding_result()$generation_stats), "Pre-Breeding_generation_summary"),
+      mf_summary = list(list(Settings = multifactor_result()$settings, Summary = multifactor_result()$summary,
+                             Notes = multifactor_result()$notes), "Multi-factor_summary"),
+      mf_anova = list(list(ANOVA = multifactor_result()$anova), "Multi-factor_ANOVA"),
+      mf_means = list(list(Mean_comparison = mf_selected_effect_table(multifactor_result(), "effect_comparison"),
+                           Pairwise = mf_selected_effect_table(multifactor_result(), "effect_pairwise")), "Multi-factor_mean_comparison"),
+      mf_superiority = list(list(Superiority = multifactor_result()$superiority), "Multi-factor_superiority"),
       lpsi_trait = list(list(Trait_summary = lpsi_result()$trait_info), "Single-Location_Trial_trait_summary"),
       lpsi_index_summary = list(list(Index_summary = lpsi_result()$weight_table), "Single-Location_Trial_index_summary"),
       lpsi_correlation = list(
@@ -4468,8 +4754,11 @@ server <- function(input, output, session) {
       lpsi_lsd = {
         comparison <- lpsi_all_traits_mean_comparison()
         list(
-          list(Mean_comparison = comparison),
-          paste0("Single-Location_Trial_mean_comparison_", lpsi_mean_comparison_method_r())
+          list(Mean_comparison = comparison$combined),
+          paste0(
+            "Single-Location_Trial_mean_comparison_",
+            lpsi_mean_comparison_method_r(), "_", lpsi_mean_spread_r()
+          )
         )
       },
       lpsi_superiority = list(list(Superiority = lpsi_result()$superiority_index), "Single-Location_Trial_superiority"),
@@ -4556,6 +4845,11 @@ server <- function(input, output, session) {
   }
   output$chart_preview_ui <- renderUI({
     chart_module <- input$chart_module %||% "selection_index"
+    if (chart_module == "multifactor") {
+      view <- input$plot_view %||% "mf_superiority_plot"
+      if (!view %in% c("mf_superiority_plot", "mf_mean_plot", "mf_interaction_plot")) view <- "mf_superiority_plot"
+      return(plotOutput(view, height = "650px"))
+    }
     if (chart_module == "mating") {
       return(tags$div(
         class = "chart-download-panel",
@@ -4718,6 +5012,10 @@ server <- function(input, output, session) {
     
     title <- switch(
       view,
+      mf_summary = "Multi-factor summary",
+      mf_anova = "Multi-factor ANOVA",
+      mf_means = "Multi-factor mean comparison",
+      mf_superiority = "Multi-factor superiority index",
       mating_anova = "ANOVA",
       mating_gca = "GCA parent effects",
       mating_sca = "SCA cross effects",
@@ -4783,10 +5081,18 @@ server <- function(input, output, session) {
     if (identical(module, "selection_index") && identical(input$result_lpsi_mode %||% "single", "single")) {
       view <- input$result_view %||% ""
       if (identical(view, "lpsi_lsd")) {
-        return(selectInput(
-          "lpsi_mean_comparison_method", NULL,
-          choices = c("LSD" = "lsd", "Tukey HSD" = "tukey"),
-          selected = lpsi_mean_comparison_method_r()
+        return(tags$div(
+          style = "display: flex; align-items: center; gap: 8px;",
+          selectInput(
+            "lpsi_mean_comparison_method", NULL,
+            choices = c("LSD" = "lsd", "Tukey HSD" = "tukey"),
+            selected = lpsi_mean_comparison_method_r()
+          ),
+          selectInput(
+            "lpsi_mean_spread", NULL,
+            choices = c("Raw SE" = "se", "Raw SD" = "sd"),
+            selected = lpsi_mean_spread_r()
+          )
         ))
       }
       if (view %in% c("lpsi_trait", "lpsi_anova")) return(NULL)
@@ -4863,6 +5169,11 @@ server <- function(input, output, session) {
         "download_diversity"
       ),
       export_row(
+        if (is.null(saved_results$MULTIFACTOR)) "pending" else "ready",
+        "Multi-factor_results.xlsx",
+        "download_multifactor"
+      ),
+      export_row(
         if (is.null(saved_results$LPSI)) "pending" else "ready",
         "Single-Location_Trial_results.xlsx",
         "download_lpsi"
@@ -4919,6 +5230,7 @@ server <- function(input, output, session) {
       "Pre-Breeding" = "breeding",
       "Genetic Diversity Analysis" = "diversity",
       "Mating" = "mating",
+      "Multi-factor" = "multifactor",
       "Single-Location Trial" = "selection_index",
       "Multi-Environment Trial" = "met"
     )
@@ -4941,6 +5253,7 @@ server <- function(input, output, session) {
         mating = uiOutput("result_mating_detail"),
         breeding = uiOutput("result_breeding_detail"),
         diversity = uiOutput("result_diversity_detail"),
+        multifactor = uiOutput("result_multifactor_detail"),
         selection_index = tagList(
           tags$div(
             class = "side-subpanel result-analysis-section",
@@ -4971,6 +5284,7 @@ server <- function(input, output, session) {
       "Pre-Breeding" = "breeding",
       "Genetic Diversity Analysis" = "diversity",
       "Mating" = "mating",
+      "Multi-factor" = "multifactor",
       "Single-Location Trial" = "selection_index",
       "Multi-Environment Trial" = "met"
     )
@@ -4994,11 +5308,47 @@ server <- function(input, output, session) {
         module,
         mating = uiOutput("chart_mating_detail"),
         breeding = uiOutput("chart_breeding_detail"),
+        multifactor = uiOutput("chart_multifactor_detail"),
         selection_index = uiOutput("chart_lpsi_detail"),
         met = uiOutput("chart_met_detail"),
         diversity = uiOutput("chart_diversity_detail")
       )
     )
+  })
+  output$result_multifactor_detail <- renderUI({
+    choices <- c("Summary" = "mf_summary", "ANOVA" = "mf_anova",
+                 "Superiority index" = "mf_superiority", "Mean comparison" = "mf_means")
+    current <- input$result_view %||% ""
+    result <- if (identical(analysis_used(), "MULTIFACTOR")) analysis_results() else saved_results$MULTIFACTOR
+    factors <- if (!is.null(result)) result$factors else c("A", "B")
+    names <- if (!is.null(result)) result$factor_names else c(input$mf_factor_a %||% "Factor A", input$mf_factor_b %||% "Factor B")
+    effect_names <- mf_effect_terms(factors)
+    effect_labels <- vapply(effect_names, function(effect) {
+      paste(names[match(strsplit(effect, ":", fixed = TRUE)[[1]], factors)], collapse = " × ")
+    }, character(1))
+    effect_choices <- c("All effects" = "All effects", stats::setNames(effect_names,
+                              paste(effect_names, effect_labels, sep = ": ")))
+    tagList(
+      sidebar_detail_panel("Multi-factor results", choices = choices, input_id = "result_view",
+                           selected = if (current %in% choices) current else "mf_summary"),
+      tags$div(class = "side-subpanel result-analysis-section",
+               selectInput("mf_result_effect", "Compare levels of", effect_choices,
+                           selected = if ((input$mf_result_effect %||% "") %in% effect_choices) input$mf_result_effect else "All effects"),
+               selectInput("mf_result_direction", "Better performance",
+                           c("Higher better", "Lower better"),
+                           selected = input$mf_result_direction %||% "Higher better"),
+               selectInput("mf_result_method", "Mean comparison",
+                           c("Tukey HSD" = "tukey", "LSD" = "lsd"),
+                           selected = input$mf_result_method %||% "tukey"))
+    )
+  })
+  output$chart_multifactor_detail <- renderUI({
+    choices <- c("Superiority" = "mf_superiority_plot",
+                 "Mean comparison" = "mf_mean_plot",
+                 "Factor interaction" = "mf_interaction_plot")
+    current <- input$plot_view %||% ""
+    sidebar_detail_panel("Multi-factor charts", choices = choices, input_id = "plot_view",
+                         selected = if (current %in% choices) current else "mf_superiority_plot")
   })
   output$result_mating_detail <- renderUI({
     choices <- c(
@@ -5454,7 +5804,8 @@ server <- function(input, output, session) {
         inputId = "met_model_type",
         label = "Model",
         choices = c(
-          "LMM" = "LMM",
+          "Standard LMM - lme4" = "LMM",
+          "Breeding LMM - sommer (compound symmetry)" = "SOMMER",
           "ANOVA (RCBD)" = "ANOVA_RCBD"
         ),
         selected = input$met_model_type %||% "LMM"
@@ -6129,6 +6480,32 @@ server <- function(input, output, session) {
       } else {
         analysis_message("Pre-Breeding Analysis failed. Please check the error message.")
       }
+    } else if (input$analysis_method == "MULTIFACTOR") {
+      factor_cols <- c(input$mf_factor_a, input$mf_factor_b,
+                       if (identical(input$mf_factor_count, "3")) input$mf_factor_c)
+      analysis_message("Running Multi-factor analysis...")
+      res <- tryCatch(run_multifactor_pipeline(
+        df = uploaded_data(), response_col = input$mf_response,
+        factor_cols = factor_cols, design = input$mf_design,
+        randomization = input$mf_randomization, model_type = input$mf_model,
+        replication_col = input$mf_rep, comparison_factor = "A",
+        checks = input$mf_checks,
+        direction = input$mf_result_direction %||% "Higher better",
+        comparison_method = input$mf_result_method %||% "tukey",
+        metadata_col = id_col,
+        metadata_labels = c(weight_row_labels, direction_row_labels)
+      ), error = function(e) {
+        showNotification(paste("Multi-factor analysis failed:", e$message), type = "error", duration = NULL)
+        NULL
+      })
+      analysis_results(res)
+      if (!is.null(res)) {
+        saved_results$MULTIFACTOR <- res
+        analysis_message("Multi-factor analysis complete. Check Results and Charts.")
+        showNotification("Multi-factor analysis complete.", type = "message")
+      } else {
+        analysis_message("Multi-factor analysis failed. Check the error message.")
+      }
     } else if (input$analysis_method == "LPSI") {
       req(input$lpsi_trial_model)
       analysis_message("Running Single-Location Trial analysis...")
@@ -6284,6 +6661,16 @@ server <- function(input, output, session) {
       cat("Selected analysis:", analysis_used(), "\n")
     }
   })
+  output$mf_settings_table <- renderDT({ datatable(multifactor_result()$settings, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
+  output$mf_summary_table <- renderDT({ datatable(multifactor_result()$summary, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$mf_notes_table <- renderDT({ datatable(multifactor_result()$notes, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
+  output$mf_anova_table <- renderDT({ datatable(multifactor_result()$anova, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$mf_means_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_comparison"), options = list(pageLength = 50, ordering = FALSE, scrollX = TRUE), rownames = FALSE) })
+  output$mf_pairwise_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_pairwise"), options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$mf_superiority_table <- renderDT({ datatable(multifactor_result()$superiority, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$mf_superiority_plot <- renderPlot({ print(mf_plot_superiority(multifactor_result())) })
+  output$mf_mean_plot <- renderPlot({ print(mf_plot_mean_comparison(multifactor_result())) })
+  output$mf_interaction_plot <- renderPlot({ print(mf_plot_interaction(multifactor_result())) })
   output$mating_anova_table <- renderDT({
     datatable(
       mating_result_for_table(),
@@ -6396,70 +6783,11 @@ server <- function(input, output, session) {
     datatable(correlation, options = list(pageLength = 50, scrollX = TRUE))
   })
   lpsi_all_traits_mean_comparison <- reactive({
-    result <- lpsi_result()
-    model_type <- as.character(result$decision_settings$Model[1] %||% "RCBD")
-    method <- lpsi_mean_comparison_method_r()
-    if (identical(method, "lsd")) {
-      return(as.data.frame(result$lsd_wide %||% data.frame()))
-    }
-
-    raw <- as.data.frame(result$cleaned_data %||% data.frame())
-    trait_info <- as.data.frame(result$trait_info %||% data.frame())
-    anova_rows <- as.data.frame(result$anova_full %||% data.frame())
-    id_lookup <- unique(raw[, c("ID", "Original_ID"), drop = FALSE])
-    id_lookup$ID <- as.character(id_lookup$ID)
-    tukey_long <- map_dfr(as.character(trait_info$Trait), function(trait) {
-      model_data <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
-      trait_test <- anova_rows[
-        as.character(anova_rows$Trait) == trait & trimws(as.character(anova_rows$Source)) == "ID",
-        , drop = FALSE
-      ]
-      is_anova <- nrow(trait_test) > 0 && identical(as.character(trait_test$Test[1]), "ANOVA")
-      out <- tryCatch({
-        model <- fit_single_location_model(model_data, trait, model_type)
-        em <- emmeans(model, ~ ID)
-        if (is_anova && df.residual(model) > 0) {
-          higher_better <- as.character(trait_info$Direction[trait_info$Trait == trait][1]) == "Higher better"
-          comparison <- multcomp::cld(
-            em,
-            Letters = c(letters, LETTERS),
-            adjust = "tukey",
-            alpha = lsd_significance_alpha,
-            sort = TRUE,
-            reversed = higher_better
-          ) %>% as.data.frame()
-          comparison$Group <- trimws(as.character(comparison$.group))
-          omnibus_p <- suppressWarnings(as.numeric(trait_test$p_value[1]))
-          if (!is.finite(omnibus_p) || omnibus_p >= lsd_significance_alpha) {
-            comparison$Group <- ""
-          }
-        } else {
-          comparison <- as.data.frame(em)
-          comparison$Group <- ""
-        }
-        comparison %>%
-          mutate(
-            ID = as.character(ID), Trait = trait,
-            Mean_Group = ifelse(
-              trimws(Group) == "",
-              as.character(round(emmean, 3)),
-              paste(round(emmean, 3), Group)
-            )
-          ) %>%
-          left_join(id_lookup, by = "ID") %>%
-          dplyr::select(ID, Original_ID, Trait, Mean_Group)
-      }, error = function(e) {
-        data.frame(
-          ID = character(0), Original_ID = character(0), Trait = character(0),
-          Mean_Group = character(0)
-        )
-      })
-      out
-    })
-    validate(need(nrow(tukey_long) > 0, "Tukey HSD table could not be generated."))
-    tukey_long %>%
-      pivot_wider(names_from = Trait, values_from = Mean_Group) %>%
-      arrange(suppressWarnings(as.numeric(as.character(ID))))
+    si_lpsi_mean_comparison_view(
+      lpsi_result(),
+      lpsi_mean_comparison_method_r(),
+      lpsi_mean_spread_r()
+    )
   })
   lpsi_selected_mean_comparison <- reactive({
     result <- lpsi_result()
@@ -6725,9 +7053,20 @@ server <- function(input, output, session) {
   })
   output$lsd_wide_table <- renderDT({
     comparison <- lpsi_all_traits_mean_comparison()
-    validate(need(nrow(comparison) > 0, "Mean comparison table was not generated."))
+    validate(need(nrow(comparison$means) > 0, "Mean comparison table was not generated."))
+    column_names <- names(comparison$means)
+    footer <- tags$tfoot(lapply(seq_len(nrow(comparison$summary)), function(row_index) {
+      tags$tr(lapply(comparison$summary[row_index, , drop = TRUE], tags$th))
+    }))
+    container <- tags$table(
+      class = "display",
+      tags$thead(tags$tr(lapply(column_names, tags$th))),
+      footer
+    )
     datatable(
-      comparison,
+      comparison$means,
+      container = container,
+      rownames = FALSE,
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
@@ -7119,6 +7458,13 @@ server <- function(input, output, session) {
       write_analysis_workbook("BREEDING", saved_results$BREEDING, file)
     }
   )
+  output$download_multifactor <- downloadHandler(
+    filename = function() paste0("Multi-factor_results_", Sys.Date(), ".xlsx"),
+    content = function(file) {
+      req(saved_results$MULTIFACTOR)
+      write_analysis_workbook("MULTIFACTOR", multifactor_result(), file)
+    }
+  )
   output$download_lpsi <- downloadHandler(
     filename = function() paste0("Single-Location_Trial_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
@@ -7128,6 +7474,8 @@ server <- function(input, output, session) {
       } else {
         saved_results$LPSI
       }
+      result$mean_comparison_method <- lpsi_mean_comparison_method_r()
+      result$mean_comparison_spread <- lpsi_mean_spread_r()
       write_analysis_workbook("LPSI", result, file)
     }
   )
@@ -7166,12 +7514,13 @@ server <- function(input, output, session) {
     }
   )
   output$download_all <- downloadHandler(
-    filename = function() paste0("Selection_analysis_results_", Sys.Date(), ".zip"),
+    filename = function() paste0("PhenoSelect_analysis_results_", Sys.Date(), ".zip"),
     content = function(file) {
       available <- c(
         MATING = !is.null(saved_results$MATING),
         BREEDING = !is.null(saved_results$BREEDING),
         DIVERSITY = !is.null(saved_results$DIVERSITY),
+        MULTIFACTOR = !is.null(saved_results$MULTIFACTOR),
         LPSI = !is.null(saved_results$LPSI),
         MET = !is.null(saved_results$MET)
       )
@@ -7186,14 +7535,20 @@ server <- function(input, output, session) {
         MATING = "Mating_analysis_results.xlsx",
         BREEDING = "Pre-Breeding_analysis_results.xlsx",
         DIVERSITY = "Genetic_diversity_results.xlsx",
+        MULTIFACTOR = "Multi-factor_results.xlsx",
         LPSI = "Single-Location_Trial_results.xlsx",
         MET = "MET_across_locations_results.xlsx"
       )
       for (analysis_type in names(available)[available]) {
         path <- file.path(temp_dir, export_names[[analysis_type]])
         result <- saved_results[[analysis_type]]
+        if (analysis_type == "MULTIFACTOR") result <- multifactor_result()
         if (analysis_type == "LPSI" && identical(analysis_used(), "LPSI")) {
           result <- lpsi_result()
+        }
+        if (analysis_type == "LPSI") {
+          result$mean_comparison_method <- lpsi_mean_comparison_method_r()
+          result$mean_comparison_spread <- lpsi_mean_spread_r()
         }
         if (analysis_type == "MET" && identical(analysis_used(), "MET")) {
           result <- analysis_results()

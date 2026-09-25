@@ -2466,6 +2466,29 @@ MET_W_ASV <- 0.25
 MET_MIN_ENVS_FOR_BIPLOT <- 3
 met_rep_col_candidates <- c("Rep", "REP", "Replication", "Replicate", "Rep_No", "RepNo", "Replication_No")
 met_block_col_candidates <- c("Block", "BLOCK", "Blk", "Block_No", "BlockNo", "Incomplete_Block")
+
+normalize_met_model_type <- function(model_type = "LMM") {
+  model_type <- toupper(trimws(as.character(model_type %||% "LMM")))[1]
+  if (model_type %in% c("ANOVA", "RCBD", "ANOVA (RCBD)", "ANOVA_RCBD")) {
+    return("ANOVA_RCBD")
+  }
+  if (model_type %in% c("SOMMER", "SOMMER_CS", "LMM_SOMMER", "LMM (SOMMER)")) {
+    return("SOMMER")
+  }
+  if (model_type %in% c("LMM", "LME4", "LMM_LME4", "LMM (LME4)")) {
+    return("LMM")
+  }
+  stop("MET model must be LMM (lme4), LMM (sommer), or ANOVA (RCBD).")
+}
+
+met_model_label <- function(model_type = "LMM") {
+  switch(
+    normalize_met_model_type(model_type),
+    LMM = "LMM (lme4)",
+    SOMMER = "LMM (sommer, compound symmetry)",
+    ANOVA_RCBD = "ANOVA (RCBD)"
+  )
+}
 prepare_met_input_frame <- function(df_raw) {
   df <- as.data.frame(df_raw)
   names(df) <- make.unique(trimws(names(df)), sep = "_")
@@ -2760,6 +2783,16 @@ build_met_qc_table <- function(result) {
     )
   }
   if (nrow(model_summary) > 0) {
+    if ("Converged" %in% names(model_summary)) {
+      converged <- isTRUE(as.logical(model_summary$Converged[1]))
+      add_qc(
+        "Model",
+        "Optimizer convergence",
+        if (converged) "Converged" else "Not converged",
+        if (converged) "OK" else "High risk",
+        if (converged) "" else "Do not use rankings until the model specification and data are reviewed."
+      )
+    }
     add_qc(
       "Controls",
       "Controls used",
@@ -3225,6 +3258,464 @@ plot_met_mgidi_ranking <- function(methods) {
       plot.title = element_text(face = "bold")
     )
 }
+
+met_sommer_component <- function(model, component_levels, ci_indices) {
+  component_levels <- as.character(component_levels)
+  values <- as.numeric(model$u[ci_indices - length(model$b), 1])
+  pev <- suppressWarnings(as.numeric(diag(model$Ci)[ci_indices]))
+  if (length(values) != length(component_levels) || length(pev) != length(component_levels)) {
+    stop("sommer returned an unexpected random-effect layout.")
+  }
+  data.frame(
+    Level = component_levels,
+    Effect = values,
+    PEV = pev,
+    Conditional_SE = sqrt(pmax(pev, 0)),
+    Ci_Index = ci_indices,
+    stringsAsFactors = FALSE
+  )
+}
+
+met_sommer_prediction_se <- function(model, ci_indices, extra_variance = 0) {
+  ci_indices <- unique(suppressWarnings(as.integer(ci_indices)))
+  ci_indices <- ci_indices[is.finite(ci_indices) & ci_indices >= 1 & ci_indices <= nrow(model$Ci)]
+  extra_variance <- suppressWarnings(as.numeric(extra_variance))[1]
+  if (!is.finite(extra_variance) || extra_variance < 0) extra_variance <- 0
+  if (length(ci_indices) == 0) return(if (extra_variance > 0) sqrt(extra_variance) else NA_real_)
+  prediction_variance <- tryCatch(
+    sum(as.matrix(model$Ci[ci_indices, ci_indices, drop = FALSE])) + extra_variance,
+    error = function(e) NA_real_
+  )
+  if (!is.finite(prediction_variance)) return(NA_real_)
+  sqrt(max(prediction_variance, 0))
+}
+
+run_met_sommer_cs <- function(
+    dat_clean,
+    raw_genotype_summary,
+    trait_used,
+    trait_direction,
+    target_value,
+    trait_weight,
+    has_replication,
+    has_block,
+    replication_col,
+    block_col,
+    min_envs_for_biplot,
+    controls_used,
+    low_conf_genos,
+    notes,
+    n_r,
+    n_envs_total) {
+  if (!requireNamespace("sommer", quietly = TRUE)) {
+    stop(
+      "The sommer MET model was selected, but package 'sommer' is not installed. ",
+      "Install it with install.packages('sommer') and restart the app."
+    )
+  }
+  if (utils::packageVersion("sommer") < "4.4.1") {
+    stop("The sommer MET backend requires sommer 4.4.1 or newer.")
+  }
+
+  dat_sommer <- droplevels(as.data.frame(dat_clean))
+  dat_sommer$Environment <- factor(dat_sommer$Environment)
+  dat_sommer$Genotype <- factor(dat_sommer$Genotype)
+  dat_sommer$Rep <- factor(dat_sommer$Rep)
+  dat_sommer$Block <- factor(dat_sommer$Block)
+  if (has_replication) {
+    dat_sommer$EnvRep <- interaction(
+      dat_sommer$Environment,
+      dat_sommer$Rep,
+      drop = TRUE,
+      sep = "__SI_MET__"
+    )
+  }
+  if (has_block) {
+    dat_sommer$DesignBlock <- if (has_replication) {
+      interaction(
+        dat_sommer$Environment,
+        dat_sommer$Rep,
+        dat_sommer$Block,
+        drop = TRUE,
+        sep = "__SI_MET__"
+      )
+    } else {
+      interaction(
+        dat_sommer$Environment,
+        dat_sommer$Block,
+        drop = TRUE,
+        sep = "__SI_MET__"
+      )
+    }
+  }
+  dat_sommer$GxE <- interaction(
+    dat_sommer$Genotype,
+    dat_sommer$Environment,
+    drop = TRUE,
+    sep = "__SI_MET__"
+  )
+
+  random_terms <- c("Environment")
+  if (has_replication) random_terms <- c(random_terms, "EnvRep")
+  if (has_block) random_terms <- c(random_terms, "DesignBlock")
+  random_terms <- c(random_terms, "Genotype", "GxE")
+  random_formula <- stats::as.formula(paste("~", paste(random_terms, collapse = " + ")))
+  full_formula_label <- paste0(
+    "Weight ~ 1; random = ~ ", paste(random_terms, collapse = " + "),
+    "; residual = ~ units"
+  )
+  # mmes() rewrites plain random terms to vsm(ism(...)) and evaluates the
+  # generated call in the caller, so keep these namespace-safe local bindings.
+  vsm <- sommer::vsm
+  ism <- sommer::ism
+
+  model <- tryCatch(
+    sommer::mmes(
+      fixed = Weight ~ 1,
+      random = random_formula,
+      rcov = ~ units,
+      data = dat_sommer,
+      nIters = 50,
+      tolParConvLL = 1e-05,
+      tolParConvNorm = 1e-05,
+      getPEV = TRUE,
+      dateWarning = FALSE,
+      verbose = FALSE
+    ),
+    error = function(e) {
+      stop("sommer MET model failed: ", e$message, call. = FALSE)
+    }
+  )
+  if (is.null(model$Ci) || is.null(model$u) || is.null(model$b)) {
+    stop("sommer did not return the coefficient covariance and prediction objects required by the MET pipeline.")
+  }
+
+  converged <- isTRUE(model$convergence)
+  if (!converged) {
+    notes <- c(notes, "sommer did not report convergence; estimates require review.")
+  }
+  component_levels <- lapply(random_terms, function(term) levels(dat_sommer[[term]]))
+  names(component_levels) <- random_terms
+  component_lengths <- vapply(component_levels, length, integer(1))
+  fixed_count <- length(model$b)
+  component_ends <- fixed_count + cumsum(component_lengths)
+  component_starts <- component_ends - component_lengths + 1L
+  component_indices <- Map(seq.int, component_starts, component_ends)
+  names(component_indices) <- random_terms
+  effects <- lapply(
+    random_terms,
+    function(term) met_sommer_component(
+      model,
+      component_levels = component_levels[[term]],
+      ci_indices = component_indices[[term]]
+    )
+  )
+  names(effects) <- random_terms
+
+  vc_raw <- as.data.frame(summary(model)$varcomp)
+  vc_raw$Component <- sub(":mu:mu$", "", rownames(vc_raw))
+  component_labels <- c(
+    Environment = "Environment (E)",
+    EnvRep = "Replication within environment",
+    DesignBlock = if (has_replication) "Block within replication/environment" else "Block within environment",
+    Genotype = "Genotype (G)",
+    GxE = "GxE Interaction",
+    units = "Residual"
+  )
+  vc_raw$Source <- unname(component_labels[vc_raw$Component])
+  vc_raw$Source[is.na(vc_raw$Source)] <- vc_raw$Component[is.na(vc_raw$Source)]
+  total_var <- sum(suppressWarnings(as.numeric(vc_raw$VarComp)), na.rm = TRUE)
+  variance_components <- vc_raw %>%
+    transmute(
+      Source,
+      Variance = round(as.numeric(VarComp), 5),
+      Variance_SE = round(as.numeric(VarCompSE), 5),
+      Z_ratio = round(as.numeric(Zratio), 4),
+      Percent = ifelse(total_var > 0, round(100 * as.numeric(VarComp) / total_var, 2), NA_real_),
+      P_value = NA_real_,
+      Sig = "",
+      Constraint = as.character(Constraint)
+    )
+  get_vc <- function(component) {
+    value <- suppressWarnings(as.numeric(vc_raw$VarComp[vc_raw$Component == component]))
+    if (length(value) == 0 || all(!is.finite(value))) 0 else value[which(is.finite(value))[1]]
+  }
+  g_var <- get_vc("Genotype")
+  gxe_var <- get_vc("GxE")
+  res_var <- get_vc("units")
+  H2 <- if (g_var + gxe_var / n_envs_total + res_var / (n_r * n_envs_total) > 0) {
+    g_var / (g_var + gxe_var / n_envs_total + res_var / (n_r * n_envs_total))
+  } else {
+    NA_real_
+  }
+  stability_ratio <- if (g_var + gxe_var > 0) g_var / (g_var + gxe_var) else NA_real_
+
+  grand_mean <- as.numeric(model$b[1, 1])
+  genotype_effects <- effects$Genotype %>%
+    transmute(
+      Genotype = Level,
+      Genotype_effect = Effect,
+      Genotype_PEV = PEV,
+      Genotype_Ci_Index = Ci_Index
+    )
+  genotype_effects$SE_G <- vapply(
+    genotype_effects$Genotype_Ci_Index,
+    function(index) met_sommer_prediction_se(model, c(1L, index)),
+    numeric(1)
+  )
+  genotype_effects$Reliability <- if (is.finite(g_var) && g_var > 0) {
+    pmin(pmax(1 - genotype_effects$Genotype_PEV / g_var, 0), 1)
+  } else {
+    NA_real_
+  }
+  BLUPs_main <- genotype_effects %>%
+    transmute(
+      Genotype,
+      BLUP_G = grand_mean + Genotype_effect,
+      SE_G,
+      Reliability = round(Reliability, 4),
+      CI_lower = BLUP_G - 1.96 * SE_G,
+      CI_upper = BLUP_G + 1.96 * SE_G
+    ) %>%
+    left_join(raw_genotype_summary, by = "Genotype") %>%
+    mutate(
+      .Favorable_BLUP_score = case_when(
+        identical(trait_direction, "Lower better") ~ -BLUP_G,
+        identical(trait_direction, "Target trait") & is.finite(target_value) ~ -abs(BLUP_G - target_value),
+        TRUE ~ BLUP_G
+      ),
+      Trait_direction = trait_direction
+    ) %>%
+    arrange(desc(.Favorable_BLUP_score)) %>%
+    mutate(Rank_BLUP = row_number()) %>%
+    dplyr::select(
+      Genotype, Raw_Mean, SE_Raw_Mean, BLUP_G, SE_G, Reliability,
+      CI_lower, CI_upper, Trait_direction, Rank_BLUP
+    )
+
+  environment_effects <- effects$Environment %>%
+    transmute(
+      Environment = Level,
+      BLUP_E = Effect,
+      Environment_Ci_Index = Ci_Index
+    )
+  gxe_lookup <- dat_sommer %>%
+    transmute(
+      GxE = as.character(GxE),
+      Genotype = as.character(Genotype),
+      Environment = as.character(Environment)
+    ) %>%
+    distinct()
+  gxe_effects <- effects$GxE %>%
+    transmute(
+      GxE = Level,
+      BLUP_GxE = Effect,
+      GxE_Ci_Index = Ci_Index
+    ) %>%
+    left_join(gxe_lookup, by = "GxE")
+  observed_cells <- dat_sommer %>%
+    group_by(Genotype, Environment) %>%
+    summarise(Observed_Mean = mean(Weight, na.rm = TRUE), N_Replications = n_distinct(Rep), .groups = "drop") %>%
+    mutate(Genotype = as.character(Genotype), Environment = as.character(Environment))
+  BLUPs_env_obs <- gxe_effects %>%
+    left_join(
+      genotype_effects %>% dplyr::select(Genotype, Genotype_effect, Genotype_Ci_Index),
+      by = "Genotype"
+    ) %>%
+    left_join(environment_effects, by = "Environment") %>%
+    left_join(observed_cells, by = c("Genotype", "Environment")) %>%
+    mutate(
+      BLUP_G = grand_mean + Genotype_effect,
+      BLUP_env = grand_mean + Genotype_effect + BLUP_E + BLUP_GxE,
+      Prediction_SE = as.numeric(mapply(
+        function(g_index, e_index, gxe_index) {
+          met_sommer_prediction_se(model, c(1L, g_index, e_index, gxe_index))
+        },
+        Genotype_Ci_Index,
+        Environment_Ci_Index,
+        GxE_Ci_Index
+      )),
+      Cell_Status = "TESTED",
+      Source = "Observed",
+      Evidence_Flag = "Observed-supported sommer model estimate",
+      Uncertainty_Method = "sommer PEV with covariance among fitted effects",
+      Reportable_Estimate = BLUP_env
+    )
+
+  all_combos <- expand.grid(
+    Genotype = levels(dat_sommer$Genotype),
+    Environment = levels(dat_sommer$Environment),
+    stringsAsFactors = FALSE
+  )
+  imputed_cells <- all_combos %>%
+    anti_join(observed_cells %>% dplyr::select(Genotype, Environment), by = c("Genotype", "Environment")) %>%
+    left_join(
+      genotype_effects %>% dplyr::select(Genotype, Genotype_effect, Genotype_Ci_Index),
+      by = "Genotype"
+    ) %>%
+    left_join(environment_effects, by = "Environment") %>%
+    mutate(
+      BLUP_G = grand_mean + Genotype_effect,
+      BLUP_GxE = 0,
+      BLUP_env = grand_mean + Genotype_effect + BLUP_E,
+      Prediction_SE = as.numeric(mapply(
+        function(g_index, e_index) {
+          met_sommer_prediction_se(model, c(1L, g_index, e_index), extra_variance = gxe_var)
+        },
+        Genotype_Ci_Index,
+        Environment_Ci_Index
+      )),
+      Observed_Mean = NA_real_,
+      N_Replications = 0L,
+      Cell_Status = "UNTESTED",
+      Source = dplyr::if_else(Genotype %in% low_conf_genos, "Imputed_low_confidence", "Imputed"),
+      Evidence_Flag = dplyr::if_else(
+        Genotype %in% low_conf_genos,
+        "Predicted-untested; low genotype coverage",
+        "Predicted-untested; GxE assumed zero"
+      ),
+      Uncertainty_Method = "sommer PEV plus unobserved GxE variance",
+      Reportable_Estimate = BLUP_env
+    )
+  BLUPs_env_full <- bind_rows(
+    BLUPs_env_obs %>% dplyr::select(
+      Genotype, Environment, BLUP_G, BLUP_E, BLUP_GxE, BLUP_env,
+      Reportable_Estimate, Prediction_SE, Observed_Mean, N_Replications,
+      Cell_Status, Source, Evidence_Flag, Uncertainty_Method
+    ),
+    imputed_cells %>% dplyr::select(
+      Genotype, Environment, BLUP_G, BLUP_E, BLUP_GxE, BLUP_env,
+      Reportable_Estimate, Prediction_SE, Observed_Mean, N_Replications,
+      Cell_Status, Source, Evidence_Flag, Uncertainty_Method
+    )
+  ) %>%
+    mutate(
+      Prediction_CI_Lower = BLUP_env - 1.96 * Prediction_SE,
+      Prediction_CI_Upper = BLUP_env + 1.96 * Prediction_SE
+    ) %>%
+    arrange(Environment, desc(BLUP_env))
+
+  model_summary <- data.frame(
+    Trait_used = trait_used,
+    Model = met_model_label("SOMMER"),
+    Model_engine = "sommer",
+    Engine_version = as.character(utils::packageVersion("sommer")),
+    Covariance_structure = "Compound symmetry (G + GxE); homogeneous residual",
+    Converged = converged,
+    N_rows_clean = nrow(dat_sommer),
+    N_genotypes = n_distinct(dat_sommer$Genotype),
+    N_environments = n_distinct(dat_sommer$Environment),
+    Replication_column = replication_col %||% "",
+    Block_column = block_col %||% "",
+    AMMI_GGE_min_observed_locations = min_envs_for_biplot,
+    Trait_direction = trait_direction,
+    Target_value = ifelse(identical(trait_direction, "Target trait"), target_value, NA_real_),
+    Input_trait_weight = trait_weight,
+    N_replications = if (has_replication) n_distinct(dat_sommer$Rep) else NA_integer_,
+    N_blocks = if (has_block) n_distinct(dat_sommer$Block) else NA_integer_,
+    Model_formula = full_formula_label,
+    Harmonic_replication = round(n_r, 3),
+    Stability_ratio_G_over_G_plus_GxE = round(stability_ratio, 4),
+    Broad_sense_H2 = round(H2, 4),
+    AIC = suppressWarnings(as.numeric(model$AIC)[1]),
+    BIC = suppressWarnings(as.numeric(model$BIC)[1]),
+    Controls_used = paste(controls_used, collapse = ", "),
+    Notes = paste(notes, collapse = " | "),
+    stringsAsFactors = FALSE
+  )
+  p_variance <- ggplot(
+    variance_components %>% mutate(Source = fct_reorder(Source, -Percent)),
+    aes(x = Source, y = Percent, fill = Source)
+  ) +
+    geom_bar(stat = "identity", width = 0.6) +
+    geom_text(aes(label = paste0(Percent, "%")), vjust = -0.5, size = 4) +
+    scale_fill_manual(values = rep(c("#9B59B6", "#3498DB", "#E67E22", "#2ECC71", "#7F8C8D", "#1ABC9C"), length.out = nrow(variance_components))) +
+    labs(title = paste0("Variance partitioning - ", trait_used), subtitle = met_model_label("SOMMER"), x = NULL, y = "% of Total Variance") +
+    theme_bw() +
+    theme(legend.position = "none")
+  residual_data <- data.frame(
+    fitted = as.numeric(stats::fitted(model)),
+    residual = as.numeric(stats::residuals(model))
+  )
+  p_qq <- ggplot(residual_data, aes(sample = residual)) +
+    stat_qq(color = "#3498DB", alpha = 0.6) +
+    stat_qq_line(color = "#E74C3C", linewidth = 0.8) +
+    labs(title = "Normal Q-Q", x = "Theoretical", y = "Sample") +
+    theme_bw()
+  p_rvf <- ggplot(residual_data, aes(x = fitted, y = residual)) +
+    geom_point(color = "#3498DB", alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "#E74C3C", linewidth = 0.8) +
+    geom_smooth(method = "loess", se = FALSE, color = "#F39C12", linewidth = 0.8, span = 0.8) +
+    labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residuals") +
+    theme_bw()
+  p_blup <- ggplot(BLUPs_main, aes(x = reorder(Genotype, -Rank_BLUP), y = BLUP_G)) +
+    geom_point(color = "#2C3E50", size = 3) +
+    geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.4, color = "#3498DB", linewidth = 0.7) +
+    coord_flip() +
+    labs(
+      title = "Genotype BLUPs with 95% CI",
+      subtitle = paste0("sommer CS model; ranked by decision direction: ", trait_direction),
+      x = "Genotype",
+      y = paste0("BLUP for ", trait_used)
+    ) +
+    theme_bw()
+  acc_dat <- dat_sommer %>%
+    group_by(Genotype, Environment) %>%
+    summarise(obs = mean(Weight), .groups = "drop") %>%
+    mutate(Genotype = as.character(Genotype), Environment = as.character(Environment)) %>%
+    left_join(BLUPs_env_full %>% dplyr::select(Genotype, Environment, BLUP_env), by = c("Genotype", "Environment")) %>%
+    filter(!is.na(BLUP_env))
+  r_by_env <- acc_dat %>%
+    group_by(Environment) %>%
+    summarise(r_val = ifelse(n() >= 2, round(cor(obs, BLUP_env, use = "complete.obs"), 4), NA_real_), .groups = "drop") %>%
+    mutate(label = paste0("r = ", r_val))
+  p_accuracy <- ggplot(acc_dat, aes(x = obs, y = BLUP_env, color = Genotype)) +
+    geom_point(size = 3, alpha = 0.85) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7, alpha = 0.15) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40", linewidth = 0.7) +
+    geom_text(
+      data = r_by_env,
+      aes(label = label, x = -Inf, y = Inf),
+      hjust = -0.15,
+      vjust = 1.4,
+      size = 3.5,
+      fontface = "bold",
+      color = "#2C3E50",
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~Environment, scales = "free", ncol = 2) +
+    labs(
+      title = "Prediction accuracy per hybrid by location",
+      subtitle = "sommer compound-symmetry LMM",
+      x = paste0("Observed mean ", trait_used),
+      y = "Predicted BLUP",
+      color = "Genotype"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  lrt_table <- data.frame(
+    Test = "Model fit",
+    Model = met_model_label("SOMMER"),
+    AIC = suppressWarnings(as.numeric(model$AIC)[1]),
+    BIC = suppressWarnings(as.numeric(model$BIC)[1]),
+    Converged = converged,
+    Note = "Variance-component Wald Z ratios are reported in the variance table; no boundary-adjusted LRT was calculated.",
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    model_summary = model_summary,
+    variance_components = variance_components,
+    lrt_table = lrt_table,
+    blups_main = BLUPs_main,
+    blups_environment = BLUPs_env_full,
+    p_variance = p_variance,
+    p_residual = p_qq + p_rvf,
+    p_blup = p_blup,
+    p_accuracy = p_accuracy
+  )
+}
+
 run_met_pipeline <- function(
     df_raw,
     trait_used = NULL,
@@ -3246,18 +3737,15 @@ run_met_pipeline <- function(
   trait_weight <- suppressWarnings(as.numeric(input$trait_weight %||% 1))
   has_replication <- !is.null(input$replication_col)
   has_block <- !is.null(input$block_col)
-  model_type <- toupper(trimws(as.character(model_type %||% "LMM")))[1]
-  if (model_type %in% c("ANOVA", "RCBD", "ANOVA (RCBD)", "ANOVA_RCBD")) {
-    model_type <- "ANOVA_RCBD"
-  }
-  if (!model_type %in% c("LMM", "ANOVA_RCBD")) {
-    stop("MET model must be LMM or ANOVA (RCBD).")
-  }
-  model_label <- if (identical(model_type, "LMM")) "LMM" else "ANOVA (RCBD)"
-  estimate_label <- if (identical(model_type, "LMM")) "BLUP" else "adjusted mean (BLUE)"
-  estimate_label_plural <- if (identical(model_type, "LMM")) "BLUPs" else "adjusted means (BLUEs)"
-  estimate_matrix_source <- if (identical(model_type, "LMM")) {
-    "LMM predicted BLUP matrix"
+  model_type <- normalize_met_model_type(model_type)
+  model_label <- met_model_label(model_type)
+  model_is_lmm <- !identical(model_type, "ANOVA_RCBD")
+  estimate_label <- if (model_is_lmm) "BLUP" else "adjusted mean (BLUE)"
+  estimate_label_plural <- if (model_is_lmm) "BLUPs" else "adjusted means (BLUEs)"
+  estimate_matrix_source <- if (identical(model_type, "SOMMER")) {
+    "sommer compound-symmetry LMM predicted BLUP matrix"
+  } else if (identical(model_type, "LMM")) {
+    "lme4 LMM predicted BLUP matrix"
   } else {
     "ANOVA adjusted-mean (BLUE) matrix"
   }
@@ -3573,6 +4061,34 @@ run_met_pipeline <- function(
   acc_dat <- dat_clean %>% group_by(Genotype, Environment) %>% summarise(obs = mean(Weight), .groups = "drop") %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment)) %>% left_join(BLUPs_env_full %>% dplyr::select(Genotype, Environment, BLUP_env), by = c("Genotype", "Environment")) %>% filter(!is.na(BLUP_env))
   r_by_env <- acc_dat %>% group_by(Environment) %>% summarise(r_val = ifelse(n() >= 2, round(cor(obs, BLUP_env, use = "complete.obs"), 4), NA_real_), .groups = "drop") %>% mutate(label = paste0("r = ", r_val))
   p_accuracy <- ggplot(acc_dat, aes(x = obs, y = BLUP_env, color = Genotype)) + geom_point(size = 3, alpha = 0.85) + geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7, alpha = 0.15) + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40", linewidth = 0.7) + geom_text(data = r_by_env, aes(label = label, x = -Inf, y = Inf), hjust = -0.15, vjust = 1.4, size = 3.5, fontface = "bold", color = "#2C3E50", inherit.aes = FALSE) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = "Prediction accuracy per hybrid by location", x = paste0("Observed mean ", trait_used), y = "Predicted BLUP", color = "Genotype") + theme_bw() + theme(legend.position = "bottom")
+  } else if (identical(model_type, "SOMMER")) {
+    sommer_result <- run_met_sommer_cs(
+      dat_clean = dat_clean,
+      raw_genotype_summary = raw_genotype_summary,
+      trait_used = trait_used,
+      trait_direction = trait_direction,
+      target_value = target_value,
+      trait_weight = trait_weight,
+      has_replication = has_replication,
+      has_block = has_block,
+      replication_col = input$replication_col,
+      block_col = input$block_col,
+      min_envs_for_biplot = min_envs_for_biplot,
+      controls_used = controls_used,
+      low_conf_genos = low_conf_genos,
+      notes = notes,
+      n_r = n_r,
+      n_envs_total = n_envs_total
+    )
+    model_summary <- sommer_result$model_summary
+    variance_components <- sommer_result$variance_components
+    lrt_table <- sommer_result$lrt_table
+    BLUPs_main <- sommer_result$blups_main
+    BLUPs_env_full <- sommer_result$blups_environment
+    p_variance <- sommer_result$p_variance
+    p_residual <- sommer_result$p_residual
+    p_blup <- sommer_result$p_blup
+    p_accuracy <- sommer_result$p_accuracy
   } else {
     met_anova_formula <- function(include_environment = TRUE,
                                   include_genotype = TRUE,
@@ -3847,12 +4363,12 @@ run_met_pipeline <- function(
   heatmap_limit <- max(abs(c(heatmap_dat$Estimated_Check_Advantage, heatmap_dat$Observed_Check_Advantage)), na.rm = TRUE)
   if (!is.finite(heatmap_limit) || heatmap_limit <= 0) heatmap_limit <- 1
   p_perf_heatmap_observed <- ggplot(heatmap_dat, aes(x = Environment, y = reorder(Genotype, Decision_score_env), fill = Observed_Check_Advantage)) + geom_tile(color = "white", linewidth = 0.5) + geom_text(aes(label = observed_label), size = 2.5, lineheight = 0.9) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 0, limits = c(-heatmap_limit, heatmap_limit), na.value = "#D9D9D9", oob = scales::squish) + labs(title = "Genotype x location observed performance", subtitle = paste0("Raw cell means relative to the best observed check. Direction: ", trait_direction, ". Gray cells were not tested."), x = "Location", y = "Genotype", fill = "Check advantage") + theme_bw()
-  estimated_heatmap_note <- if (identical(model_type, "LMM")) {
+  estimated_heatmap_note <- if (!identical(model_type, "ANOVA_RCBD")) {
     "Faded cells were not tested and are model predictions."
   } else {
     "Gray cells were not tested and have no estimable BLUE under the fixed GxE model."
   }
-  p_perf_heatmap <- ggplot(heatmap_dat, aes(x = Environment, y = reorder(Genotype, Decision_score_env), fill = Estimated_Check_Advantage)) + geom_tile(aes(alpha = alpha_val), color = "white", linewidth = 0.5) + geom_text(aes(label = label), size = 2.5, lineheight = 0.9) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 0, limits = c(-heatmap_limit, heatmap_limit), na.value = "#D9D9D9", oob = scales::squish) + scale_alpha_identity() + labs(title = paste0("Genotype x location ", ifelse(identical(model_type, "LMM"), "BLUPs", "BLUEs")), subtitle = paste0("Estimated values relative to the best check. Direction: ", trait_direction, ". ", estimated_heatmap_note), x = "Location", y = "Genotype", fill = "Check advantage") + theme_bw()
+  p_perf_heatmap <- ggplot(heatmap_dat, aes(x = Environment, y = reorder(Genotype, Decision_score_env), fill = Estimated_Check_Advantage)) + geom_tile(aes(alpha = alpha_val), color = "white", linewidth = 0.5) + geom_text(aes(label = label), size = 2.5, lineheight = 0.9) + scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71", midpoint = 0, limits = c(-heatmap_limit, heatmap_limit), na.value = "#D9D9D9", oob = scales::squish) + scale_alpha_identity() + labs(title = paste0("Genotype x location ", ifelse(model_is_lmm, "BLUPs", "BLUEs")), subtitle = paste0("Estimated values relative to the best check. Direction: ", trait_direction, ". ", estimated_heatmap_note), x = "Location", y = "Genotype", fill = "Check advantage") + theme_bw()
   GxE_matrix_wide <- BLUPs_env_full %>% dplyr::select(Genotype, Environment, BLUP_env) %>% pivot_wider(names_from = Environment, values_from = BLUP_env) %>% column_to_rownames("Genotype")
   GxE_long_complete <- GxE_matrix_wide %>% rownames_to_column("Genotype") %>% pivot_longer(-Genotype, names_to = "Environment", values_to = "BLUP_env")
   n_genos <- nrow(GxE_matrix_wide)
@@ -4101,7 +4617,7 @@ run_met_all_traits <- function(
       Ran_MET = trait_cols %in% names(results),
       Replication_column = replication_col %||% "",
       Block_column = block_col %||% "",
-      Model = ifelse(toupper(as.character(model_type %||% "LMM")) %in% c("ANOVA", "RCBD", "ANOVA (RCBD)", "ANOVA_RCBD"), "ANOVA (RCBD)", "LMM"),
+      Model = met_model_label(model_type),
       AMMI_GGE_min_observed_locations = min_envs_for_biplot %||% "",
       stringsAsFactors = FALSE
     ),

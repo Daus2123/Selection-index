@@ -158,7 +158,7 @@ si_reset_analysis_state <- function(analysis_results, analysis_used, analysis_me
   analysis_results(NULL)
   analysis_used(NULL)
   analysis_message(paste(reason, "Run an analysis again."))
-  for (nm in c("MATING", "BREEDING", "LPSI", "MET", "DIVERSITY")) {
+  for (nm in c("MATING", "BREEDING", "MULTIFACTOR", "LPSI", "MET", "DIVERSITY")) {
     saved_results[[nm]] <- NULL
   }
   invisible(TRUE)
