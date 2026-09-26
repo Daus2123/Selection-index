@@ -106,11 +106,57 @@ plot_result <- make_result(trial)
 plot_result$lsd_long <- data.frame(
   Trait = "Yield", ID = c("1", "2", "3"),
   Original_ID = paste("Variety", 1:3), emmean = c(10, 13, 16),
+  SE = c(0.1, 0.2, 0.3),
   LSD_group = c("c", "b", "a")
 )
 plot_result$mean_comparison_method <- "lsd"
 mean_plot <- plot_lpsi_mean_comparison(plot_result, "Yield")
-stopifnot(inherits(mean_plot$layers[[1]]$geom, "GeomCol"))
+stopifnot(inherits(mean_plot$layers[[1]]$geom, "GeomBoxplot"))
 invisible(ggplot2::ggplot_build(mean_plot))
+annotation_data <- mean_plot$layers[[2]]$data
+stopifnot(all(c("Top", "Group") %in% names(annotation_data)),
+          !any(c("SE.x", "SE.y") %in% names(annotation_data)),
+          all(vapply(seq_len(nrow(annotation_data)), function(i) {
+            annotation_data$Top[i] == max(mean_plot$data$Value[
+              mean_plot$data$Label == annotation_data$Label[i]])
+          }, logical(1))))
+
+# Exercise the real Charts reactive data (including adjusted SE), preview,
+# and download plot with the punctuation used in uploaded trait names.
+shiny::testServer(server, {
+  session$setInputs(chart_module = "selection_index", chart_lpsi_mode = "single",
+                    plot_view = "lpsi_mean_comparison_plot",
+                    lpsi_chart_trait = "No.ofFruit/plant", lpsi_chart_mean_comparison_method = "lsd")
+  for (model in c("CRD", "RCBD", "LMM")) {
+    result <- make_result(trial, model)
+    names(result$cleaned_data)[names(result$cleaned_data) == "Yield"] <- "No.ofFruit/plant"
+    for (field in c("trait_info", "anova_full", "heritability_gain")) {
+      result[[field]]$Trait[result[[field]]$Trait == "Yield"] <- "No.ofFruit/plant"
+    }
+    saved_results$LPSI <- result
+    for (method in c("lsd", "tukey")) {
+      session$setInputs(lpsi_chart_trait = "No.ofFruit/plant", lpsi_chart_mean_comparison_method = method)
+      comparison <- lpsi_selected_mean_comparison()
+      stopifnot("SE" %in% names(comparison$plot_data),
+                length(output$lpsi_mean_comparison_plot$src) == 1)
+      chart <- selected_chart()$plot
+      built <- ggplot2::ggplot_build(chart)
+      stopifnot(nrow(built$data[[2]]) == 3, all(is.finite(built$data[[2]]$y)))
+      png_path <- tempfile(fileext = ".png")
+      ggplot2::ggsave(png_path, chart, width = 8, height = 5)
+      stopifnot(file.info(png_path)$size > 0)
+      unlink(png_path)
+    }
+    session$setInputs(lpsi_chart_trait = "Score")
+    stopifnot(lpsi_selected_mean_comparison()$method == "Dunn_Holm",
+              length(output$lpsi_mean_comparison_plot$src) == 1)
+    invisible(ggplot2::ggplot_build(selected_chart()$plot))
+    result$anova_full$p_value <- 0.5
+    saved_results$LPSI <- result
+    session$setInputs(lpsi_chart_trait = "No.ofFruit/plant")
+    stopifnot(nrow(ggplot2::ggplot_build(selected_chart()$plot)$data[[2]]) == 0,
+              length(output$lpsi_mean_comparison_plot$src) == 1)
+  }
+})
 
 cat("LPSI mean comparison checks passed.\n")

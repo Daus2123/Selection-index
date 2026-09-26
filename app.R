@@ -1891,43 +1891,47 @@ plot_lpsi_mean_comparison <- function(results, trait) {
   label_levels <- unique(c(label_levels, setdiff(unique(plot_dat$Label), label_levels)))
   plot_dat$Label <- factor(plot_dat$Label, levels = label_levels)
   letters_dat$Label <- factor(letters_dat$Label, levels = label_levels)
-  bar_dat <- plot_dat %>%
+  label_positions <- plot_dat %>%
     group_by(Label) %>%
-    summarise(Mean = mean(Value), SD = sd(Value), N = n(), .groups = "drop") %>%
-    mutate(SE = SD / sqrt(N))
-  letters_dat <- merge(letters_dat, bar_dat[, c("Label", "Mean", "SE")], by = "Label", all.x = TRUE, sort = FALSE)
+    summarise(Top = max(Value), .groups = "drop")
+  # Keep model letters separate from raw observations and position them above
+  # the entire boxplot, including outliers. Model SE is not a boxplot whisker.
+  letters_dat <- merge(letters_dat[, c("Label", "Group"), drop = FALSE],
+                       label_positions,
+                       by = "Label", all.x = TRUE, sort = FALSE)
   letters_dat$Label <- factor(letters_dat$Label, levels = label_levels)
-  value_range <- diff(range(c(bar_dat$Mean - bar_dat$SE, bar_dat$Mean + bar_dat$SE), na.rm = TRUE))
-  label_gap <- max(value_range * 0.05, max(abs(bar_dat$Mean), na.rm = TRUE) * 0.015, 0.03)
+  value_range <- diff(range(plot_dat$Value))
+  label_gap <- max(value_range * 0.05, max(abs(plot_dat$Value)) * 0.015, 0.03)
+  palette <- c("#1B9E77", "#D95F02", "#7570B3", "#E7298A",
+               "#66A61E", "#E6AB02", "#A6761D", "#666666")
 
-  ggplot(bar_dat, aes(x = Label, y = Mean, fill = Label)) +
-    geom_col(width = 0.7, show.legend = FALSE) +
-    geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.18, na.rm = TRUE) +
+  ggplot(plot_dat, aes(x = Label, y = Value, fill = Label)) +
+    geom_boxplot(width = 0.65, color = "#4D4D4D", linewidth = 0.5,
+                 outlier.size = 1.8, na.rm = TRUE) +
     geom_text(
       data = letters_dat[letters_dat$Group != "" & !is.na(letters_dat$Group), , drop = FALSE],
-      aes(x = Label, y = Mean + SE + label_gap, label = Group),
-      fontface = "bold", vjust = 0, size = 4, inherit.aes = FALSE
+      aes(x = Label, y = Top + label_gap, label = Group),
+      fontface = "bold", vjust = 0, size = 4, inherit.aes = FALSE, show.legend = FALSE
     ) +
-    scale_fill_manual(values = rep("#3498DB", nlevels(bar_dat$Label))) +
+    scale_fill_manual(values = stats::setNames(rep(palette, length.out = length(label_levels)), label_levels)) +
     labs(
-      title = "Mean comparison",
+      title = "Boxplot per genotype",
       subtitle = paste(
         gsub("_", " ", results$mean_comparison_method %||% "Mean comparison"),
-        "for", trait
+        "comparison letters |", trait
       ),
-      x = "Entry",
-      y = paste(trait, "raw mean ± SE")
+      x = "Genotype", y = trait, fill = "Genotype"
     ) +
-    theme_bw(base_size = 12) +
+    theme_gray(base_size = 13) +
     theme(
-      plot.title = element_text(face = "bold", color = "#111111", size = 12, margin = margin(5, 8, 5, 8)),
+      plot.title = element_text(color = "#005675", size = 24, margin = margin(b = 8)),
       plot.title.position = "plot",
-      plot.background = element_rect(fill = "#FFFFFF", color = "#9FC5E8", linewidth = 0.8),
-      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
-      panel.grid.major.x = element_blank(),
-      legend.position = "none"
+      plot.background = element_rect(fill = "#FFFFFF", color = NA),
+      axis.text = element_text(color = "#4D4D4D", size = 11),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
     ) +
-    expand_limits(y = max(bar_dat$Mean + bar_dat$SE, na.rm = TRUE) + 2.5 * label_gap)
+    expand_limits(y = max(plot_dat$Value) + 2.5 * label_gap)
 }
 
 
@@ -5910,8 +5914,8 @@ server <- function(input, output, session) {
         inputId = "met_model_type",
         label = "Model",
         choices = c(
-          "Standard LMM - lme4" = "LMM",
-          "Breeding LMM - sommer (compound symmetry)" = "SOMMER",
+          "LMM-Lme4" = "LMM",
+          "LMM-Sommer" = "SOMMER",
           "ANOVA (RCBD)" = "ANOVA_RCBD"
         ),
         selected = input$met_model_type %||% "LMM"
