@@ -32,6 +32,19 @@ for (model_type in c("LMM", "ANOVA_RCBD", "SOMMER")) {
     length(result$met_trait_names) == 1,
     length(build_export_tables("MET", result)) > 0
   )
+  chart <- trait_result$p_fw_regression
+  stopifnot(identical(chart$labels$x, "Environment"),
+            setequal(levels(chart$data$Environment), unique(trial$Environment)))
+  built <- ggplot2::ggplot_build(chart)
+  tick_labels <- built$layout$panel_params[[1]]$x$get_labels()
+  stopifnot(all(grepl("Mean:", tick_labels, fixed = TRUE)),
+            nrow(built$data[[2]]) == 12,
+            all(is.finite(built$data[[2]]$x)),
+            all(is.finite(built$data[[2]]$y)))
+  for (env in levels(chart$data$Environment)) {
+    expected_mean <- mean(chart$data$BLUP_env[chart$data$Environment == env])
+    stopifnot(paste0(env, "\nMean: ", sprintf("%.2f", expected_mean)) %in% tick_labels)
+  }
 }
 
 cat("MET LMM, ANOVA, and sommer export checks passed.\n")

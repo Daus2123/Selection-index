@@ -2897,6 +2897,19 @@ plot_met_selection_ranking <- function(selection, trait_used, estimate_label = "
     theme_bw() +
     theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 8), plot.margin = margin(t = 10, r = 24, b = 24, l = 12))
 }
+met_standardize_component <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  valid <- is.finite(x)
+  out <- rep(NA_real_, length(x))
+  if (!any(valid)) return(out)
+  spread <- stats::sd(x[valid])
+  # A singleton or constant component has no measurable spread. Keep its
+  # finite observations neutral; missing/nonfinite observations stay missing.
+  out[valid] <- if (!is.finite(spread) || spread == 0) 0 else
+    (x[valid] - mean(x[valid])) / spread
+  out
+}
+
 build_met_integrated_ranking <- function(df_raw, met_results, component_weights = c(mean = 1, fw = 0, asv = 0)) {
   prepared <- prepare_met_trait_settings(df_raw)
   successful_traits <- intersect(prepared$trait_cols, names(met_results))
@@ -2957,9 +2970,9 @@ build_met_integrated_ranking <- function(df_raw, met_results, component_weights 
   trait_blups <- trait_blups %>%
     group_by(Trait) %>%
     mutate(
-      Mean_component = standardize_trait(Adjusted_performance),
-      FW_component = standardize_trait(FW_stability_raw),
-      ASV_component = standardize_trait(ASV_stability_raw),
+      Mean_component = met_standardize_component(Adjusted_performance),
+      FW_component = met_standardize_component(FW_stability_raw),
+      ASV_component = met_standardize_component(ASV_stability_raw),
       Component_weight_coverage =
         ifelse(!is.na(Mean_component), component_weights[["mean"]], 0) +
         ifelse(!is.na(FW_component), component_weights[["fw"]], 0) +
@@ -3024,6 +3037,18 @@ build_met_integrated_ranking <- function(df_raw, met_results, component_weights 
       Normalized_weight = round(as.numeric(weights[Trait]), 4),
       Used_in_integrated_ranking = "YES"
     )
+  component_notes <- trait_blups %>%
+    group_by(Trait) %>%
+    summarise(Component_notes = paste(vapply(
+      list(Mean = Adjusted_performance, FW = FW_stability_raw, ASV = ASV_stability_raw),
+      function(x) {
+        count <- sum(is.finite(x))
+        paste0(count, "/", length(x), " usable",
+               if (count == 0) "; excluded from component weights" else if (count == 1)
+                 "; single value scored neutrally" else "")
+      }, character(1)) %>% paste(c("Mean", "FW", "ASV"), ., sep = ": "),
+      collapse = "; "), .groups = "drop")
+  trait_weights <- left_join(trait_weights, component_notes, by = "Trait")
   p_integrated <- if (nrow(ranking) == 0) {
     empty_plot("Integrated ranking needs at least one genotype.")
   } else {
@@ -3105,7 +3130,7 @@ met_gge_chart_choices <- function() {
 met_fw_chart_choices <- function() {
   c(
     "Mean vs Sensitivity" = "mean_sensitivity",
-    "Response Correlation" = "response_correlation"
+    "Response by Environment" = "response_correlation"
   )
 }
 met_fw_selected_view <- function(input_value) {
@@ -4388,18 +4413,32 @@ run_met_pipeline <- function(
     ) %>%
     arrange(desc(Favorable_GenMean))
   p_fw_mean_sens <- ggplot(FW_results, aes(x = GenMean, y = Sens, color = b_interp, label = Genotype)) + geom_point(size = 3) + geom_text(vjust = -0.8, size = 3) + geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + scale_color_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71")) + labs(title = "Finlay-Wilkinson: mean vs sensitivity", subtitle = paste0("Decision direction: ", trait_direction), x = paste("Genotype", estimate_label, "mean"), y = "Sensitivity (b)", color = "Stability") + theme_bw()
-  p_fw_regression <- ggplot(FW_dat_loo, aes(x = EnvIndex, y = BLUP_env, color = Genotype, group = Genotype)) +
-    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
-    geom_point(shape = 18, size = 3) +
+  fw_environment_means <- FW_dat_loo %>%
+    group_by(Environment) %>%
+    summarise(Environment_mean = mean(BLUP_env, na.rm = TRUE), .groups = "drop") %>%
+    arrange(Environment_mean, Environment)
+  fw_environment_levels <- as.character(fw_environment_means$Environment)
+  fw_response_data <- FW_dat_loo %>%
+    mutate(Environment = factor(Environment, levels = fw_environment_levels))
+  fw_environment_labels <- stats::setNames(
+    paste0(fw_environment_levels, "\nMean: ", sprintf("%.2f", fw_environment_means$Environment_mean)),
+    fw_environment_levels
+  )
+  p_fw_regression <- ggplot(fw_response_data, aes(x = Environment, y = BLUP_env, color = Genotype, group = Genotype)) +
+    geom_line(color = "gray70", linewidth = 0.8, na.rm = TRUE) +
+    geom_point(size = 3.5, na.rm = TRUE) +
+    scale_x_discrete(labels = fw_environment_labels, drop = FALSE) +
     labs(
-      title = paste0("Finlay-Wilkinson response correlation - ", trait_used),
-      subtitle = "Genotype response across the leave-one-out environmental index.",
-      x = "Leave-one-out environment index",
+      title = paste0("Finlay-Wilkinson response by environment - ", trait_used),
+      subtitle = paste0("Points and environment means: ", estimate_label, ". Lines connect each genotype."),
+      caption = "FW sensitivity uses the leave-one-out environmental index. Environments are ordered by their mean.",
+      x = "Environment",
       y = paste0(estimate_label, " for ", trait_used),
       color = "Genotype"
     ) +
-    theme_bw() +
-    theme(legend.position = "bottom")
+    theme_bw(base_size = 13) +
+    theme(legend.position = "right", axis.text.x = element_text(size = 11),
+          axis.title = element_text(size = 13))
   metan_single <- if (ammi_gge_available) {
     run_met_single_trait_extensions(dat_clean)
   } else {

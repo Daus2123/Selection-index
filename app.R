@@ -300,6 +300,7 @@ build_export_tables <- function(analysis_type, results) {
       }
     }
     add_sheet("09_overall", "selection", results$met_integrated_ranking)
+    add_sheet("09_overall", "trait_weights", results$met_integrated_trait_weights)
     if (!is.null(results$met_decision_board)) {
       add_sheet("09b_decision", "board", results$met_decision_board$board)
       add_sheet("09c_decision_rules", "thresholds", results$met_decision_board$thresholds)
@@ -6669,7 +6670,7 @@ server <- function(input, output, session) {
         )
       }, error = function(e) {
         showNotification(
-          paste("MET pipeline failed:", e$message),
+          paste("MET pipeline failed:", conditionMessage(e)),
           type = "error",
           duration = NULL
         )
