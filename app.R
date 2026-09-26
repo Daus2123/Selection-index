@@ -225,6 +225,12 @@ build_export_tables <- function(analysis_type, results) {
       add_sheet("04", "generation", results$generation_stats)
     }
   } else if (analysis_type == "MULTIFACTOR") {
+    if (length(results$results_by_trait) > 1) {
+      fields <- c("settings", "summary", "anova", "effect_comparison", "effect_pairwise", "superiority", "notes")
+      for (field in fields) {
+        results[[field]] <- dplyr::bind_rows(lapply(results$results_by_trait, `[[`, field), .id = "Trait")
+      }
+    }
     add_sheet("00", "settings", results$settings)
     add_sheet("01", "summary", results$summary)
     add_sheet("02", "anova", results$anova)
@@ -3429,6 +3435,21 @@ ui <- page_navbar(
     .result-analysis-section .form-group {
       width: 100%;
     }
+    .analysis-output-controls .mf-slicer-stack {
+      margin: 0 14px;
+      padding: 9px 0 0;
+    }
+    .mf-slicer-stack .shiny-input-container,
+    .mf-slicer-stack .selectize-control {
+      width: 100%;
+      max-width: none;
+    }
+    .mf-slicer-stack .form-group {
+      margin-bottom: 10px;
+    }
+    .mf-slicer-stack p {
+      margin: 2px 0 0;
+    }
     .slicer-button-menu > .button-menu-item > .form-check {
       align-items: center;
       display: flex;
@@ -3976,10 +3997,12 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'breeding_realized'", DTOutput("breeding_realized_table")),
         conditionalPanel("input.result_view == 'breeding_generation'", DTOutput("breeding_generation_table")),
         conditionalPanel("input.result_view == 'mf_summary'", tagList(DTOutput("mf_settings_table"), DTOutput("mf_summary_table"), DTOutput("mf_notes_table"))),
-        conditionalPanel("input.result_view == 'mf_anova'", DTOutput("mf_anova_table")),
+        conditionalPanel("input.result_view == 'mf_anova'", tagList(
+          DTOutput("mf_anova_table"),
+          tags$p(class = "small-note", "Significance: *** p < 0.001; ** p < 0.01; * p < 0.05; . p < 0.1. Mixed models use Satterthwaite denominator df; the residual Mean Sq is the REML residual variance, with no classical residual df or sum of squares."))),
         conditionalPanel("input.result_view == 'mf_means'", tagList(
           tags$div(class = "small-note", style = "margin: 0 0 12px 0;",
-                   "Values are raw mean ± raw SD. Compact letters come from adjusted model comparisons and appear only when the corresponding ANOVA effect is significant (p < 0.05). CV uses the residual error. Heritability is shown as not estimated until a genotype variance model is specified."),
+                   "Values are raw mean \u00b1 raw SD. Letters follow Better performance (a = best group) and appear only for significant ANOVA effects (p < 0.05). CV uses residual error. Broad-sense heritability (Cullis H\u00b2) assumes Factor A contains genotypes; it uses a separate REML variance model. See Summary notes for assumptions and estimation warnings."),
           DTOutput("mf_means_table"), DTOutput("mf_pairwise_table"))),
         conditionalPanel("input.result_view == 'mf_superiority'", DTOutput("mf_superiority_table")),
         conditionalPanel("input.result_view == 'lpsi_trait'", DTOutput("trait_table")),
@@ -4169,11 +4192,66 @@ server <- function(input, output, session) {
     validate(need(!is.null(result), "Run Multi-factor analysis to view this result."))
     result
   })
-  multifactor_result <- reactive({
-    mf_refresh_result(multifactor_saved_result(),
+  mf_result_for_trait <- function(trait) {
+    saved <- multifactor_saved_result()
+    traits <- names(saved$results_by_trait) %||% saved$response
+    if (is.null(trait) || !trait %in% traits) trait <- traits[1]
+    result <- if (length(saved$results_by_trait)) saved$results_by_trait[[trait]] else saved
+    mf_refresh_result(result,
                       method = input$mf_result_method %||% "tukey",
-                      direction = input$mf_result_direction %||% "Higher better",
+                      direction = mf_resolved_direction(result$response),
                       effect = input$mf_result_effect %||% "All effects")
+  }
+  multifactor_result <- reactive({
+    mf_result_for_trait(input$mf_result_trait)
+  })
+  multifactor_export_result <- reactive({
+    saved <- multifactor_saved_result()
+    traits <- names(saved$results_by_trait) %||% saved$response
+    results <- stats::setNames(lapply(traits, mf_result_for_trait), traits)
+    result <- results[[1]]
+    result$results_by_trait <- results
+    result
+  })
+  mf_direction_overrides <- reactiveVal(list())
+  observeEvent(uploaded_data(), {
+    mf_direction_overrides(list())
+  }, priority = 100)
+  observeEvent(input$mf_result_direction, {
+    saved <- if (identical(analysis_used(), "MULTIFACTOR")) analysis_results() else saved_results$MULTIFACTOR
+    traits <- if (!is.null(saved)) names(saved$results_by_trait) %||% saved$response else input$mf_response
+    trait <- input$mf_result_trait %||% head(traits, 1)
+    if (!length(trait) || !trait %in% traits) return()
+    overrides <- mf_direction_overrides()
+    value <- input$mf_result_direction
+    overrides[[trait]] <- if (value %in% c("Higher better", "Lower better")) value else NULL
+    mf_direction_overrides(overrides)
+  }, ignoreInit = TRUE)
+  mf_resolved_direction <- function(trait) {
+    if (!length(trait)) return("Higher better")
+    override <- mf_direction_overrides()[[trait]]
+    if (!is.null(override)) return(override)
+    data <- uploaded_data()
+    metadata_col <- if (id_col %in% names(data)) id_col else input$mf_factor_a
+    if (!is.null(metadata_col) && metadata_col %in% names(data) && trait %in% names(data)) {
+      rows <- which(toupper(trimws(as.character(data[[metadata_col]]))) %in% direction_row_labels)
+      if (length(rows)) {
+        direction <- parse_trait_direction(data[[trait]][tail(rows, 1)])$direction
+        validate(need(direction != "Target trait", "Multi-factor comparisons require Higher better or Lower better. Choose a performance override for this target trait."))
+        return(direction)
+      }
+    }
+    "Higher better"
+  }
+  multifactor_chart_result <- reactive({
+    result <- mf_result_for_trait(input$mf_chart_trait %||% input$mf_result_trait)
+    effects <- mf_effect_terms(result$factors)
+    order <- as.integer(input$mf_chart_order %||% "1")
+    available <- effects[lengths(strsplit(effects, ":", fixed = TRUE)) == order]
+    if (!length(available)) available <- result$factors
+    effect <- input$mf_chart_effect %||% available[1]
+    result$selected_effect <- if (effect %in% available) effect else available[1]
+    result
   })
   output$multifactor_controls <- renderUI({
     data <- tryCatch(uploaded_data(), error = function(e) NULL)
@@ -4199,16 +4277,17 @@ server <- function(input, output, session) {
     factor_c <- choose(input$mf_factor_c, factor_c_choices,
                        if (length(factor_c_default)) match(factor_c_default[1], factor_c_choices) else 1L)
     model_choices <- if (design == "split_plot") c("LMM" = "LMM") else if (randomization == "CRD") c("ANOVA" = "ANOVA") else c("ANOVA" = "ANOVA", "LMM" = "LMM")
+    traits <- setdiff(traits, c(factor_a, factor_b, if (count == 3) factor_c,
+                              if (randomization == "RCBD" || design == "split_plot") input$mf_rep %||% rep_col))
+    selected_traits <- intersect(input$mf_response %||% character(0), traits)
     tagList(
       selectInput("mf_factor_count", "Number of factors", c("Two" = 2, "Three" = 3), selected = count),
       selectInput("mf_design", "Treatment design", c("Factorial" = "factorial", "Split plot" = "split_plot"), selected = design),
       selectInput("mf_factor_a", if (design == "split_plot") "Factor A / main plot" else "Factor A", columns, selected = factor_a),
       selectInput("mf_factor_b", if (design == "split_plot") "Factor B / subplot" else "Factor B", factor_b_choices, selected = factor_b),
       if (count == 3) selectInput("mf_factor_c", if (design == "split_plot") "Factor C / sub-subplot" else "Factor C", factor_c_choices, selected = factor_c),
-      selectInput("mf_response", "Response trait", traits,
-                  selected = choose(input$mf_response, traits,
-                                    if (length(setdiff(traits, c(factor_a, factor_b, if (count == 3) factor_c, rep_col))))
-                                      match(setdiff(traits, c(factor_a, factor_b, if (count == 3) factor_c, rep_col))[1], traits) else 1L)),
+      selectInput("mf_response", "Response traits", traits, multiple = TRUE,
+                  selected = if (length(selected_traits)) selected_traits else head(traits, 1)),
       selectInput("mf_randomization", "Base randomization", c("CRD" = "CRD", "RCBD" = "RCBD"), selected = randomization),
       selectInput("mf_model", "Model", model_choices, selected = choose(input$mf_model, model_choices, 1)),
       if (randomization == "RCBD" || design == "split_plot") selectInput("mf_rep", "Block / whole-plot replicate", columns, selected = choose(input$mf_rep, columns, if (rep_col %in% columns) match(rep_col, columns) else 1L)),
@@ -4508,11 +4587,10 @@ server <- function(input, output, session) {
     }
     view <- input$plot_view
     if (chart_module == "multifactor") {
-      if (!view %in% c("mf_superiority_plot", "mf_mean_plot", "mf_interaction_plot")) view <- "mf_superiority_plot"
-      result <- multifactor_result()
+      if (!view %in% c("mf_superiority_plot", "mf_mean_plot")) view <- "mf_mean_plot"
+      result <- multifactor_chart_result()
       plot <- switch(view, mf_superiority_plot = mf_plot_superiority(result),
-                     mf_mean_plot = mf_plot_mean_comparison(result),
-                     mf_interaction_plot = mf_plot_interaction(result))
+                     mf_mean_plot = mf_plot_mean_comparison(result))
       return(list(plot = plot, name = paste0("Multi-factor_", view, "_", gsub("[^A-Za-z0-9_-]+", "_", result$response))))
     }
     if (chart_module == "selection_index") {
@@ -4847,7 +4925,7 @@ server <- function(input, output, session) {
     chart_module <- input$chart_module %||% "selection_index"
     if (chart_module == "multifactor") {
       view <- input$plot_view %||% "mf_superiority_plot"
-      if (!view %in% c("mf_superiority_plot", "mf_mean_plot", "mf_interaction_plot")) view <- "mf_superiority_plot"
+      if (!view %in% c("mf_superiority_plot", "mf_mean_plot")) view <- "mf_mean_plot"
       return(plotOutput(view, height = "650px"))
     }
     if (chart_module == "mating") {
@@ -5324,31 +5402,59 @@ server <- function(input, output, session) {
     names <- if (!is.null(result)) result$factor_names else c(input$mf_factor_a %||% "Factor A", input$mf_factor_b %||% "Factor B")
     effect_names <- mf_effect_terms(factors)
     effect_labels <- vapply(effect_names, function(effect) {
-      paste(names[match(strsplit(effect, ":", fixed = TRUE)[[1]], factors)], collapse = " × ")
+      paste(names[match(strsplit(effect, ":", fixed = TRUE)[[1]], factors)], collapse = " \u00d7 ")
     }, character(1))
     effect_choices <- c("All effects" = "All effects", stats::setNames(effect_names,
                               paste(effect_names, effect_labels, sep = ": ")))
+    traits <- if (!is.null(result)) names(result$results_by_trait) %||% result$response else input$mf_response
+    selected_trait <- input$mf_result_trait %||% head(traits, 1)
+    if (!length(selected_trait) || !selected_trait %in% traits) selected_trait <- head(traits, 1)
     tagList(
       sidebar_detail_panel("Multi-factor results", choices = choices, input_id = "result_view",
                            selected = if (current %in% choices) current else "mf_summary"),
-      tags$div(class = "side-subpanel result-analysis-section",
+      tags$div(class = "mf-slicer-stack",
+        selectInput("mf_result_trait", "Which trait?", traits, selected = selected_trait),
+        conditionalPanel("input.result_view == 'mf_means'",
                selectInput("mf_result_effect", "Compare levels of", effect_choices,
                            selected = if ((input$mf_result_effect %||% "") %in% effect_choices) input$mf_result_effect else "All effects"),
                selectInput("mf_result_direction", "Better performance",
                            c("Higher better", "Lower better"),
-                           selected = input$mf_result_direction %||% "Higher better"),
+                           selected = mf_resolved_direction(selected_trait)),
                selectInput("mf_result_method", "Mean comparison",
                            c("Tukey HSD" = "tukey", "LSD" = "lsd"),
-                           selected = input$mf_result_method %||% "tukey"))
+                           selected = input$mf_result_method %||% "tukey")))
     )
   })
   output$chart_multifactor_detail <- renderUI({
     choices <- c("Superiority" = "mf_superiority_plot",
-                 "Mean comparison" = "mf_mean_plot",
-                 "Factor interaction" = "mf_interaction_plot")
+                 "Mean comparison" = "mf_mean_plot")
     current <- input$plot_view %||% ""
-    sidebar_detail_panel("Multi-factor charts", choices = choices, input_id = "plot_view",
-                         selected = if (current %in% choices) current else "mf_superiority_plot")
+    result <- if (identical(analysis_used(), "MULTIFACTOR")) analysis_results() else saved_results$MULTIFACTOR
+    factors <- if (!is.null(result)) result$factors else c("A", "B")
+    orders <- c("Single factor" = "1", "Two-factor interaction" = "2",
+                if (length(factors) == 3) c("Three-factor interaction" = "3"))
+    order <- input$mf_chart_order %||% "1"
+    if (!order %in% orders) order <- "1"
+    effects <- mf_effect_terms(factors)
+    effects <- effects[lengths(strsplit(effects, ":", fixed = TRUE)) == as.integer(order)]
+    factor_names <- if (!is.null(result)) result$factor_names else factors
+    labels <- vapply(effects, function(effect) paste0(effect, ": ",
+      paste(factor_names[match(strsplit(effect, ":", fixed = TRUE)[[1]], factors)], collapse = " \u00d7 ")), character(1))
+    selected <- input$mf_chart_effect %||% effects[1]
+    traits <- if (!is.null(result)) names(result$results_by_trait) %||% result$response else input$mf_response
+    selected_trait <- input$mf_chart_trait %||% head(traits, 1)
+    tagList(
+      sidebar_detail_panel("Multi-factor charts", choices = choices, input_id = "plot_view",
+                           selected = if (current %in% choices) current else "mf_superiority_plot"),
+      tags$div(class = "mf-slicer-stack",
+        selectInput("mf_chart_trait", "Which trait?", traits,
+                  selected = if (length(selected_trait) && selected_trait %in% traits) selected_trait else head(traits, 1)),
+        conditionalPanel("input.plot_view == 'mf_mean_plot'",
+          selectInput("mf_chart_order", "Comparison view", orders, selected = order),
+          selectInput("mf_chart_effect", "Factor(s) to compare", stats::setNames(effects, labels),
+                      selected = if (selected %in% effects) selected else effects[1]),
+          tags$p("Bars show raw mean \u00b1 SD. Method and performance direction follow the Results selectors.")))
+    )
   })
   output$result_mating_detail <- renderUI({
     choices <- c(
@@ -6484,15 +6590,15 @@ server <- function(input, output, session) {
       factor_cols <- c(input$mf_factor_a, input$mf_factor_b,
                        if (identical(input$mf_factor_count, "3")) input$mf_factor_c)
       analysis_message("Running Multi-factor analysis...")
-      res <- tryCatch(run_multifactor_pipeline(
-        df = uploaded_data(), response_col = input$mf_response,
+      res <- tryCatch(mf_run_traits(
+        df = uploaded_data(), response_cols = input$mf_response,
+        directions = stats::setNames(lapply(input$mf_response, mf_resolved_direction), input$mf_response),
         factor_cols = factor_cols, design = input$mf_design,
         randomization = input$mf_randomization, model_type = input$mf_model,
         replication_col = input$mf_rep, comparison_factor = "A",
         checks = input$mf_checks,
-        direction = input$mf_result_direction %||% "Higher better",
         comparison_method = input$mf_result_method %||% "tukey",
-        metadata_col = id_col,
+        metadata_col = if (id_col %in% names(uploaded_data())) id_col else input$mf_factor_a,
         metadata_labels = c(weight_row_labels, direction_row_labels)
       ), error = function(e) {
         showNotification(paste("Multi-factor analysis failed:", e$message), type = "error", duration = NULL)
@@ -6664,13 +6770,17 @@ server <- function(input, output, session) {
   output$mf_settings_table <- renderDT({ datatable(multifactor_result()$settings, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
   output$mf_summary_table <- renderDT({ datatable(multifactor_result()$summary, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
   output$mf_notes_table <- renderDT({ datatable(multifactor_result()$notes, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
-  output$mf_anova_table <- renderDT({ datatable(multifactor_result()$anova, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$mf_anova_table <- renderDT({
+    datatable(multifactor_result()$anova,
+      colnames = c("Source", "Df", "Den. Df", "Sum Sq", "Mean Sq", "F value", "Pr(>F)", "Signif."),
+      options = list(pageLength = 10, ordering = FALSE, scrollX = TRUE), rownames = FALSE) %>%
+      formatRound(c("Sum_Sq", "Mean_Sq", "F_value"), digits = 3)
+  })
   output$mf_means_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_comparison"), options = list(pageLength = 50, ordering = FALSE, scrollX = TRUE), rownames = FALSE) })
   output$mf_pairwise_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_pairwise"), options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
   output$mf_superiority_table <- renderDT({ datatable(multifactor_result()$superiority, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
-  output$mf_superiority_plot <- renderPlot({ print(mf_plot_superiority(multifactor_result())) })
-  output$mf_mean_plot <- renderPlot({ print(mf_plot_mean_comparison(multifactor_result())) })
-  output$mf_interaction_plot <- renderPlot({ print(mf_plot_interaction(multifactor_result())) })
+  output$mf_superiority_plot <- renderPlot({ print(mf_plot_superiority(multifactor_chart_result())) })
+  output$mf_mean_plot <- renderPlot({ print(mf_plot_mean_comparison(multifactor_chart_result())) })
   output$mating_anova_table <- renderDT({
     datatable(
       mating_result_for_table(),
@@ -7462,7 +7572,7 @@ server <- function(input, output, session) {
     filename = function() paste0("Multi-factor_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
       req(saved_results$MULTIFACTOR)
-      write_analysis_workbook("MULTIFACTOR", multifactor_result(), file)
+      write_analysis_workbook("MULTIFACTOR", multifactor_export_result(), file)
     }
   )
   output$download_lpsi <- downloadHandler(
@@ -7542,7 +7652,7 @@ server <- function(input, output, session) {
       for (analysis_type in names(available)[available]) {
         path <- file.path(temp_dir, export_names[[analysis_type]])
         result <- saved_results[[analysis_type]]
-        if (analysis_type == "MULTIFACTOR") result <- multifactor_result()
+        if (analysis_type == "MULTIFACTOR") result <- multifactor_export_result()
         if (analysis_type == "LPSI" && identical(analysis_used(), "LPSI")) {
           result <- lpsi_result()
         }

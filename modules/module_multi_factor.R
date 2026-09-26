@@ -145,12 +145,12 @@ mf_fit_model <- function(data, factors, design, randomization, model_type) {
   list(model = model, anova = test, method = "LMM Type III (Satterthwaite)")
 }
 
-mf_anova_table <- function(test) {
+mf_anova_table <- function(test, model = NULL) {
   get_column <- function(names_to_try) {
     column <- intersect(names_to_try, names(test))[1]
     if (is.na(column)) rep(NA_real_, nrow(test)) else suppressWarnings(as.numeric(test[[column]]))
   }
-  data.frame(
+  out <- data.frame(
     Source = as.character(test$Source),
     Num_df = get_column(c("NumDF", "Df")),
     Den_df = get_column(c("DenDF")),
@@ -160,9 +160,24 @@ mf_anova_table <- function(test) {
     p_value = get_column(c("Pr(>F)", "Pr(>Chisq)")),
     check.names = FALSE
   ) |> dplyr::filter(Source != "(Intercept)")
+  missing_ms <- !is.finite(out$Mean_Sq) & is.finite(out$Sum_Sq) & out$Num_df > 0
+  out$Mean_Sq[missing_ms] <- out$Sum_Sq[missing_ms] / out$Num_df[missing_ms]
+  if (inherits(model, "lm")) {
+    out$Den_df[out$Source != "Residuals"] <- stats::df.residual(model)
+  } else if (inherits(model, "merMod") && !"Residuals" %in% out$Source) {
+    # REML residual variance is not a classical residual sum of squares/df.
+    out <- rbind(out, data.frame(Source = "Residuals", Num_df = NA_real_,
+      Den_df = NA_real_, Sum_Sq = NA_real_, Mean_Sq = stats::sigma(model)^2,
+      F_value = NA_real_, p_value = NA_real_))
+  }
+  out$Significance <- ifelse(is.na(out$p_value), "",
+    ifelse(out$p_value < 0.001, "***", ifelse(out$p_value < 0.01, "**",
+      ifelse(out$p_value < 0.05, "*", ifelse(out$p_value < 0.1, ".", "")))))
+  out
 }
 
-mf_comparison_tables <- function(model, factors, comparison_factor, method) {
+mf_comparison_tables <- function(model, factors, comparison_factor, method,
+                                 direction = "Higher better") {
   other <- setdiff(factors, comparison_factor)
   formula <- stats::as.formula(paste("~", comparison_factor, "|", paste(other, collapse = "*")))
   emm <- emmeans::emmeans(model, specs = formula)
@@ -171,7 +186,7 @@ mf_comparison_tables <- function(model, factors, comparison_factor, method) {
   letter_table <- suppressMessages(as.data.frame(multcomp::cld(
     emm, by = other, Letters = c(base::letters, LETTERS),
     adjust = if (method == "tukey") "tukey" else "none",
-    alpha = 0.05, sort = FALSE
+    alpha = 0.05, sort = TRUE, reversed = direction == "Higher better"
   )))
   means$Group <- ""
   key <- function(x) do.call(paste, c(lapply(x[group_cols], as.character), sep = "\r"))
@@ -180,7 +195,7 @@ mf_comparison_tables <- function(model, factors, comparison_factor, method) {
   names(means)[names(means) == "emmean"] <- "Adjusted_mean"
   names(means)[names(means) == "lower.CL"] <- "Lower_95_CI"
   names(means)[names(means) == "upper.CL"] <- "Upper_95_CI"
-  means$Adjusted_mean_SE <- sprintf("%.3f ± %.3f", means$Adjusted_mean, means$SE)
+  means$Adjusted_mean_SE <- sprintf("%.3f \u00b1 %.3f", means$Adjusted_mean, means$SE)
   first <- c(group_cols, "Adjusted_mean_SE", "Group")
   means <- means[, c(first, setdiff(names(means), first)), drop = FALSE]
   pairwise <- as.data.frame(summary(pairs(
@@ -202,7 +217,8 @@ mf_effect_terms <- function(factors) {
   }), use.names = FALSE)
 }
 
-mf_effect_comparisons <- function(model, data, factors, anova, method) {
+mf_effect_comparisons <- function(model, data, factors, anova, method,
+                                  direction = "Higher better", heritability = NULL) {
   terms <- mf_effect_terms(factors)
   tables <- lapply(terms, function(effect) {
     columns <- strsplit(effect, ":", fixed = TRUE)[[1]]
@@ -219,20 +235,20 @@ mf_effect_comparisons <- function(model, data, factors, anova, method) {
       letters <- suppressMessages(as.data.frame(multcomp::cld(
         emm, Letters = c(base::letters, LETTERS),
         adjust = if (method == "tukey") "tukey" else "none",
-        alpha = 0.05, sort = FALSE
+        alpha = 0.05, sort = TRUE, reversed = direction == "Higher better"
       )))
       key <- function(x) do.call(paste, c(lapply(x[columns], as.character), sep = "\r"))
       adjusted$Group <- trimws(as.character(letters$.group)[match(key(adjusted), key(letters))])
       if (anyNA(adjusted$Group)) stop("Could not align effect comparison letters.", call. = FALSE)
     }
-    level <- apply(adjusted[columns], 1, function(x) paste(x, collapse = " × "))
+    level <- apply(adjusted[columns], 1, function(x) paste(x, collapse = " \u00d7 "))
     means <- data.frame(
       Effect = effect, Level = level,
-      Raw_mean_SD = sprintf("%.3f ± %.3f", adjusted$Raw_mean, adjusted$Raw_SD),
+      Raw_mean_SD = sprintf("%.3f \u00b1 %.3f", adjusted$Raw_mean, adjusted$Raw_SD),
       Group = adjusted$Group, N = adjusted$N,
       Raw_mean = adjusted$Raw_mean, Raw_SD = adjusted$Raw_SD,
       Adjusted_mean = adjusted$emmean, Adjusted_SE = adjusted$SE,
-      Omnibus_p = p, Row_type = "Level", stringsAsFactors = FALSE
+      stringsAsFactors = FALSE
     )
     contrast <- as.data.frame(summary(pairs(
       emm, adjust = if (method == "tukey") "tukey" else "none"
@@ -252,18 +268,77 @@ mf_effect_comparisons <- function(model, data, factors, anova, method) {
     cv <- 100 * stats::sigma(model) / abs(mean(data$Y))
     footer <- data.frame(
       Effect = effect,
-      Level = c("Residual CV (%)", "Heritability (h²)",
+      Level = c("Residual CV (%)", "Heritability (h\u00b2)",
                 if (method == "lsd") "LSD (0.05)" else "Tukey HSD (0.05)"),
       Raw_mean_SD = c(if (is.finite(cv)) sprintf("%.2f%%", cv) else "Not estimable",
-                      "Not estimated", critical_label),
+                      if (effect != "A") "Not applicable (Factor A only)" else if (
+                        !is.null(heritability) && is.finite(heritability$value)) {
+                        sprintf("%.3f (%.1f%%)", heritability$value, 100 * heritability$value)
+                      } else "Not estimable; see Summary notes", critical_label),
       Group = "", N = NA_integer_, Raw_mean = NA_real_, Raw_SD = NA_real_,
-      Adjusted_mean = NA_real_, Adjusted_SE = NA_real_, Omnibus_p = p,
-      Row_type = "Statistic", stringsAsFactors = FALSE
+      Adjusted_mean = NA_real_, Adjusted_SE = NA_real_, stringsAsFactors = FALSE
     )
     list(means = dplyr::bind_rows(means, footer), pairwise = contrast)
   })
   list(means = dplyr::bind_rows(lapply(tables, `[[`, "means")),
        pairwise = dplyr::bind_rows(lapply(tables, `[[`, "pairwise")))
+}
+
+# Generalized broad-sense H2 (Cullis): 1 - mean PEV of genotype
+# differences / (2 * genetic variance). Factor A is assumed to be genotype.
+# A separate REML model leaves the user's ANOVA/mean comparisons unchanged.
+mf_heritability <- function(data, factors, design, randomization) {
+  assumption <- paste("Heritability assumes Factor A contains genotypes. Cullis H\u00b2 uses a separate REML model",
+                      "with random A and A interactions, fixed remaining treatment factors, and the design's random error strata.")
+  tryCatch({
+    terms <- mf_effect_terms(factors)
+    genetic_terms <- terms[grepl("(^|:)A(:|$)", terms)]
+    random <- c(genetic_terms, if (randomization == "RCBD") "Rep",
+                if (design == "split_plot") "WholePlot",
+                if (design == "split_plot" && length(factors) == 3) "SubPlot")
+    formula <- stats::as.formula(paste("Y ~", paste(setdiff(factors, "A"), collapse = "*"),
+                                        "+", paste(paste0("(1 | ", random, ")"), collapse = " + ")))
+    warnings <- character(0)
+    fit <- withCallingHandlers(lme4::lmer(formula, data = data, REML = TRUE),
+                               warning = function(w) {
+                                 warnings <<- c(warnings, conditionMessage(w))
+                                 invokeRestart("muffleWarning")
+                               })
+    convergence <- fit@optinfo$conv$lme4$messages
+    convergence <- convergence[!grepl("boundary.*singular", convergence)]
+    if (length(convergence)) stop(paste(convergence, collapse = "; "))
+    variance <- lme4::VarCorr(fit)
+    vg <- as.numeric(variance$A[1, 1])
+    if (!is.finite(vg) || vg <= .Machine$double.eps) {
+      return(list(value = NA_real_, note = paste(assumption,
+        "Not estimable: genotype variance is at the zero boundary.", paste(warnings, collapse = "; "))))
+    }
+    # Joint mixed-model equations include uncertainty in the fixed effects.
+    # Spherical random effects avoid division by zero for boundary components.
+    x <- lme4::getME(fit, "X")
+    z <- lme4::getME(fit, "Z")
+    lambda <- lme4::getME(fit, "Lambda")
+    design_matrix <- cbind(Matrix::Matrix(x, sparse = TRUE), z %*% lambda)
+    p <- ncol(x)
+    q <- ncol(z)
+    equations <- Matrix::crossprod(design_matrix) +
+      Matrix::Diagonal(p + q, c(rep(0, p), rep(1, q)))
+    groups <- names(lme4::getME(fit, "cnms"))
+    offsets <- lme4::getME(fit, "Gp")
+    a <- match("A", groups)
+    indices <- seq.int(offsets[a] + 1L, offsets[a + 1L])
+    rhs <- rbind(Matrix::Matrix(0, p, length(indices), sparse = TRUE),
+                 Matrix::t(lambda[indices, , drop = FALSE]))
+    pev <- as.matrix(Matrix::crossprod(rhs, Matrix::solve(equations, rhs))) * stats::sigma(fit)^2
+    n <- nrow(pev)
+    mean_difference_pev <- 2 * (n * sum(diag(pev)) - sum(pev)) / (n * (n - 1))
+    value <- 1 - mean_difference_pev / (2 * vg)
+    if (!is.finite(value) || value < -1e-6 || value > 1 + 1e-6) stop("Invalid prediction-error variance estimate.")
+    list(value = max(0, min(1, value)), note = paste(assumption,
+      if (lme4::isSingular(fit)) "The heritability model has boundary variance components.",
+      paste(warnings, collapse = "; ")))
+  }, error = function(e) list(value = NA_real_, note = paste(assumption,
+                                        "Heritability not estimable:", conditionMessage(e))))
 }
 
 mf_superiority_table <- function(means, factors, comparison_factor, checks, direction) {
@@ -338,13 +413,14 @@ run_multifactor_pipeline <- function(df, response_col, factor_cols,
     dplyr::summarise(N = dplyr::n(), Raw_mean = mean(Y), Raw_SD = stats::sd(Y),
                      Raw_SE = Raw_SD / sqrt(N), .groups = "drop")
   comparison <- mf_comparison_tables(fitted$model, prepared$factors,
-                                     comparison_factor, comparison_method)
-  anova <- mf_anova_table(fitted$anova)
+                                     comparison_factor, comparison_method, direction)
+  anova <- mf_anova_table(fitted$anova, fitted$model)
+  heritability <- mf_heritability(prepared$data, prepared$factors, design, randomization)
   effects <- mf_effect_comparisons(fitted$model, prepared$data, prepared$factors,
-                                   anova, comparison_method)
+                                   anova, comparison_method, direction, heritability)
   superiority <- mf_superiority_table(comparison$means, prepared$factors,
                                       comparison_factor, checks, direction)
-  notes <- prepared$notes
+  notes <- c(prepared$notes, heritability$note)
   notes <- c(notes, "Main-effect comparisons average across the other factors; interpret them alongside interaction tests.")
   if (inherits(fitted$model, "merMod") && lme4::isSingular(fitted$model)) {
     notes <- c(notes, "The mixed model has a singular random-effects fit; inspect variance estimates and interpret tests cautiously.")
@@ -370,14 +446,36 @@ run_multifactor_pipeline <- function(df, response_col, factor_cols,
        factor_names = factor_cols, factors = prepared$factors,
        comparison_factor = comparison_factor, response = response_col,
        method_label = fitted$method, model = fitted$model,
-       analysis_data = prepared$data, checks = checks)
+       analysis_data = prepared$data, checks = checks, heritability = heritability)
+}
+
+mf_run_traits <- function(df, response_cols, directions, ...) {
+  response_cols <- unique(as.character(response_cols))
+  if (!length(response_cols)) stop("Select at least one response trait.", call. = FALSE)
+  results <- list()
+  failures <- character(0)
+  for (trait in response_cols) {
+    fit <- tryCatch(run_multifactor_pipeline(df, response_col = trait,
+      direction = directions[[trait]], ...), error = function(e) e)
+    if (inherits(fit, "error")) {
+      failures <- c(failures, paste0(trait, ": ", conditionMessage(fit)))
+    } else results[[trait]] <- fit
+  }
+  if (!length(results)) stop(paste(failures, collapse = "\n"), call. = FALSE)
+  if (length(failures)) {
+    for (trait in names(results)) results[[trait]]$notes <- rbind(results[[trait]]$notes,
+      data.frame(Note = paste("Trait analysis failed:", failures)))
+  }
+  result <- results[[1]]
+  result$results_by_trait <- results
+  result
 }
 
 mf_refresh_result <- function(result, method = "tukey", direction = "Higher better",
                               effect = "All effects") {
-  comparison <- mf_comparison_tables(result$model, result$factors, "A", method)
+  comparison <- mf_comparison_tables(result$model, result$factors, "A", method, direction)
   effects <- mf_effect_comparisons(result$model, result$analysis_data, result$factors,
-                                   result$anova, method)
+                                   result$anova, method, direction, result$heritability)
   result$mean_comparison <- comparison$means
   result$pairwise <- comparison$pairwise
   result$effect_comparison <- effects$means
@@ -398,40 +496,54 @@ mf_selected_effect_table <- function(result, field) {
   table
 }
 
+mf_chart_palette <- function(levels) {
+  stats::setNames(rep(c("#3498DB", "#2ECC71", "#E74C3C", "#9B59B6",
+                       "#F39C12", "#1ABC9C", "#E84393", "#34495E"),
+                     length.out = length(levels)), levels)
+}
+
+mf_chart_theme <- function() {
+  ggplot2::theme_bw(base_size = 14) +
+    ggplot2::theme(axis.text = ggplot2::element_text(size = 12, color = "gray20"),
+                   axis.title = ggplot2::element_text(size = 15),
+                   strip.text = ggplot2::element_text(size = 13, face = "bold"),
+                   legend.text = ggplot2::element_text(size = 12))
+}
+
 mf_plot_mean_comparison <- function(result) {
   d <- mf_selected_effect_table(result, "effect_comparison")
-  d <- d[d$Row_type == "Level", , drop = FALSE]
+  d <- d[!is.na(d$N), , drop = FALSE]
   gap <- max(diff(range(c(d$Raw_mean - d$Raw_SD, d$Raw_mean + d$Raw_SD), na.rm = TRUE)) * 0.04, 0.03)
-  ggplot2::ggplot(d, ggplot2::aes(x = Level, y = Raw_mean, fill = Effect)) +
+  ggplot2::ggplot(d, ggplot2::aes(x = Level, y = Raw_mean, fill = Level)) +
     ggplot2::geom_col(width = 0.72, show.legend = FALSE) +
     ggplot2::geom_errorbar(ggplot2::aes(ymin = Raw_mean - Raw_SD, ymax = Raw_mean + Raw_SD),
                            width = 0.16, na.rm = TRUE) +
     ggplot2::geom_text(ggplot2::aes(y = Raw_mean + Raw_SD + gap, label = Group),
-                       fontface = "bold", na.rm = TRUE) +
+                       fontface = "bold", size = 5, na.rm = TRUE) +
     ggplot2::facet_wrap(~ Effect, scales = "free_x") +
-    ggplot2::scale_fill_manual(values = rep(c("#3498DB", "#2ECC71", "#E74C3C"), length.out = length(unique(d$Effect)))) +
+    ggplot2::scale_fill_manual(values = mf_chart_palette(sort(unique(d$Level)))) +
     ggplot2::labs(title = "Multi-factor mean comparison",
-                  subtitle = "Bars and error bars: raw mean ± SD; letters: adjusted model comparisons",
+                  subtitle = "Bars and error bars: raw mean \u00b1 SD; letters: adjusted model comparisons",
                   x = "Factor level or combination", y = result$response) +
-    ggplot2::theme_bw() +
+    mf_chart_theme() +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
 }
 
 mf_plot_superiority <- function(result) {
   d <- result$superiority
   other <- setdiff(result$factors, "A")
-  d$Context <- apply(d[other], 1, function(x) paste(x, collapse = " × "))
+  d$Context <- apply(d[other], 1, function(x) paste(x, collapse = " \u00d7 "))
   d$Label <- ifelse(is.finite(d$Superiority_pct), sprintf("%+.1f%%", d$Superiority_pct), "")
   limit <- max(abs(d$Superiority_pct), na.rm = TRUE)
   if (!is.finite(limit) || limit < 1) limit <- 1
   ggplot2::ggplot(d, ggplot2::aes(x = Context, y = A, fill = Superiority_pct)) +
     ggplot2::geom_tile(color = "white", linewidth = 0.5, na.rm = TRUE) +
-    ggplot2::geom_text(ggplot2::aes(label = Label), color = "gray15", size = 3) +
+    ggplot2::geom_text(ggplot2::aes(label = Label), color = "gray15", size = 4.5) +
     ggplot2::scale_fill_gradient2(low = "#E74C3C", mid = "white", high = "#2ECC71",
                                   midpoint = 0, limits = c(-limit, limit), na.value = "gray90") +
-    ggplot2::labs(title = "Superiority versus checks", x = paste(other, collapse = " × "),
+    ggplot2::labs(title = "Superiority versus checks", x = paste(other, collapse = " \u00d7 "),
                   y = result$factor_names[1], fill = "Advantage (%)") +
-    ggplot2::theme_bw() +
+    mf_chart_theme() +
     ggplot2::theme(panel.grid = ggplot2::element_blank(),
                    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
 }
@@ -440,8 +552,8 @@ mf_plot_interaction <- function(result) {
   d <- result$summary
   effect <- paste(result$factors, collapse = ":")
   labels <- result$effect_comparison
-  labels <- labels[labels$Effect == effect & labels$Row_type == "Level", c("Level", "Group"), drop = FALSE]
-  d$Level <- apply(d[result$factors], 1, function(x) paste(x, collapse = " × "))
+  labels <- labels[labels$Effect == effect & !is.na(labels$N), c("Level", "Group"), drop = FALSE]
+  d$Level <- apply(d[result$factors], 1, function(x) paste(x, collapse = " \u00d7 "))
   d <- dplyr::left_join(d, labels, by = "Level")
   gap <- max(diff(range(c(d$Raw_mean - d$Raw_SE, d$Raw_mean + d$Raw_SE), na.rm = TRUE)) * 0.04, 0.03)
   dodge <- ggplot2::position_dodge(width = 0.8)
@@ -451,11 +563,11 @@ mf_plot_interaction <- function(result) {
                                        ymax = Raw_mean + Raw_SE),
                             position = dodge, width = 0.14, na.rm = TRUE) +
     ggplot2::geom_text(ggplot2::aes(y = Raw_mean + Raw_SE + gap, label = Group),
-                       position = dodge, fontface = "bold", na.rm = TRUE) +
+                       position = dodge, fontface = "bold", size = 5, na.rm = TRUE) +
     {if ("C" %in% result$factors) ggplot2::facet_wrap(~ C) else NULL} +
-    ggplot2::scale_fill_manual(values = rep(c("#3498DB", "#2ECC71", "#E74C3C"), length.out = length(unique(d$B)))) +
+    ggplot2::scale_fill_manual(values = mf_chart_palette(levels(d$B))) +
     ggplot2::labs(title = "Factor interaction", x = result$factor_names[1],
-                  y = paste(result$response, "raw mean ± SE"), fill = result$factor_names[2],
+                  y = paste(result$response, "raw mean \u00b1 SE"), fill = result$factor_names[2],
                   subtitle = "Letters from adjusted interaction comparisons when the interaction is significant") +
-    ggplot2::theme_bw()
+    mf_chart_theme()
 }

@@ -32,10 +32,48 @@ cell summaries, Type III ANOVA, estimated marginal means with comparison
 letters, pairwise contrasts, and superiority against checks within levels of
 the other factors. Results compare every main effect and interaction, showing
 raw mean ± SD and model-based letters when the matching ANOVA term is
-significant. CV and per-pair LSD/Tukey thresholds are reported. Heritability
-is left unestimated until a genotype variance model is specified. Charts use
-bars for mean comparisons and interactions and a heatmap for superiority.
+significant. CV and per-pair LSD/Tukey thresholds are reported. Compact letters
+start with `a` at the preferred adjusted mean, using the last DIRECTION metadata
+row by default and the Results performance selector as an explicit override.
+The selector displays only Higher better / Lower better, initialized from that
+trait's metadata. Manual overrides are retained per trait and reset on upload.
+The same direction applies to all effects, within-factor comparisons, charts,
+and exports. Omnibus p-values remain in ANOVA rather than the mean table.
+
+`mf_heritability()` estimates generalized broad-sense Cullis H² for Factor A,
+assuming A contains genotypes. A separate REML model makes A and its interactions
+random, keeps the remaining treatment effects fixed, and includes the design's
+block/whole-plot/subplot random terms. The inverse joint mixed-model equations
+provide the mean prediction-error variance of genotype differences, including
+fixed-effect uncertainty; H² = 1 - mean PEV difference / (2 * genetic variance).
+Zero genetic variance, convergence failures, and unidentifiable fits produce an
+explicit unavailable value and a Summary note. Boundary nuisance components
+are retained with a note. See the [genotype-difference heritability formulation](https://pmc.ncbi.nlm.nih.gov/articles/PMC6707473/).
+The estimate is cached and exported in the Factor A mean-comparison footer;
+assumptions and warnings are exported in Notes. B/C and interaction effects are
+not labeled as genetic heritability.
+
+Charts use bars for mean comparisons and interactions and a heatmap for superiority.
+Mean-comparison chart selectors independently choose one factor (A/B/C), a
+two-factor interaction (A:B/A:C/B:C), or the three-factor interaction (A:B:C),
+using uploaded column names as labels. The preview and chart download use the
+same selection, without changing the Results effect filter.
+The Charts menu exposes Superiority and Mean comparison; interaction choices
+live within Mean comparison rather than a separate Factor interaction entry.
 Tables and charts follow the existing saved-result and workbook-export flow.
+
+Multi-factor analysis accepts multiple response traits through `mf_run_traits()`.
+The result retains the first trait's fields for compatibility and stores each
+successful fit in `results_by_trait`; failed traits are named in Summary notes.
+Results and Charts have independent trait selectors. Comparison effect,
+direction, and method controls are visible only in the Mean comparison Results
+view. Full workbook downloads combine all selected traits with a `Trait` column;
+individual-view downloads use the currently displayed trait. The ANOVA table
+includes computed mean squares and significance codes. Mixed-model residual
+rows report REML variance without inventing classical residual SS or df.
+Charts use a shared larger type scale and a fixed categorical palette for levels.
+Results and Charts place the trait and contextual selectors in one compact,
+full-width stack with consistent margins and no nested panel indentation.
 
 ## 2. Request/response flow (one analysis run)
 
