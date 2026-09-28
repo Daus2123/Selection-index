@@ -36,15 +36,17 @@ stopifnot(
   nrow(rcbd$summary) == 3,
   nrow(rcbd$combined) == 6,
   identical(names(rcbd$means), names(rcbd$summary)),
+  identical(names(rcbd$means), c("ID", "Original_ID", "Yield", "Yield Group", "Score", "Score Group")),
   grepl(" \u00b1 ", rcbd$means$Yield[1]),
   grepl("\u00b1", rcbd$means$Score[1]),
   rcbd$summary$Yield[1] == "7.90%",
   rcbd$summary$Yield[2] == "0.680",
   is.finite(as.numeric(rcbd$summary$Yield[3])),
   grepl("^p=0.01 \\(KW; Dunn: [1-9]", rcbd$summary$Score[3]),
-  any(grepl("[[:alpha:]]$", rcbd$means$Score)),
-  grepl(sprintf("%.3f", mean(trial$Yield[trial$ID == "1"])), rcbd$means$Yield[1], fixed = TRUE),
-  grepl(sprintf("%.3f", stats::sd(trial$Yield[trial$ID == "1"]) / 2), rcbd$means$Yield[1], fixed = TRUE)
+  any(nzchar(rcbd$means$`Score Group`)),
+  rcbd$means$Yield[1] == sprintf("%.2f \u00b1 %.2f", mean(trial$Yield[trial$ID == "1"]), stats::sd(trial$Yield[trial$ID == "1"]) / 2),
+  all(rcbd$summary$`Yield Group` == ""),
+  all(rcbd$summary$`Score Group` == "")
 )
 
 tukey <- si_lpsi_mean_comparison_view(make_result(trial), "tukey")
@@ -57,7 +59,7 @@ crd <- si_lpsi_mean_comparison_view(make_result(trial, "CRD"), "lsd")
 stopifnot(grepl(" \u00b1 ", crd$means$Yield[1]))
 
 sd_view <- si_lpsi_mean_comparison_view(make_result(trial), "lsd", "sd")
-stopifnot(grepl(sprintf("%.3f", stats::sd(trial$Yield[trial$ID == "1"])), sd_view$means$Yield[1], fixed = TRUE))
+stopifnot(grepl(sprintf("%.2f", stats::sd(trial$Yield[trial$ID == "1"])), sd_view$means$Yield[1], fixed = TRUE))
 
 unbalanced <- trial[!(trial$ID == "3" & trial$Rep == "4"), , drop = FALSE]
 unequal <- si_lpsi_mean_comparison_view(make_result(unbalanced), "lsd")
@@ -70,8 +72,18 @@ nonsignificant <- make_result(trial)
 nonsignificant$anova_full$p_value[2] <- 0.50
 blank_letters <- si_lpsi_mean_comparison_view(nonsignificant, "lsd")
 stopifnot(
-  blank_letters$summary$Score[3] == "p=0.5 (KW; Dunn not run)",
-  !grepl("[[:alpha:]]$", blank_letters$means$Score[1])
+  blank_letters$summary$Score[3] == "",
+  !nzchar(blank_letters$means$`Score Group`[1])
+)
+
+nonsignificant$anova_full$p_value[1] <- 0.50
+blank_lsd <- si_lpsi_mean_comparison_view(nonsignificant, "lsd")
+blank_tukey <- si_lpsi_mean_comparison_view(nonsignificant, "tukey")
+stopifnot(
+  blank_lsd$summary$Yield[3] == "",
+  blank_tukey$summary$Yield[3] == "",
+  blank_tukey$summary$Score[3] == "",
+  all(blank_lsd$means$`Yield Group` == "")
 )
 
 flat <- trial
@@ -79,7 +91,7 @@ flat$Score <- rep(1:4, each = 3)
 no_pairwise_difference <- si_lpsi_mean_comparison_view(make_result(flat), "lsd")
 stopifnot(
   grepl("^p=0.01 \\(KW; Dunn: no significant pairs\\)$", no_pairwise_difference$summary$Score[3]),
-  !any(grepl("[[:alpha:]]$", no_pairwise_difference$means$Score))
+  !any(nzchar(no_pairwise_difference$means$`Score Group`))
 )
 
 footer <- htmltools::tags$tfoot(lapply(seq_len(nrow(rcbd$summary)), function(i) {
@@ -99,7 +111,8 @@ stopifnot(
   nrow(exported) == 6,
   identical(exported$Original_ID[4:6], rcbd$summary$Original_ID),
   grepl("^p=0.01 \\(KW; Dunn:", exported$Score[6]),
-  grepl("\u00b1", exported$Yield[1])
+  grepl("\u00b1", exported$Yield[1]),
+  identical(exported$`Score Group`[1:3], rcbd$means$`Score Group`)
 )
 
 plot_result <- make_result(trial)

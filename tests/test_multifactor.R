@@ -61,6 +61,25 @@ lsd_fit <- run_multifactor_pipeline(two, "Y", c("A", "B"), "factorial", "RCBD",
                                     "ANOVA", "Rep", "A", "check",
                                     comparison_method = "lsd")
 stopifnot(all(is.finite(lsd_fit$pairwise$Critical_difference)))
+mean_rows <- lsd_fit$effect_comparison[!is.na(lsd_fit$effect_comparison$N), ]
+stopifnot(
+  all(grepl("^-?[0-9]+\\.[0-9]{2} \u00b1 [0-9]+\\.[0-9]{2}$", mean_rows$Raw_mean_SD)),
+  all(grepl("^-?[0-9]+\\.[0-9]{2} \u00b1 [0-9]+\\.[0-9]{2}$", lsd_fit$mean_comparison$Adjusted_mean_SE))
+)
+non_significant_anova <- lsd_fit$anova
+non_significant_anova$p_value[non_significant_anova$Source == "B"] <- 0.50
+for (method in c("lsd", "tukey")) {
+  comparisons <- mf_effect_comparisons(lsd_fit$model, lsd_fit$analysis_data,
+    lsd_fit$factors, non_significant_anova, method, heritability = lsd_fit$heritability)
+  method_label <- if (method == "lsd") "LSD (0.05)" else "Tukey HSD (0.05)"
+  footer <- comparisons$means[comparisons$means$Level == method_label, ]
+  stopifnot(
+    footer$Raw_mean_SD[footer$Effect == "B"] == "",
+    nzchar(footer$Raw_mean_SD[footer$Effect == "A"]),
+    grepl("^[0-9]+\\.[0-9]{2}$", footer$Raw_mean_SD[footer$Effect == "A"]),
+    all(comparisons$means$Group[comparisons$means$Effect == "B"] == "")
+  )
+}
 for (method in c("lsd", "tukey")) {
   for (direction in c("Higher better", "Lower better")) {
     refreshed <- mf_refresh_result(lsd_fit, method, direction)
@@ -106,6 +125,8 @@ suppressMessages(invisible(source("app.R", local = app_env)))
 export <- app_env$build_export_tables("MULTIFACTOR", fit)
 stopifnot(length(export) == 7L,
           !any(c("Omnibus_p", "Row_type") %in% names(export$`03_mean_comparison`)),
+          all(vapply(export$`03_mean_comparison`[c("Raw_mean", "Raw_SD", "Adjusted_mean", "Adjusted_SE")],
+            function(x) all(is.na(x) | x == round(x, 2)), logical(1))),
           any(grepl("%", export$`03_mean_comparison`$Raw_mean_SD[
             export$`03_mean_comparison`$Effect == "A" &
               grepl("Heritability", export$`03_mean_comparison`$Level)])),

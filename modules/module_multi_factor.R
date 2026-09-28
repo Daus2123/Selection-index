@@ -195,7 +195,7 @@ mf_comparison_tables <- function(model, factors, comparison_factor, method,
   names(means)[names(means) == "emmean"] <- "Adjusted_mean"
   names(means)[names(means) == "lower.CL"] <- "Lower_95_CI"
   names(means)[names(means) == "upper.CL"] <- "Upper_95_CI"
-  means$Adjusted_mean_SE <- sprintf("%.3f \u00b1 %.3f", means$Adjusted_mean, means$SE)
+  means$Adjusted_mean_SE <- sprintf("%.2f \u00b1 %.2f", means$Adjusted_mean, means$SE)
   first <- c(group_cols, "Adjusted_mean_SE", "Group")
   means <- means[, c(first, setdiff(names(means), first)), drop = FALSE]
   pairwise <- as.data.frame(summary(pairs(
@@ -244,7 +244,7 @@ mf_effect_comparisons <- function(model, data, factors, anova, method,
     level <- apply(adjusted[columns], 1, function(x) paste(x, collapse = " \u00d7 "))
     means <- data.frame(
       Effect = effect, Level = level,
-      Raw_mean_SD = sprintf("%.3f \u00b1 %.3f", adjusted$Raw_mean, adjusted$Raw_SD),
+      Raw_mean_SD = sprintf("%.2f \u00b1 %.2f", adjusted$Raw_mean, adjusted$Raw_SD),
       Group = adjusted$Group, N = adjusted$N,
       Raw_mean = adjusted$Raw_mean, Raw_SD = adjusted$Raw_SD,
       Adjusted_mean = adjusted$emmean, Adjusted_SE = adjusted$SE,
@@ -262,8 +262,8 @@ mf_effect_comparisons <- function(model, data, factors, anova, method,
     }
     contrast$Significant_0.05 <- is.finite(contrast$Adjusted_p_value) & contrast$Adjusted_p_value < 0.05
     critical <- contrast$Critical_difference[is.finite(contrast$Critical_difference)]
-    critical_label <- if (!length(critical)) "Not estimable" else if (diff(range(critical)) < 1e-6) {
-      sprintf("%.3f", critical[1])
+    critical_label <- if (!is.finite(p) || p >= 0.05) "" else if (!length(critical)) "Not estimable" else if (diff(range(critical)) < 1e-6) {
+      sprintf("%.2f", critical[1])
     } else "Varies by pair; see pairwise table"
     cv <- 100 * stats::sigma(model) / abs(mean(data$Y))
     footer <- data.frame(
@@ -493,6 +493,12 @@ mf_selected_effect_table <- function(result, field) {
   table <- result[[field]]
   effect <- if (is.null(result$selected_effect)) "All effects" else result$selected_effect
   if (!identical(effect, "All effects")) table <- table[table$Effect == effect, , drop = FALSE]
+  table
+}
+
+mf_round_effect_means <- function(table) {
+  columns <- intersect(c("Raw_mean", "Raw_SD", "Adjusted_mean", "Adjusted_SE"), names(table))
+  for (column in columns) table[[column]] <- round(table[[column]], 2)
   table
 }
 

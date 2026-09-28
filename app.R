@@ -234,7 +234,7 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("00", "settings", results$settings)
     add_sheet("01", "summary", results$summary)
     add_sheet("02", "anova", results$anova)
-    add_sheet("03", "mean_comparison", results$effect_comparison)
+    add_sheet("03", "mean_comparison", mf_round_effect_means(results$effect_comparison))
     add_sheet("04", "pairwise", results$effect_pairwise)
     add_sheet("05", "superiority", results$superiority)
     add_sheet("06", "notes", results$notes)
@@ -424,12 +424,11 @@ fit_single_location_model <- function(data, trait, model_type = "RCBD") {
 si_lpsi_format_raw_mean <- function(summaries, spread = "se") {
   spread <- match.arg(spread, c("se", "sd"))
   variation <- if (identical(spread, "sd")) summaries$SD else summaries$SE
-  value <- ifelse(
+  ifelse(
     is.finite(variation),
-    sprintf("%.3f \u00b1 %.3f", summaries$Mean, variation),
-    sprintf("%.3f (%s unavailable)", summaries$Mean, toupper(spread))
+    sprintf("%.2f \u00b1 %.2f", summaries$Mean, variation),
+    sprintf("%.2f (%s unavailable)", summaries$Mean, toupper(spread))
   )
-  trimws(paste(value, ifelse(is.na(summaries$Group), "", summaries$Group)))
 }
 
 si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se") {
@@ -455,6 +454,7 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
     ]
     test <- if (nrow(test_row) > 0) as.character(test_row$Test[1]) else "Failed"
     p_value <- if (nrow(test_row) > 0) suppressWarnings(as.numeric(test_row$p_value[1])) else NA_real_
+    significant <- is.finite(p_value) && p_value < lsd_significance_alpha
     gain_row <- gain[as.character(gain$Trait) == trait, , drop = FALSE]
     cv <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$CV_pct[1])) else NA_real_
     h2 <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$Broad_sense_H2[1])) else NA_real_
@@ -466,7 +466,7 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
     } else {
       paste0("p=", format(signif(p_value, 3), scientific = FALSE, trim = TRUE))
     }
-    means <- data.frame(ID = character(0), Value = character(0))
+    means <- data.frame(ID = character(0), Value = character(0), Group = character(0))
 
     raw_means <- trait_rows %>%
       mutate(ID = as.character(ID)) %>%
@@ -481,14 +481,12 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
 
     if (identical(test, "Kruskal-Wallis") && nrow(trait_rows) > 0) {
       raw_means$Group <- ""
-      critical_difference <- if (is.finite(p_value) && p_value < lsd_significance_alpha) {
+      critical_difference <- if (significant) {
         paste0(p_label, " (KW; Dunn unavailable)")
-      } else if (is.finite(p_value)) {
-        paste0(p_label, " (KW; Dunn not run)")
       } else {
-        "p unavailable (KW; Dunn not run)"
+        ""
       }
-      if (is.finite(p_value) && p_value < lsd_significance_alpha && nrow(raw_means) > 1) {
+      if (significant && nrow(raw_means) > 1) {
         dunn <- tryCatch(
           dunn_holm_test(trait_rows, trait, "ID", lsd_significance_alpha),
           error = function(e) NULL
@@ -507,7 +505,8 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
       }
       means <- data.frame(
         ID = raw_means$ID,
-        Value = si_lpsi_format_raw_mean(raw_means, spread)
+        Value = si_lpsi_format_raw_mean(raw_means, spread),
+        Group = raw_means$Group
       )
     } else if (identical(test, "ANOVA") && nrow(trait_rows) > 0) {
       model_view <- tryCatch({
@@ -516,7 +515,7 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
         estimates <- as.data.frame(em)
         estimates$ID <- as.character(estimates$ID)
         estimates$Group <- ""
-        if (is.finite(p_value) && p_value < lsd_significance_alpha &&
+        if (significant &&
             nrow(estimates) > 1 && df.residual(model) > 0) {
           higher_better <- as.character(trait_info$Direction[trait_info$Trait == trait][1]) == "Higher better"
           letters_table <- as.data.frame(multcomp::cld(
@@ -551,26 +550,31 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
         raw_means$Group <- estimates$Group[match(raw_means$ID, estimates$ID)]
         means <- data.frame(
           ID = raw_means$ID,
-          Value = si_lpsi_format_raw_mean(raw_means, spread)
+          Value = si_lpsi_format_raw_mean(raw_means, spread),
+          Group = raw_means$Group
         )
-        critical_difference <- model_view$critical
+        critical_difference <- if (significant) model_view$critical else ""
       } else {
         raw_means$Group <- ""
-        means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread))
-        critical_difference <- "Model comparison unavailable"
+        means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread), Group = raw_means$Group)
+        critical_difference <- if (significant) "Model comparison unavailable" else ""
       }
     } else if (nrow(trait_rows) > 0) {
       raw_means$Group <- ""
-      means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread))
+      means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread), Group = raw_means$Group)
     }
 
     value_columns[[trait]] <- means$Value[match(id_lookup$ID, means$ID)]
     value_columns[[trait]][is.na(value_columns[[trait]])] <- "Not available"
+    group_column <- paste0(trait, " Group")
+    value_columns[[group_column]] <- means$Group[match(id_lookup$ID, means$ID)]
+    value_columns[[group_column]][is.na(value_columns[[group_column]])] <- ""
     summary_columns[[trait]] <- c(
       if (is.finite(cv)) sprintf("%.2f%%", cv) else "Not available",
       if (is.finite(h2)) sprintf("%.3f", h2) else "Not estimated",
       critical_difference
     )
+    summary_columns[[group_column]] <- rep("", 3)
   }
 
   means_table <- data.frame(id_lookup, value_columns, check.names = FALSE)
@@ -4824,7 +4828,7 @@ server <- function(input, output, session) {
       mf_summary = list(list(Settings = multifactor_result()$settings, Summary = multifactor_result()$summary,
                              Notes = multifactor_result()$notes), "Multi-factor_summary"),
       mf_anova = list(list(ANOVA = multifactor_result()$anova), "Multi-factor_ANOVA"),
-      mf_means = list(list(Mean_comparison = mf_selected_effect_table(multifactor_result(), "effect_comparison"),
+      mf_means = list(list(Mean_comparison = mf_round_effect_means(mf_selected_effect_table(multifactor_result(), "effect_comparison")),
                            Pairwise = mf_selected_effect_table(multifactor_result(), "effect_pairwise")), "Multi-factor_mean_comparison"),
       mf_superiority = list(list(Superiority = multifactor_result()$superiority), "Multi-factor_superiority"),
       lpsi_trait = list(list(Trait_summary = lpsi_result()$trait_info), "Single-Location_Trial_trait_summary"),
@@ -6781,7 +6785,12 @@ server <- function(input, output, session) {
       options = list(pageLength = 10, ordering = FALSE, scrollX = TRUE), rownames = FALSE) %>%
       formatRound(c("Sum_Sq", "Mean_Sq", "F_value"), digits = 3)
   })
-  output$mf_means_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_comparison"), options = list(pageLength = 50, ordering = FALSE, scrollX = TRUE), rownames = FALSE) })
+  output$mf_means_table <- renderDT({
+    datatable(
+      mf_selected_effect_table(multifactor_result(), "effect_comparison"),
+      options = list(pageLength = 50, ordering = FALSE, scrollX = TRUE), rownames = FALSE
+    ) %>% formatRound(c("Raw_mean", "Raw_SD", "Adjusted_mean", "Adjusted_SE"), digits = 2)
+  })
   output$mf_pairwise_table <- renderDT({ datatable(mf_selected_effect_table(multifactor_result(), "effect_pairwise"), options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
   output$mf_superiority_table <- renderDT({ datatable(multifactor_result()$superiority, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
   output$mf_superiority_plot <- renderPlot({ print(mf_plot_superiority(multifactor_chart_result())) })
