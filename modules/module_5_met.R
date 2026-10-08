@@ -3130,7 +3130,7 @@ met_gge_chart_choices <- function() {
 met_fw_chart_choices <- function() {
   c(
     "Mean vs Sensitivity" = "mean_sensitivity",
-    "Response by Environment" = "response_correlation"
+    "FW Regression" = "response_correlation"
   )
 }
 met_fw_selected_view <- function(input_value) {
@@ -4413,26 +4413,15 @@ run_met_pipeline <- function(
     ) %>%
     arrange(desc(Favorable_GenMean))
   p_fw_mean_sens <- ggplot(FW_results, aes(x = GenMean, y = Sens, color = b_interp, label = Genotype)) + geom_point(size = 3) + geom_text(vjust = -0.8, size = 3) + geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + scale_color_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71")) + labs(title = "Finlay-Wilkinson: mean vs sensitivity", subtitle = paste0("Decision direction: ", trait_direction), x = paste("Genotype", estimate_label, "mean"), y = "Sensitivity (b)", color = "Stability") + theme_bw()
-  fw_environment_means <- FW_dat_loo %>%
-    group_by(Environment) %>%
-    summarise(Environment_mean = mean(BLUP_env, na.rm = TRUE), .groups = "drop") %>%
-    arrange(Environment_mean, Environment)
-  fw_environment_levels <- as.character(fw_environment_means$Environment)
-  fw_response_data <- FW_dat_loo %>%
-    mutate(Environment = factor(Environment, levels = fw_environment_levels))
-  fw_environment_labels <- stats::setNames(
-    paste0(fw_environment_levels, "\nMean: ", sprintf("%.2f", fw_environment_means$Environment_mean)),
-    fw_environment_levels
-  )
-  p_fw_regression <- ggplot(fw_response_data, aes(x = Environment, y = BLUP_env, color = Genotype, group = Genotype)) +
-    geom_line(color = "gray70", linewidth = 0.8, na.rm = TRUE) +
+  # Use the same numeric leave-one-out index and linear model as FW_results.
+  p_fw_regression <- ggplot(FW_dat_loo, aes(x = EnvIndex, y = BLUP_env, color = Genotype, group = Genotype)) +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.8, na.rm = TRUE) +
     geom_point(size = 3.5, na.rm = TRUE) +
-    scale_x_discrete(labels = fw_environment_labels, drop = FALSE) +
     labs(
-      title = paste0("Finlay-Wilkinson response by environment - ", trait_used),
-      subtitle = paste0("Points and environment means: ", estimate_label, ". Lines connect each genotype."),
-      caption = "FW sensitivity uses the leave-one-out environmental index. Environments are ordered by their mean.",
-      x = "Environment",
+      title = paste0("Finlay-Wilkinson regression - ", trait_used),
+      subtitle = paste0("Points: environment-specific ", estimate_label, ". Lines: fitted FW regressions."),
+      caption = "Environmental index = mean estimate of all other genotypes in each environment. Line slopes match FW sensitivity (b).",
+      x = "Environmental index (mean of other genotypes)",
       y = paste0(estimate_label, " for ", trait_used),
       color = "Genotype"
     ) +

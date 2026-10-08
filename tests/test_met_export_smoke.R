@@ -33,17 +33,21 @@ for (model_type in c("LMM", "ANOVA_RCBD", "SOMMER")) {
     length(build_export_tables("MET", result)) > 0
   )
   chart <- trait_result$p_fw_regression
-  stopifnot(identical(chart$labels$x, "Environment"),
-            setequal(levels(chart$data$Environment), unique(trial$Environment)))
+  stopifnot(identical(chart$labels$x, "Environmental index (mean of other genotypes)"),
+            setequal(unique(as.character(chart$data$Environment)), unique(trial$Environment)))
   built <- ggplot2::ggplot_build(chart)
-  tick_labels <- built$layout$panel_params[[1]]$x$get_labels()
-  stopifnot(all(grepl("Mean:", tick_labels, fixed = TRUE)),
-            nrow(built$data[[2]]) == 12,
+  stopifnot(nrow(built$data[[2]]) == 12,
             all(is.finite(built$data[[2]]$x)),
             all(is.finite(built$data[[2]]$y)))
-  for (env in levels(chart$data$Environment)) {
-    expected_mean <- mean(chart$data$BLUP_env[chart$data$Environment == env])
-    stopifnot(paste0(env, "\nMean: ", sprintf("%.2f", expected_mean)) %in% tick_labels)
+  for (point_group in unique(built$data[[2]]$group)) {
+    points <- built$data[[2]][built$data[[2]]$group == point_group, ]
+    line <- built$data[[1]][built$data[[1]]$group == point_group, ]
+    genotype_levels <- sort(unique(as.character(chart$data$Genotype)))
+    genotype_colors <- built$plot$scales$get_scales("colour")$map(genotype_levels)
+    genotype <- genotype_levels[match(points$colour[1], genotype_colors)]
+    expected_slope <- trait_result$fw_results$Sens[trait_result$fw_results$Genotype == genotype]
+    plotted_slope <- (tail(line$y, 1) - line$y[1]) / (tail(line$x, 1) - line$x[1])
+    stopifnot(isTRUE(all.equal(unname(plotted_slope), unname(expected_slope), tolerance = 1e-7)))
   }
 }
 
