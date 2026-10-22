@@ -305,6 +305,13 @@ build_export_tables <- function(analysis_type, results) {
       add_sheet("09b_decision", "board", results$met_decision_board$board)
       add_sheet("09c_decision_rules", "thresholds", results$met_decision_board$thresholds)
     }
+    methods <- results$met_multitrait_methods
+    if (!is.null(methods)) {
+      add_sheet("09d", "MGIDI_distance", methods$mgidi)
+      for (field in names(methods$mgidi_fa)) {
+        add_sheet("09e_FA", field, methods$mgidi_fa[[field]])
+      }
+    }
     add_sheet("10", "pipeline_review", si_met_pipeline_review(results))
     add_sheet("11", "trait_quality", si_met_trait_quality(results))
   } else if (analysis_type == "DIVERSITY") {
@@ -3900,8 +3907,10 @@ ui <- page_navbar(
           class = "analysis-output-controls",
         panel_header("Results", "Grouped by analysis question"),
         uiOutput("result_sidebar_menu"),
+        conditionalPanel("input.result_module == 'met' && input.result_view == 'met_integrated'",
+          uiOutput("met_multi_method_control")),
         conditionalPanel(
-          "input.result_module == 'met' && (input.result_view == 'met_selection' || input.result_view == 'met_integrated')",
+          "input.result_module == 'met' && (input.result_view == 'met_selection' || (input.result_view == 'met_integrated' && (input.met_multi_result_method == null || input.met_multi_result_method == 'integrated')))",
           tags$div(
             class = "side-subpanel met-weight-panel",
             tags$div(class = "side-subpanel-title", "Weight"),
@@ -3940,7 +3949,7 @@ ui <- page_navbar(
           )
         ),
         conditionalPanel(
-          "input.result_module == 'met' && (input.result_view == 'met_decision_board' || (input.result_view == 'met_integrated' && input.met_multi_selection_view == 'mgidi'))",
+          "input.result_module == 'met' && (input.result_view == 'met_decision_board' || (input.result_view == 'met_integrated' && (input.met_multi_result_method == 'mgidi' || input.met_multi_result_method == 'mgidi_fa')))",
           tags$div(
             class = "side-subpanel met-selection-pct-panel",
             tags$div(class = "side-subpanel-title", "Selection intensity"),
@@ -4059,7 +4068,11 @@ ui <- page_navbar(
           DTOutput("met_gge_environment_table")
         ),
         conditionalPanel("input.result_view == 'met_selection'", DTOutput("met_selection_table")),
-        conditionalPanel("input.result_view == 'met_integrated'", DTOutput("met_integrated_table")),
+        conditionalPanel("input.result_view == 'met_integrated'", DTOutput("met_integrated_table"),
+          conditionalPanel("input.met_multi_result_method == 'mgidi_fa'",
+            tags$h5("FA calculation notes"), DTOutput("met_fa_notes"),
+            tags$h5("Factor loadings and communalities"), DTOutput("met_fa_loadings"),
+            tags$h5("Variance explained"), DTOutput("met_fa_variance"))),
         conditionalPanel(
           "input.result_view == 'met_decision_board'",
           tagList(
@@ -4481,15 +4494,22 @@ server <- function(input, output, session) {
     if (length(pct) == 0 || !is.finite(pct)) pct <- 20
     min(max(pct, 1), 100)
   })
+  weighted_met_methods <- reactive({
+    req(analysis_results(), uploaded_data())
+    validate(need(analysis_used() == "MET", "Run MET analysis first."))
+    build_met_multitrait_methods(uploaded_data(), analysis_results()$met_by_trait,
+      weighted_met_integrated()$ranking, selection_pct = met_selection_pct())
+  })
+  met_multi_selection_table <- reactive({
+    method <- input$met_multi_result_method %||% input$met_multi_selection_view %||% "integrated"
+    if (method == "mgidi") return(weighted_met_methods()$mgidi)
+    if (method == "mgidi_fa") return(weighted_met_methods()$mgidi_fa$ranking)
+    weighted_met_integrated()$ranking
+  })
   weighted_met_decision_board <- reactive({
     req(analysis_results(), uploaded_data())
     validate(need(analysis_used() == "MET", "Run MET analysis to view this result."))
-    methods <- build_met_multitrait_methods(
-      uploaded_data(),
-      analysis_results()$met_by_trait,
-      weighted_met_integrated()$ranking,
-      selection_pct = met_selection_pct()
-    )
+    methods <- weighted_met_methods()
     build_met_decision_board(
       uploaded_data(),
       analysis_results()$met_by_trait,
@@ -4760,16 +4780,11 @@ server <- function(input, output, session) {
     validate(need(analysis_used() == "MET", "Run MET analysis before downloading this chart."))
     if (view == "met_multi_selection_plot") {
       multi_view <- input$met_multi_selection_view %||% "integrated"
-      if (identical(multi_view, "mgidi")) {
-        methods <- build_met_multitrait_methods(
-          uploaded_data(),
-          analysis_results()$met_by_trait,
-          weighted_met_integrated()$ranking,
-          selection_pct = met_selection_pct()
-        )
+      if (multi_view %in% c("mgidi", "mgidi_fa")) {
+        methods <- weighted_met_methods()
         return(list(
-          plot = plot_met_mgidi_ranking(methods),
-          name = "MET_multi_selection_MGIDI"
+          plot = plot_met_mgidi_ranking(methods, use_fa = multi_view == "mgidi_fa"),
+          name = if (multi_view == "mgidi_fa") "MET_multi_selection_MGIDI_FA" else "MET_multi_selection_MGIDI"
         ))
       }
       return(list(
@@ -4903,7 +4918,7 @@ server <- function(input, output, session) {
           "MET_decision_board"
         )
       },
-      met_integrated = list(list(Integrated_selection = weighted_met_integrated()$ranking), "MET_integrated_selection"),
+      met_integrated = list(list(Selection = met_multi_selection_table()), "MET_multi_selection"),
       diversity_values = list(list(Genotypic_values = diversity_result()$genotype_values), "GDA_genotypic_values"),
       diversity_clusters = list(list(Clusters = diversity_result()$clusters), "GDA_clusters"),
       diversity_superiority = list(list(Superiority = diversity_superiority_result()), "GDA_superiority"),
@@ -5735,7 +5750,7 @@ server <- function(input, output, session) {
       ),
       met_multi_selection_plot = sidebar_detail_panel(
         "Multi Selection",
-        choices = c("Integrated Ranking" = "integrated", "MGIDI" = "mgidi"),
+        choices = c("Integrated Ranking" = "integrated", "MGIDI" = "mgidi", "MGIDI with FA" = "mgidi_fa"),
         input_id = "met_multi_selection_view",
         selected = input$met_multi_selection_view %||% "integrated",
         style = "slicer"
@@ -7355,14 +7370,22 @@ server <- function(input, output, session) {
   output$met_selection_table <- renderDT({
     datatable(weighted_met_selection_for_table(), options = list(pageLength = 50, scrollX = TRUE))
   })
+  output$met_multi_method_control <- renderUI({
+    selectInput("met_multi_result_method", "Multi Selection",
+      choices = c("Integrated Ranking" = "integrated", "MGIDI" = "mgidi", "MGIDI with FA" = "mgidi_fa"),
+      selected = isolate(input$met_multi_result_method) %||% "integrated")
+  })
   output$met_integrated_table <- renderDT({
     req(analysis_results())
     validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
     datatable(
-      weighted_met_integrated()$ranking,
+      met_multi_selection_table(),
       options = list(pageLength = 50, scrollX = TRUE)
     )
   })
+  output$met_fa_notes <- renderDT({ datatable(weighted_met_methods()$mgidi_fa$notes, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
+  output$met_fa_loadings <- renderDT({ datatable(weighted_met_methods()$mgidi_fa$loadings, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
+  output$met_fa_variance <- renderDT({ datatable(weighted_met_methods()$mgidi_fa$variance, options = list(dom = "t", scrollX = TRUE), rownames = FALSE) })
   output$met_decision_board_table <- renderDT({
     req(analysis_results())
     validate(need(analysis_used() == "MET", "Run MET analysis to view this table."))
@@ -7433,14 +7456,9 @@ server <- function(input, output, session) {
       "Run MET analysis to view this plot."
     ))
     method <- input$met_multi_selection_view %||% "integrated"
-    if (identical(method, "mgidi")) {
-      methods <- build_met_multitrait_methods(
-        uploaded_data(),
-        analysis_results()$met_by_trait,
-        weighted_met_integrated()$ranking,
-        selection_pct = met_selection_pct()
-      )
-      print(plot_met_mgidi_ranking(methods))
+    if (method %in% c("mgidi", "mgidi_fa")) {
+      methods <- weighted_met_methods()
+      print(plot_met_mgidi_ranking(methods, use_fa = method == "mgidi_fa"))
     } else {
       print(weighted_met_integrated()$plot)
     }
@@ -7614,6 +7632,7 @@ server <- function(input, output, session) {
         result$met_integrated_trait_weights <- integrated$trait_weights
         result$met_integrated_adjusted <- integrated$adjusted_performance
         result$met_integrated_standardized <- integrated$standardized_scores
+        result$met_multitrait_methods <- weighted_met_methods()
         result$met_decision_board <- weighted_met_decision_board()
         result
       } else {
@@ -7681,6 +7700,7 @@ server <- function(input, output, session) {
           result$met_integrated_trait_weights <- integrated$trait_weights
           result$met_integrated_adjusted <- integrated$adjusted_performance
           result$met_integrated_standardized <- integrated$standardized_scores
+          result$met_multitrait_methods <- weighted_met_methods()
           result$met_decision_board <- weighted_met_decision_board()
         }
         if (analysis_type == "DIVERSITY") {
