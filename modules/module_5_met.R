@@ -127,7 +127,7 @@ si_met_pipeline_review <- function(results) {
   stability <- suppressWarnings(as.numeric(successful$Stability_ratio))
   low_conf <- sum(grepl("Single-environment genotypes", successful$Notes, ignore.case = TRUE), na.rm = TRUE)
 
-  data.frame(
+  review <- data.frame(
     Module = "MET",
     Check = c(
       "Trait model coverage",
@@ -152,6 +152,13 @@ si_met_pipeline_review <- function(results) {
     ),
     stringsAsFactors = FALSE
   )
+  fa_notes <- results$met_multitrait_methods$mgidi_fa$notes
+  if (!is.null(fa_notes) && nrow(fa_notes) > 0) {
+    review <- rbind(review, data.frame(Module = "MET", Check = "MGIDI with FA",
+      Result = as.character(fa_notes$Note),
+      Why_this_matters = "FA availability, trait coverage and interpretation.", stringsAsFactors = FALSE))
+  }
+  review
 }
 
 si_met_recommendation_table <- function(integrated_ranking, top_n = 20) {
@@ -637,6 +644,72 @@ run_met_multitrait_extensions <- function(df_raw, trait_cols, replication_col, s
   )
 }
 
+# Published factor-analysis MGIDI on the selected MET model estimates.
+# Trait directions/targets are applied before metan rescales to 0-100.
+met_mgidi_fa <- function(matrix_info, selection_pct = 20) {
+  notes <- c("FA MGIDI uses equal trait importance; workbook weights and Mean/FW/ASV sliders do not apply.")
+  ranking <- data.frame(Genotype = as.character(matrix_info$adjusted_wide$Genotype),
+    MGIDI_distance = rep(NA_real_, nrow(matrix_info$adjusted_wide)),
+    MGIDI_rank = rep(NA_real_, nrow(matrix_info$adjusted_wide)),
+    Selected = rep(FALSE, nrow(matrix_info$adjusted_wide)),
+    MGIDI_source = rep("metan::mgidi factor analysis", nrow(matrix_info$adjusted_wide)), stringsAsFactors = FALSE)
+  finish <- function(status) list(ranking = ranking, loadings = data.frame(),
+    variance = data.frame(), scores = data.frame(), ideotype = data.frame(),
+    contributions = data.frame(), notes = data.frame(Status = status, Note = unique(notes)))
+  if (!requireNamespace("metan", quietly = TRUE)) {
+    notes <- c(notes, "Install the metan package to calculate MGIDI with FA.")
+    return(finish("Not available"))
+  }
+  traits <- matrix_info$traits
+  if (length(traits) < 2 || nrow(ranking) < 3) {
+    notes <- c(notes, "FA MGIDI needs at least two traits and three genotypes.")
+    return(finish("Not available"))
+  }
+  values <- as.matrix(matrix_info$adjusted_wide[, traits, drop = FALSE])
+  usable <- apply(values, 2, function(x) sum(is.finite(x)) >= 2 && stats::sd(x[is.finite(x)]) > 0)
+  if (any(!usable)) notes <- c(notes, paste("Excluded constant or unusable traits:", paste(traits[!usable], collapse = ", ")))
+  traits <- traits[usable]
+  values <- values[, usable, drop = FALSE]
+  complete <- if (ncol(values)) apply(values, 1, function(x) all(is.finite(x))) else rep(FALSE, nrow(values))
+  if (any(!complete)) notes <- c(notes, paste("Unranked genotypes with incomplete retained-trait estimates:",
+    paste(ranking$Genotype[!complete], collapse = ", ")))
+  if (length(traits) < 2 || sum(complete) < 3 ||
+      any(apply(values[complete, , drop = FALSE], 2, stats::sd) == 0)) {
+    notes <- c(notes, "Insufficient complete, varying trait estimates for FA; no fallback ranking was substituted.")
+    return(finish("Not available"))
+  }
+  if (sum(complete) <= length(traits)) notes <- c(notes,
+    "Genotype count is no greater than trait count; the correlation matrix is rank deficient. Interpret FA cautiously.")
+  input <- data.frame(Genotype = ranking$Genotype[complete], values[complete, , drop = FALSE], check.names = FALSE)
+  fit <- tryCatch(withCallingHandlers(
+    metan::mgidi(input, ideotype = rep("h", length(traits)), SI = 100, verbose = FALSE),
+    warning = function(w) { notes <<- c(notes, conditionMessage(w)); invokeRestart("muffleWarning") }),
+    error = function(e) { notes <<- c(notes, paste("FA MGIDI failed:", conditionMessage(e))); NULL })
+  if (is.null(fit)) return(finish("Not available"))
+  if (!nrow(fit$MGIDI) || any(!is.finite(fit$MGIDI$MGIDI))) {
+    notes <- c(notes, "FA returned no usable distances; no fallback ranking was substituted.")
+    return(finish("Not available"))
+  }
+  idx <- match(ranking$Genotype, as.character(fit$MGIDI$Genotype))
+  ranking$MGIDI_distance <- fit$MGIDI$MGIDI[idx]
+  ranking$MGIDI_rank <- rank(ranking$MGIDI_distance, ties.method = "average", na.last = "keep")
+  pct <- suppressWarnings(as.numeric(selection_pct)[1])
+  if (!is.finite(pct)) pct <- 20
+  n_selected <- max(1, ceiling(sum(complete) * min(max(pct, 1), 100) / 100))
+  ordered <- order(ranking$MGIDI_distance, ranking$Genotype, na.last = NA)
+  cutoff <- ranking$MGIDI_distance[ordered[min(n_selected, length(ordered))]]
+  ranking$Selected <- is.finite(ranking$MGIDI_distance) & ranking$MGIDI_distance <= cutoff
+  ranking <- ranking[order(ranking$MGIDI_rank, ranking$Genotype, na.last = TRUE), , drop = FALSE]
+  out <- finish("OK")
+  out$loadings <- as.data.frame(fit$FA)
+  out$variance <- as.data.frame(fit$PCA)
+  out$variance$Retained <- out$variance$Eigenvalues >= 1
+  out$scores <- as.data.frame(fit$scores_gen)
+  out$ideotype <- as.data.frame(fit$scores_ide)
+  out$contributions <- as.data.frame(fit$contri_fac)
+  out
+}
+
 build_met_multitrait_methods <- function(df_raw, met_results, integrated_ranking,
                                          metan_multitrait = NULL, selection_pct = 20) {
   matrix_info <- met_ds_trait_matrix(df_raw, met_results)
@@ -649,6 +722,7 @@ build_met_multitrait_methods <- function(df_raw, met_results, integrated_ranking
       gyt_table = empty,
       gyt_scores = data.frame(),
       mgidi = empty,
+      mgidi_fa = met_mgidi_fa(matrix_info, selection_pct),
       waasb = empty,
       method_membership = empty,
       method_agreement = empty,
@@ -822,6 +896,7 @@ build_met_multitrait_methods <- function(df_raw, met_results, integrated_ranking
     gyt_table = met_ds_round_numeric(gyt_table),
     gyt_scores = met_ds_round_numeric(gyt$trait_scores),
     mgidi = met_ds_round_numeric(mgidi),
+    mgidi_fa = met_mgidi_fa(matrix_info, selection_pct),
     waasb = met_ds_round_numeric(waasb),
     method_membership = met_ds_round_numeric(membership),
     method_agreement = met_ds_round_numeric(agreement),
@@ -3210,13 +3285,18 @@ met_gge_chart_file_slug <- function(gge_view) {
     "MET_GGE"
   )
 }
-plot_met_mgidi_ranking <- function(methods) {
-  mgidi <- as.data.frame(methods$mgidi %||% data.frame())
+plot_met_mgidi_ranking <- function(methods, use_fa = FALSE) {
+  if (use_fa && !any(is.finite(methods$mgidi_fa$ranking$MGIDI_distance))) {
+    return(empty_plot(paste(methods$mgidi_fa$notes$Note, collapse = "\n")))
+  }
+  mgidi <- as.data.frame(if (use_fa) methods$mgidi_fa$ranking else methods$mgidi %||% data.frame())
   if (nrow(mgidi) == 0 || !all(c("Genotype", "MGIDI_distance", "MGIDI_rank") %in% names(mgidi))) {
     return(empty_plot("MGIDI needs at least two successful MET traits."))
   }
   membership <- as.data.frame(methods$method_membership %||% data.frame())
-  if (all(c("Genotype", "MGIDI") %in% names(membership))) {
+  if (use_fa) {
+    mgidi$Selected <- as.logical(mgidi$Selected)
+  } else if (all(c("Genotype", "MGIDI") %in% names(membership))) {
     mgidi <- mgidi %>%
       left_join(membership %>% dplyr::select(Genotype, MGIDI), by = "Genotype") %>%
       mutate(Selected = replace_na(as.logical(MGIDI), FALSE))
@@ -3265,13 +3345,13 @@ plot_met_mgidi_ranking <- function(methods) {
     ) +
     coord_polar(start = -pi / 2) +
     labs(
-      title = "MGIDI multi-trait selection",
-      subtitle = "Lower ideotype distance is plotted farther from the center; the red circle is the selection cutoff.",
+      title = if (use_fa) "MGIDI with FA multi-trait selection" else "MGIDI multi-trait selection",
+      subtitle = if (use_fa) "FA on model estimates, equal trait importance. Lower distance is farther out; red circle marks selection." else "Lower ideotype distance is plotted farther from the center; the red circle is the selection cutoff.",
       x = NULL,
       y = "Multi-trait genotype-ideotype distance index",
       fill = NULL
     ) +
-    theme_minimal(base_size = 12) +
+    theme_bw(base_size = 12) +
     theme(
       panel.grid.major.x = element_line(color = "#E5E5E5", linewidth = 0.5),
       panel.grid.major.y = element_line(color = "#E5E5E5", linewidth = 0.5),
@@ -4639,7 +4719,9 @@ run_met_all_traits <- function(
     stop("MET pipeline failed for all numeric traits: ", paste(failures$Error, collapse = " | "))
   }
   integrated <- build_met_integrated_ranking(df_raw, results)
+  methods <- build_met_multitrait_methods(df_raw, results, integrated$ranking)
   list(
+    met_multitrait_methods = methods,
     settings = data.frame(
       Trait = trait_cols,
       Ran_MET = trait_cols %in% names(results),

@@ -111,6 +111,24 @@ why almost every result-reading reactive has an `if (identical(analysis_used(),
 
 ## 3. Data model
 
+The MET Multi Selection chart and Results table offer three methods:
+Integrated Ranking (performance/FW/ASV blend), MGIDI (the existing workbook-weighted
+distance in standardized trait space), and MGIDI with FA (`met_mgidi_fa()`, using
+`metan::mgidi()` on direction-adjusted estimates from the selected MET model).
+The FA method uses equal trait importance, 0–100 desirability rescaling, factors
+with eigenvalues at least 1, and varimax rotation where multiple factors remain.
+It does not use workbook weights or Mean/FW/ASV sliders. The selection percentage
+controls the highlighted fraction, including ties at the cutoff.
+
+`met_multitrait_methods$mgidi_fa` stores ranking, loadings/communalities, PCA
+variance and retention, genotype scores, ideotype scores, factor contributions,
+and notes. Results shows ranking, notes, loadings and variance; all seven tables
+export through `build_export_tables()`. Constant/unusable traits are excluded
+with notes. Incomplete genotypes remain visible with missing ranks; insufficient
+or failed FA returns an explanatory unavailable result, never a substituted
+distance method. FA notes also appear in pipeline review. FA selection does not
+change the existing decision-board method-support counts.
+
 Input workbook (first sheet), long format, one row per plot/observation:
 
 | Column | Role | Configured by |
