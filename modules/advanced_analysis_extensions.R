@@ -8,6 +8,159 @@
 # The functions are intentionally UI-free. They can be called from app.R server
 # logic, export logic, or future modules without changing the existing code paths.
 
+# Mean comparisons retain fixed genotypes. This separate REML fit estimates
+# generalized broad-sense H2 from joint prediction-error variances of differences.
+si_lpsi_lmm_statistics <- function(data, trait, selection_proportion) {
+  d <- data[is.finite(data[[trait]]), , drop = FALSE]
+  d$ID <- droplevels(factor(d$ID)); d$Rep <- droplevels(factor(d$Rep))
+  mean_value <- mean(d[[trait]])
+  counts <- table(d$ID)
+  harmonic <- if (length(counts)) 1 / mean(1 / as.numeric(counts)) else NA_real_
+  intensity <- dnorm(qnorm(1 - selection_proportion)) / selection_proportion
+  out <- data.frame(Trait = trait, Mean = mean_value, CV_pct = NA_real_,
+    MS_genotype = NA_real_, MS_error = NA_real_, Harmonic_replication = harmonic,
+    Genotypic_variance = NA_real_, Error_variance = NA_real_, Phenotypic_variance = NA_real_,
+    Broad_sense_H2 = NA_real_, Selection_intensity_pct = selection_proportion * 100,
+    Selection_intensity_k = intensity, Genetic_advance = NA_real_, Genetic_advance_pct_mean = NA_real_,
+    CV_model_residual_variance = NA_real_, Mean_PEV_difference = NA_real_,
+    Heritability_method = "Cullis genotype-difference H2 (separate REML model)",
+    Heritability_model = "Trait ~ 1 + (1 | ID) + (1 | Rep)",
+    CV_status = "Model failed", H2_status = "Model failed", Note = "", stringsAsFactors = FALSE)
+  notes <- c("Residual CV uses Trait ~ ID + (1 | Rep). H2 uses a separate random-genotype model; mean comparisons remain fixed-genotype.",
+    "Genetic advance is not calculated from generalized H2.")
+  warnings <- character()
+  capture_fit <- function(expr) withCallingHandlers(expr, warning = function(w) {
+    warnings <<- c(warnings, conditionMessage(w)); invokeRestart("muffleWarning")
+  })
+  check_fit <- function(fit) {
+    messages <- fit@optinfo$conv$lme4$messages
+    messages <- messages[!grepl("boundary.*singular", messages)]
+    if (length(messages)) stop(paste(messages, collapse = "; "))
+    code <- fit@optinfo$conv$opt
+    if (length(code) && any(code != 0)) stop("Optimizer did not converge.")
+  }
+  # Diagnose exact boundary datasets before asking an optimizer to estimate
+  # vanishing residual variance (common with rounded/replicated score values).
+  if (nlevels(d$ID) >= 2 && nlevels(d$Rep) >= 2 && nrow(d) > nlevels(d$ID)) {
+    boundary <- stats::lm(as.formula(paste0(backtick_name(trait), " ~ ID + Rep")), d)
+    tolerance <- 1e-10 * max(1, stats::sd(d[[trait]]))
+    if (df.residual(boundary) > 0 && max(abs(residuals(boundary))) <= tolerance) {
+      out$CV_model_residual_variance <- 0
+      out$CV_pct <- if (abs(mean_value) > .0001) 0 else NA_real_
+      out$CV_status <- if (is.finite(out$CV_pct)) "Zero residual variation" else "Zero mean"
+      out$H2_status <- if (diff(range(d[[trait]])) <= tolerance) "Constant trait" else "Zero residual variation"
+      out$Note <- paste(c(notes, paste(out$H2_status,
+        "makes the REML/Cullis variance ratio non-regular. H2 is not forced to 0 or 1; verify rounding and independent replication.")), collapse = " | ")
+      return(out)
+    }
+  }
+  # Fit on a standardized response; return all variances in original trait units.
+  response_scale <- stats::sd(d[[trait]])
+  if (!is.finite(response_scale) || response_scale <= 0) response_scale <- 1
+  scaled <- d
+  scaled[[trait]] <- (d[[trait]] - mean_value) / response_scale
+  fit_with_retry <- function(comparison = FALSE) {
+    last_error <- NULL
+    for (optimizer in c("bobyqa", "nloptwrap", "Nelder_Mead")) {
+      attempt <- tryCatch({
+        form <- as.formula(paste0(backtick_name(trait),
+          if (comparison) " ~ ID + (1 | Rep)" else " ~ 1 + (1 | ID) + (1 | Rep)"))
+        fit <- capture_fit(lme4::lmer(form, scaled, REML = TRUE,
+          control = lme4::lmerControl(optimizer = optimizer)))
+        check_fit(fit)
+        fit
+      }, error = function(e) { last_error <<- conditionMessage(e); NULL })
+      if (!is.null(attempt)) {
+        if (optimizer != "bobyqa") notes <<- c(notes, paste("Converged after optimizer retry:", optimizer))
+        return(attempt)
+      }
+    }
+    stop(last_error %||% "Mixed model could not be fitted.")
+  }
+  tryCatch({
+    comparison <- fit_with_retry(comparison = TRUE)
+    residual_var <- stats::sigma(comparison)^2 * response_scale^2
+    out$CV_model_residual_variance <- residual_var
+    if (is.finite(mean_value) && abs(mean_value) > 0.0001) {
+      out$CV_pct <- 100 * sqrt(residual_var) / abs(mean_value)
+      out$CV_status <- "Estimated"
+    } else {
+      out$CV_status <- "Zero mean"
+      notes <- c(notes, "CV unavailable: trait mean is zero or near zero.")
+    }
+  }, error = function(e) notes <<- c(notes, paste("CV unavailable:", conditionMessage(e))))
+  tryCatch({
+    if (nlevels(d$ID) < 2 || nlevels(d$Rep) < 2 || nrow(d) <= nlevels(d$ID)) stop("Insufficient replicated genotype data.")
+    fit <- fit_with_retry()
+    vg_scaled <- as.numeric(lme4::VarCorr(fit)$ID[1, 1])
+    vg <- vg_scaled * response_scale^2
+    out$Genotypic_variance <- vg
+    out$Error_variance <- stats::sigma(fit)^2 * response_scale^2
+    if (!is.finite(vg)) stop("Invalid genotype variance.")
+    if (vg_scaled <= 1e-10 * max(1, stats::sigma(fit)^2)) {
+      out$Genotypic_variance <- 0
+      out$H2_status <- "Zero genetic variance"
+      # Cullis' ratio is undefined at vg=0. Report the zero-reliability limit
+      # explicitly as a boundary convention, rather than an interior estimate.
+      out$Broad_sense_H2 <- 0
+      out$Heritability_method <- "Zero-genetic-variance boundary (H2=0 limiting convention)"
+      notes <- c(notes, "Genotype variance is at the zero boundary; H2=0 is the zero-reliability limiting convention.")
+    } else {
+    x <- lme4::getME(fit, "X"); z <- lme4::getME(fit, "Z")
+    lambda <- lme4::getME(fit, "Lambda")
+    design <- cbind(Matrix::Matrix(x, sparse = TRUE), z %*% lambda)
+    p <- ncol(x); q <- ncol(z)
+    equations <- Matrix::crossprod(design) + Matrix::Diagonal(p + q, c(rep(0, p), rep(1, q)))
+    groups <- names(lme4::getME(fit, "cnms")); offsets <- lme4::getME(fit, "Gp")
+    g <- match("ID", groups)
+    indices <- seq.int(offsets[g] + 1L, offsets[g + 1L])
+    rhs <- rbind(Matrix::Matrix(0, p, length(indices), sparse = TRUE),
+      Matrix::t(lambda[indices, , drop = FALSE]))
+    pev <- as.matrix(Matrix::crossprod(rhs, Matrix::solve(equations, rhs))) * stats::sigma(fit)^2 * response_scale^2
+    n <- nrow(pev)
+    mean_pev <- 2 * (n * sum(diag(pev)) - sum(pev)) / (n * (n - 1))
+    h2 <- 1 - mean_pev / (2 * vg)
+    if (!is.finite(h2) || h2 < -1e-6 || h2 > 1 + 1e-6) stop("Invalid genotype-difference PEV estimate.")
+    out$Mean_PEV_difference <- mean_pev
+    out$Broad_sense_H2 <- max(0, min(1, h2))
+    out$H2_status <- "Estimated"
+    }
+    if (lme4::isSingular(fit)) notes <- c(notes, "The H2 model has boundary nuisance variance components.")
+  }, error = function(e) notes <<- c(notes, paste("H2 not estimable:", conditionMessage(e))))
+  out$CV_pct <- round(out$CV_pct, 2)
+  out$Broad_sense_H2 <- round(out$Broad_sense_H2, 4)
+  out$Note <- paste(unique(c(notes, warnings)), collapse = " | ")
+  out
+}
+
+si_lpsi_final_diagnostics <- function(data, traits, model_type) {
+  dplyr::bind_rows(lapply(traits, function(trait) {
+    d <- data[is.finite(data[[trait]]), , drop = FALSE]
+    fit <- fit_single_location_model(d, trait, model_type)
+    residual <- as.numeric(residuals(fit))
+    h <- as.numeric(hatvalues(fit))
+    standardized <- residual / (stats::sigma(fit) * sqrt(pmax(1 - h, 0)))
+    standardized[!is.finite(standardized)] <- NA_real_
+    data.frame(Trait = trait, ID = as.character(d$ID), Original_ID = d$Original_ID,
+      Rep = as.character(d$Rep), Observed = d[[trait]], Fitted = as.numeric(fitted(fit)),
+      Residual = residual, Standardized_residual = standardized,
+      Model = paste(deparse(formula(fit)), collapse = " "), stringsAsFactors = FALSE)
+  }))
+}
+
+si_lpsi_diagnostic_plot <- function(result, trait) {
+  d <- result$residual_diagnostics
+  d <- d[d$Trait == trait & is.finite(d$Residual), , drop = FALSE]
+  if (!nrow(d)) return(empty_plot("No fitted-model diagnostics are available for this trait."))
+  qq <- ggplot2::ggplot(d, ggplot2::aes(sample = Residual)) +
+    ggplot2::stat_qq(color = "#3498DB") + ggplot2::stat_qq_line(color = "#E74C3C") +
+    ggplot2::labs(title = paste("Final model Q-Q:", trait), x = "Theoretical quantiles", y = "Residual quantiles") + ggplot2::theme_bw()
+  rvf <- ggplot2::ggplot(d, ggplot2::aes(Fitted, Residual)) +
+    ggplot2::geom_point(color = "#3498DB") + ggplot2::geom_hline(yintercept = 0, color = "#E74C3C", linetype = "dashed") +
+    ggplot2::labs(title = "Final model residuals vs fitted") + ggplot2::theme_bw()
+  qq + rvf
+}
+
 si_ext_require <- function(pkg) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
     stop("Package '", pkg, "' is required for this analysis. Install it before running this extension.",
@@ -58,10 +211,11 @@ si_ext_estimate_trait_values <- function(data, trait, genotype = "GEN", replicat
     return(data.frame(GEN = character(0), Trait = trait, Value = numeric(0), SE = numeric(0)))
   }
 
-  if (method == "mean" || is.null(replication) || !".REP" %in% names(d)) {
+  if (method == "mean") {
     out <- stats::aggregate(d$.y, by = list(GEN = d$.GEN), FUN = mean, na.rm = TRUE)
     return(data.frame(GEN = as.character(out$GEN), Trait = trait, Value = out$x, SE = NA_real_))
   }
+  if (is.null(replication) || !".REP" %in% names(d)) stop("Select a replication column for BLUE/BLUP estimation; no raw-mean fallback was used.")
 
   if (method == "blue") {
     fit <- stats::lm(.y ~ .GEN + .REP, data = d)
@@ -69,8 +223,7 @@ si_ext_estimate_trait_values <- function(data, trait, genotype = "GEN", replicat
       em <- as.data.frame(emmeans::emmeans(fit, specs = ".GEN"))
       return(data.frame(GEN = as.character(em$.GEN), Trait = trait, Value = em$emmean, SE = em$SE))
     }
-    out <- stats::aggregate(d$.y, by = list(GEN = d$.GEN), FUN = mean, na.rm = TRUE)
-    return(data.frame(GEN = as.character(out$GEN), Trait = trait, Value = out$x, SE = NA_real_))
+    stop("BLUE estimation requires emmeans; no raw-mean fallback was used.", call. = FALSE)
   }
 
   si_ext_require("lme4")
@@ -375,6 +528,9 @@ si_ext_run_multitrait_selection <- function(data, env, gen, rep, traits, goals =
   d$GEN <- factor(si_ext_chr(d[[gen]]))
   d$REP <- factor(si_ext_chr(d[[rep]]))
   for (trait in traits) d[[trait]] <- si_ext_num(d[[trait]])
+  if (any(!vapply(d[, traits, drop = FALSE], function(x) all(is.finite(x)), logical(1)))) {
+    stop("Multi-trait selection requires complete trait records for this method. Missing/nonfinite measurements were found; no plots were silently removed. Review the data or select a supported trait set before continuing.", call. = FALSE)
+  }
   d <- d[stats::complete.cases(d[, c("ENV", "GEN", "REP", traits), drop = FALSE]), , drop = FALSE]
   if (nrow(d) == 0) stop("No complete rows are available for multi-trait selection.", call. = FALSE)
 

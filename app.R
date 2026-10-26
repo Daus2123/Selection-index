@@ -21,6 +21,7 @@ options(shiny.maxRequestSize = 50 * 1024^2)
 
 # Shared infrastructure used across the complete analysis pipeline.
 source(file.path("modules", "shared_data_validation.R"), local = TRUE)
+source(file.path("modules", "data_cleaning.R"), local = TRUE)
 source(file.path("modules", "advanced_analysis_extensions.R"), local = TRUE)
 
 # Numbered analysis modules. Keep this list as the pipeline backbone.
@@ -37,6 +38,11 @@ id_col  <- "Variety"
 rep_col <- "Rep"
 weight_row_labels <- c("WEIGHT", "WEIGHTS", "IMPORTANCE", "IMPORTANT")
 direction_row_labels <- c("DIRECTION", "DIRECTIONS", "TRAIT_DIRECTION")
+trait_type_row_labels <- c("TYPE", "TRAIT_TYPE")
+unit_row_labels <- c("UNIT", "UNITS")
+metadata_row_labels <- c(weight_row_labels, direction_row_labels, trait_type_row_labels, unit_row_labels)
+observation_id_columns <- c("Entry", "ENTRY", "ID", "Plot_ID", "PlotID", "Plot_id")
+design_column_candidates <- c("Environment", "Location", "Year", "Season", "Block", "BLOCK", "Replication", "REP")
 type_col_candidates <- c("Type", "TYPE", "Entry_Type", "Entry type", "EntryType")
 check_type_labels <- c(
   "CHECK", "CHECKS", "CONTROL", "CONTROLS", "BENCHMARK",
@@ -209,6 +215,11 @@ build_export_tables <- function(analysis_type, results) {
     output_list[[sheet_name]] <<- as.data.frame(table)
   }
   
+  add_sheet("00m", "trait_metadata", results$trait_metadata)
+  add_sheet("QC1", "cleaning_review", results$cleaning_review)
+  add_sheet("QC2", "cleaning_settings", results$cleaning_settings)
+  add_sheet("QC3", "cleaning_impact", results$cleaning_impact)
+  add_sheet("QC4", "cleaning_rank_changes", results$cleaning_rank_changes)
   if (analysis_type == "MATING") {
     add_sheet("01", "anova", get_mating_result_table(results, "anova"))
     add_sheet("02", "gca", get_mating_result_table(results, "gca"))
@@ -248,6 +259,7 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("00b", "breeder_recommendation", si_breeder_recommendation_table(lpsi_results = results))
     add_sheet("01", "summary", results$trait_info)
     add_sheet("02", "anova", results$anova_full)
+    add_sheet("02b", "model_diagnostics", results$residual_diagnostics)
     add_sheet("03", "mean_comparison", mean_comparison$combined)
     add_sheet("04", "superiority_mean", results$superiority_index)
     add_sheet("05", "selection_index", results$index_ranking)
@@ -387,13 +399,12 @@ parse_trait_direction <- function(x) {
   return(list(direction = "Higher better", target_value = NA_real_))
 }
 standardize_trait <- function(x) {
-  if (all(is.na(x))) {
-    return(rep(0, length(x)))
-  }
-  if (sd(x, na.rm = TRUE) == 0) {
-    return(rep(0, length(x)))
-  }
-  as.numeric(scale(x))
+  valid <- is.finite(x)
+  out <- rep(NA_real_, length(x))
+  if (!any(valid)) return(out)
+  spread <- sd(x[valid])
+  out[valid] <- if (!is.finite(spread) || spread == 0) 0 else (x[valid] - mean(x[valid])) / spread
+  out
 }
 make_model_formula <- function(trait, data, model_type = "RCBD") {
   model_type <- toupper(trimws(as.character(model_type %||% "RCBD")))
@@ -453,6 +464,7 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
   summary_columns <- list()
 
   for (trait in traits) {
+    model_view <- NULL
     trait_rows <- raw[!is.na(raw[[trait]]) & !is.na(raw$ID), , drop = FALSE]
     test_row <- anova_rows[
       as.character(anova_rows$Trait) == trait &
@@ -465,6 +477,8 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
     gain_row <- gain[as.character(gain$Trait) == trait, , drop = FALSE]
     cv <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$CV_pct[1])) else NA_real_
     h2 <- if (nrow(gain_row) > 0) suppressWarnings(as.numeric(gain_row$Broad_sense_H2[1])) else NA_real_
+    cv_status <- if (nrow(gain_row) && "CV_status" %in% names(gain_row)) as.character(gain_row$CV_status[1]) else "Not available"
+    h2_status <- if (nrow(gain_row) && "H2_status" %in% names(gain_row)) as.character(gain_row$H2_status[1]) else "Not estimated"
     critical_difference <- ""
     p_label <- if (!is.finite(p_value)) {
       "p unavailable"
@@ -571,14 +585,26 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
       means <- data.frame(ID = raw_means$ID, Value = si_lpsi_format_raw_mean(raw_means, spread), Group = raw_means$Group)
     }
 
+    if (identical(spread, "se")) {
+      # SE always describes the adjusted estimate, never the raw sample mean.
+      if (identical(test, "ANOVA") && !is.null(model_view)) {
+        estimates <- model_view$estimates
+        valid <- is.finite(estimates$emmean) & is.finite(estimates$SE)
+        formatted <- rep("Adjusted estimate unavailable", nrow(estimates))
+        formatted[valid] <- sprintf("%.2f \u00b1 %.2f", estimates$emmean[valid], estimates$SE[valid])
+        means$Value <- formatted[match(means$ID, estimates$ID)]
+      } else {
+        means$Value <- rep("Adjusted estimate unavailable", nrow(means))
+      }
+    }
     value_columns[[trait]] <- means$Value[match(id_lookup$ID, means$ID)]
     value_columns[[trait]][is.na(value_columns[[trait]])] <- "Not available"
     group_column <- paste0(trait, " Group")
     value_columns[[group_column]] <- means$Group[match(id_lookup$ID, means$ID)]
     value_columns[[group_column]][is.na(value_columns[[group_column]])] <- ""
     summary_columns[[trait]] <- c(
-      if (is.finite(cv)) sprintf("%.2f%%", cv) else "Not available",
-      if (is.finite(h2)) sprintf("%.3f", h2) else "Not estimated",
+      if (is.finite(cv)) sprintf("%.2f%%", cv) else cv_status,
+      if (is.finite(h2)) paste0(sprintf("%.3f", h2), if (identical(h2_status, "Zero genetic variance")) " (boundary)" else "") else h2_status,
       critical_difference
     )
     summary_columns[[group_column]] <- rep("", 3)
@@ -588,7 +614,8 @@ si_lpsi_mean_comparison_view <- function(results, method = "lsd", spread = "se")
   critical_label <- if (identical(method, "tukey")) "Tukey HSD (0.05)" else "LSD (0.05)"
   summary_table <- data.frame(
     ID = rep("", 3),
-    Original_ID = c("CV (%)", "Broad-sense H\u00b2", critical_label),
+    Original_ID = c(if (identical(model_type, "LMM")) "Residual CV (%)" else "CV (%)",
+      if (identical(model_type, "LMM")) "Broad-sense H\u00b2 (Cullis)" else "Broad-sense H\u00b2", critical_label),
     summary_columns,
     check.names = FALSE
   )
@@ -634,7 +661,7 @@ prepare_excel_input <- function(df_raw, require_rep = FALSE) {
   direction_rows <- which(id_values_upper %in% direction_row_labels)
   weight_row <- if (length(weight_rows) > 0) tail(weight_rows, 1) else integer(0)
   direction_row <- if (length(direction_rows) > 0) tail(direction_rows, 1) else integer(0)
-  metadata_rows <- sort(unique(c(weight_rows, direction_rows)))
+  metadata_rows <- si_metadata_rows(df_raw)
   df_data <- df_raw
   if (length(metadata_rows) > 0) {
     df_data <- df_data[-metadata_rows, , drop = FALSE]
@@ -668,12 +695,13 @@ prepare_excel_input <- function(df_raw, require_rep = FALSE) {
   check_original_name <- as.character(df_data[[id_col]][1])
   candidate_cols <- setdiff(
     names(df_data),
-    c(id_col, rep_col, type_col)
+    c(id_col, rep_col, type_col, observation_id_columns, design_column_candidates)
   )
   trait_numeric_count <- sapply(candidate_cols, function(tr) {
     sum(!is.na(to_number(df_data[[tr]])))
   })
-  trait_cols <- candidate_cols[trait_numeric_count > 0]
+  empty_numeric_traits <- vapply(df_data[candidate_cols], function(x) all(is.na(x) | trimws(as.character(x)) == ""), logical(1))
+  trait_cols <- candidate_cols[trait_numeric_count > 0 | empty_numeric_traits]
   if (length(trait_cols) == 0) {
     stop("No usable numeric trait columns found.")
   }
@@ -732,6 +760,7 @@ prepare_excel_input <- function(df_raw, require_rep = FALSE) {
       "No DIRECTION row was found. All detected traits were treated as higher-better."
     )
   }
+  trait_metadata <- si_trait_metadata(df_raw, trait_cols)
   direction_table <- data.frame(
     Trait = trait_cols,
     Direction = as.character(trait_direction[trait_cols]),
@@ -742,9 +771,11 @@ prepare_excel_input <- function(df_raw, require_rep = FALSE) {
     ),
     Raw_weight = as.numeric(weights_raw_used[trait_cols])
   )
+  direction_table <- cbind(direction_table, trait_metadata[, c("Type", "Unit", "Metadata_source"), drop = FALSE])
   list(
     data = df_data,
     trait_cols = trait_cols,
+    trait_metadata = trait_metadata,
     weights_raw_used = weights_raw_used,
     trait_direction = trait_direction,
     target_traits = target_traits,
@@ -803,8 +834,23 @@ make_diversity_trait_info <- function(df_raw, genotype_col, trait_cols) {
   )
 }
 # Diagnostic data preparation
-make_diagnostic_data <- function(df_raw) {
-  prepared <- prepare_excel_input(df_raw)
+make_diagnostic_data <- function(df_raw, context = NULL) {
+  prepared <- if (!is.null(context) && identical(context$kind, "met")) {
+    met <- prepare_met_trait_settings(df_raw)
+    met$direction_table <- met$trait_info
+    met
+  } else if (id_col %in% names(df_raw)) prepare_excel_input(df_raw) else {
+    list(data = si_observation_data(df_raw, context$identity),
+      trait_cols = setdiff(si_detect_numeric_like_traits(df_raw),
+        c(observation_id_columns, design_column_candidates, context$identity, context$factors, context$rep)),
+      notes = character(), direction_table = data.frame())
+  }
+  if (!is.null(context)) {
+    df <- si_observation_data(df_raw, context$identity)
+    for (tr in prepared$trait_cols) df[[tr]] <- to_number(df[[tr]])
+    return(list(data = df, trait_cols = prepared$trait_cols, context = context,
+      direction_table = prepared$direction_table, notes = prepared$notes))
+  }
   df <- prepared$data %>%
     dplyr::select(all_of(c(id_col, rep_col, prepared$trait_cols))) %>%
     mutate(
@@ -826,7 +872,20 @@ make_diagnostic_data <- function(df_raw) {
     notes = prepared$notes
   )
 }
-fit_diagnostic_model <- function(df, trait) {
+si_diagnostic_preview <- function(diag, trait, stage = "raw") {
+  df <- diag$data
+  values <- df[[trait]]
+  valid <- is.finite(values)
+  keep <- valid
+  removed <- if (identical(stage, "trimmed")) diag$excluded_counts[[trait]] %||% 0L else 0L
+  stage_label <- if (identical(stage, "trimmed")) "Approved cleaned data" else "Before trimming"
+  note <- paste0(stage_label, " | Used: ", sum(keep), " | Removed: ", removed,
+                 " | Missing/non-finite: ", sum(!valid))
+  list(data = df[keep, , drop = FALSE], note = note,
+       removed = removed, n_used = sum(keep))
+}
+fit_diagnostic_model <- function(df, trait, context = NULL) {
+  if (!is.null(context)) return(si_trial_diagnostic_fit(df, trait, context)$model)
   model_data <- df %>%
     filter(!is.na(.data[[trait]]))
   if (nrow(model_data) < 3) {
@@ -846,10 +905,10 @@ fit_diagnostic_model <- function(df, trait) {
   }
   lm(form, data = model_data)
 }
-make_shapiro_table <- function(diag) {
+make_shapiro_table <- function(diag, stage = "raw") {
   map_dfr(diag$trait_cols, function(tr) {
     model <- tryCatch({
-      fit_diagnostic_model(diag$data, tr)
+      fit_diagnostic_model(si_diagnostic_preview(diag, tr, stage)$data, tr, diag$context)
     }, error = function(e) {
       NULL
     })
@@ -920,63 +979,19 @@ make_shapiro_table <- function(diag) {
     )
   })
 }
-get_lpsi_normality_decision <- function(df, trait) {
-  model <- tryCatch({
-    fit_diagnostic_model(df, trait)
-  }, error = function(e) {
-    NULL
-  })
-  if (is.null(model)) {
-    return(list(
-      use_anova = TRUE,
-      p_value = NA_real_,
-      note = "Model could not be fitted; ANOVA used by default"
-    ))
-  }
-  res <- residuals(model)
-  res <- res[is.finite(res)]
-  if (length(res) < 3) {
-    return(list(
-      use_anova = TRUE,
-      p_value = NA_real_,
-      note = "Too few residuals for Shapiro-Wilk test; ANOVA used by default"
-    ))
-  }
-  if (length(res) > 5000) {
-    return(list(
-      use_anova = TRUE,
-      p_value = NA_real_,
-      note = "More than 5000 residuals; ANOVA used by default"
-    ))
-  }
-  if (length(unique(res)) < 2) {
-    return(list(
-      use_anova = TRUE,
-      p_value = NA_real_,
-      note = "Residuals are constant; ANOVA used by default"
-    ))
-  }
-  st <- tryCatch({
-    shapiro.test(res)
-  }, error = function(e) {
-    NULL
-  })
-  if (is.null(st)) {
-    return(list(
-      use_anova = TRUE,
-      p_value = NA_real_,
-      note = "Shapiro-Wilk test failed; ANOVA used by default"
-    ))
-  }
-  list(
-    use_anova = st$p.value >= 0.05,
-    p_value = as.numeric(st$p.value),
-    note = ifelse(
-      st$p.value >= 0.05,
-      "Residuals passed Shapiro-Wilk; ANOVA used",
-      "Residuals failed Shapiro-Wilk; Kruskal-Wallis used"
-    )
-  )
+get_lpsi_normality_decision <- function(df, trait, model_type = "RCBD") {
+  tryCatch({
+    fit <- fit_single_location_model(df[is.finite(df[[trait]]), , drop = FALSE], trait, model_type)
+    res <- residuals(fit); res <- res[is.finite(res)]
+    p <- if (length(res) >= 3 && length(res) <= 5000 && length(unique(res)) > 1) {
+      tryCatch(shapiro.test(res)$p.value, error = function(e) NA_real_)
+    } else NA_real_
+    list(use_anova = TRUE, p_value = p,
+      note = if (!is.finite(p)) "Normality unavailable; selected design model retained" else if (p < .05)
+        "Residual normality warning; selected design model retained; inspect diagnostics" else
+        "No Shapiro-Wilk rejection; selected design model retained")
+  }, error = function(e) list(use_anova = TRUE, p_value = NA_real_,
+    note = paste("Selected model diagnostics unavailable:", conditionMessage(e))))
 }
 empty_plot <- function(message_text) {
   ggplot() +
@@ -1782,43 +1797,52 @@ plot_lpsi_direct_selection <- function(direct_table, selection_pct = 15, lpsi_re
       panel.grid.minor = element_blank()
     )
 }
-make_diagnostic_plot <- function(diag, trait, plot_type) {
+make_diagnostic_plot <- function(diag, trait, plot_type, stage = "raw") {
   df <- diag$data
   if (!trait %in% names(df)) {
     return(empty_plot("Trait not found."))
   }
+  preview <- si_diagnostic_preview(diag, trait, stage)
+  df <- preview$data
+  if (nrow(df) == 0) return(empty_plot(preview$note))
+  model_error <- NULL
   model <- tryCatch({
-    fit_diagnostic_model(df, trait)
+    fit_diagnostic_model(df, trait, diag$context)
   }, error = function(e) {
+    model_error <<- conditionMessage(e)
     NULL
   })
   if (plot_type == "Raw trait histogram") {
     return(
       ggplot(df, aes(x = .data[[trait]])) +
         geom_histogram(bins = 20, fill = "#2D89C8", color = "white") +
-        theme_minimal(base_size = 14) +
+        theme_bw(base_size = 14) +
         labs(
-          title = paste("Raw data histogram:", trait),
+          title = paste("Observed trait histogram:", trait),
+          subtitle = preview$note,
           x = trait,
           y = "Frequency"
         )
     )
   }
   if (is.null(model)) {
-    return(empty_plot("Model could not be fitted for this trait."))
+    return(empty_plot(paste("Diagnostic model unavailable:", model_error %||% "Check trial settings.")))
   }
   plot_df <- data.frame(
-    Observed = model$model[[1]],
+    Observed = as.numeric(model.response(model.frame(model))),
     Fitted = fitted(model),
     Residual = residuals(model)
   )
+  if (!is.null(diag$context)) preview$note <- paste(preview$note,
+    paste0("Model observations: ", nrow(plot_df)), attr(model, "si_diagnostic_label"), sep = " | ")
   if (plot_type == "Residual histogram") {
     return(
       ggplot(plot_df, aes(x = Residual)) +
         geom_histogram(bins = 20, fill = "#2D89C8", color = "white") +
-        theme_minimal(base_size = 14) +
+        theme_bw(base_size = 14) +
         labs(
           title = paste("Residual histogram:", trait),
+          subtitle = preview$note,
           x = "Residual",
           y = "Frequency"
         )
@@ -1829,9 +1853,10 @@ make_diagnostic_plot <- function(diag, trait, plot_type) {
       ggplot(plot_df, aes(sample = Residual)) +
         stat_qq(size = 2) +
         stat_qq_line(color = "#E85D24", linewidth = 1) +
-        theme_minimal(base_size = 14) +
+        theme_bw(base_size = 14) +
         labs(
           title = paste("QQ plot of residuals:", trait),
+          subtitle = preview$note,
           x = "Theoretical quantiles",
           y = "Sample quantiles"
         )
@@ -1842,9 +1867,10 @@ make_diagnostic_plot <- function(diag, trait, plot_type) {
       ggplot(plot_df, aes(x = Fitted, y = Residual)) +
         geom_point(size = 2, alpha = 0.75) +
         geom_hline(yintercept = 0, linetype = "dashed", color = "#E85D24") +
-        theme_minimal(base_size = 14) +
+        theme_bw(base_size = 14) +
         labs(
           title = paste("Residuals vs fitted:", trait),
+          subtitle = preview$note,
           x = "Fitted value",
           y = "Residual"
         )
@@ -1855,9 +1881,10 @@ make_diagnostic_plot <- function(diag, trait, plot_type) {
       ggplot(plot_df, aes(x = Fitted, y = Observed)) +
         geom_point(size = 2, alpha = 0.75) +
         geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#E85D24") +
-        theme_minimal(base_size = 14) +
+        theme_bw(base_size = 14) +
         labs(
           title = paste("Observed data against fitted value:", trait),
+          subtitle = preview$note,
           x = "Fitted value",
           y = "Observed value"
         )
@@ -1994,6 +2021,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
   if (nrow(df) == 0) {
     stop("No valid rows remained after cleaning ID and Rep.")
   }
+  si_require_index_coverage(df, "ID", trait_cols, weights_raw_used)
   trait_cols <- trait_cols[
     sapply(df[trait_cols], function(x) !all(is.na(x)))
   ]
@@ -2055,15 +2083,8 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     ) %>%
     dplyr::select(ID, Original_ID)
   check_original_label <- paste(selected_checks, collapse = ", ")
-  score_cols <- trait_cols[
-    sapply(trait_cols, function(tr) {
-      vals <- na.omit(as.numeric(df[[tr]]))
-      length(vals) > 0 &&
-        all(vals == floor(vals)) &&
-        min(vals, na.rm = TRUE) >= 1 &&
-        max(vals, na.rm = TRUE) <= 5
-    })
-  ]
+  trait_metadata <- prepared$trait_metadata
+  score_cols <- trait_metadata$Trait[trait_metadata$Type == "Score 1-5"]
   df_index <- df
   for (tr in trait_cols) {
     if (tr %in% names(target_traits)) {
@@ -2078,15 +2099,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
   get_adjusted_means <- function(data, trait) {
     model_data <- data %>%
       filter(!is.na(.data[[trait]]))
-    if (nrow(model_data) == 0) {
-      return(
-        data.frame(
-          ID = levels(data$ID),
-          Value = NA_real_,
-          Trait = trait
-        )
-      )
-    }
+    if (nrow(model_data) == 0) stop("No usable observations for adjusted estimates: ", trait)
     out <- tryCatch({
       model <- fit_single_location_model(model_data, trait, model_type)
       em <- emmeans(model, ~ ID)
@@ -2098,17 +2111,11 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
           Trait = trait
         )
     }, error = function(e) {
-      model_data %>%
-        group_by(ID) %>%
-        summarise(
-          Value = mean(.data[[trait]], na.rm = TRUE),
-          .groups = "drop"
-        ) %>%
-        mutate(
-          ID = as.character(ID),
-          Trait = trait
-        )
+      stop("Adjusted estimates unavailable for trait '", trait, "' under ", model_type,
+        ": ", conditionMessage(e), ". No raw-mean fallback was used.", call. = FALSE)
     })
+    if (any(!is.finite(out$Value))) stop("Non-estimable adjusted means for trait '", trait,
+      "'. Check design connectivity and missing observations. Ranking was not generated.", call. = FALSE)
     out
   }
   adj_means_long <- map_dfr(
@@ -2137,6 +2144,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     Direction = as.character(trait_direction[names(weights)]),
     Raw_weight = as.numeric(weights_raw_used[names(weights)]),
     Normalized_weight = round(as.numeric(weights), 4),
+    Missing_trait_policy = "All positive-weight traits required; no imputation or weight redistribution",
     Priority_trait = ifelse(
       as.numeric(weights_raw_used[names(weights)]) >= priority_weight_cutoff,
       "YES",
@@ -2148,8 +2156,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     rowwise() %>%
     mutate(
       Selection_Index = sum(
-        c_across(all_of(trait_cols)) * weights[trait_cols],
-        na.rm = TRUE
+        c_across(all_of(trait_cols[weights[trait_cols] > 0])) * weights[trait_cols[weights[trait_cols] > 0]]
       )
     ) %>%
     ungroup() %>%
@@ -2594,15 +2601,14 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       model_data <- df %>%
         filter(!is.na(.data[[tr]]))
       temp <- tryCatch({
-        normality <- get_lpsi_normality_decision(df, tr)
-        if (isTRUE(normality$use_anova)) {
+        normality <- get_lpsi_normality_decision(df, tr, model_type)
           model <- fit_single_location_model(model_data, tr, model_type)
           sm <- single_location_anova_table(model)
           data.frame(
             Trait = tr,
             Test = "ANOVA",
             Normality_p = round(normality$p_value, 5),
-            Normality_note = "ANOVA used",
+            Normality_note = normality$note,
             Source = sm$Source,
             Df = sm$Df,
             Sum_Sq = round(sm$Sum_Sq, 4),
@@ -2612,31 +2618,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
             Sig = sig_label(sm$p_value),
             stringsAsFactors = FALSE
           )
-        } else {
-          kw_data <- model_data %>%
-            filter(!is.na(ID), !is.na(.data[[tr]]))
-          if (n_distinct(kw_data$ID) < 2) {
-            stop("Kruskal-Wallis requires at least 2 ID groups.")
-          }
-          kw <- kruskal.test(
-            as.formula(paste0(backtick_name(tr), " ~ ID")),
-            data = kw_data
-          )
-          data.frame(
-            Trait = tr,
-            Test = "Kruskal-Wallis",
-            Normality_p = round(normality$p_value, 5),
-            Normality_note = "Kruskal-Wallis used",
-            Source = "ID",
-            Df = as.numeric(kw$parameter),
-            Sum_Sq = NA_real_,
-            Mean_Sq = NA_real_,
-            F_value = round(as.numeric(kw$statistic), 4),
-            p_value = round(kw$p.value, 5),
-            Sig = sig_label(kw$p.value),
-            stringsAsFactors = FALSE
-          )
-        }
+
       }, error = function(e) {
         data.frame(
           Trait = tr,
@@ -2660,12 +2642,12 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
   heritability_gain <- map_dfr(trait_cols, function(tr) {
     model_data <- df %>%
       filter(!is.na(.data[[tr]]))
+    if (identical(model_type, "LMM")) {
+      return(si_lpsi_lmm_statistics(model_data, tr, lpsi_selection_intensity))
+    }
     tryCatch({
       if (n_distinct(model_data$ID) < 2) {
         stop("At least two varieties are required.")
-      }
-      if (identical(model_type, "LMM")) {
-        stop("Genetic variance and broad-sense heritability are not estimated when Variety is fixed in LMM.")
       }
       model <- fit_single_location_model(model_data, tr, model_type)
       sm <- as.data.frame(summary(model)[[1]])
@@ -2744,7 +2726,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       model_data <- df %>%
         filter(!is.na(.data[[tr]]))
       temp <- tryCatch({
-        normality <- get_lpsi_normality_decision(df, tr)
+        normality <- get_lpsi_normality_decision(df, tr, model_type)
         model <- fit_single_location_model(model_data, tr, model_type)
         sm <- single_location_anova_table(model)
         id_p_value <- sm$p_value[sm$Source == "ID"]
@@ -2841,10 +2823,13 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
         arrange(as.numeric(as.character(ID)))
     }
   }
+  residual_diagnostics <- si_lpsi_final_diagnostics(df, trait_cols, model_type)
   trait_info <- data.frame(
     Trait = trait_cols,
     Model = model_type,
     Type = ifelse(trait_cols %in% score_cols, "Score 1-5", "Quantitative"),
+    Unit = trait_metadata$Unit[match(trait_cols, trait_metadata$Trait)],
+    Metadata_source = trait_metadata$Metadata_source[match(trait_cols, trait_metadata$Trait)],
     Direction = as.character(trait_direction[trait_cols]),
     Target_value = ifelse(
       trait_cols %in% names(target_traits),
@@ -2862,6 +2847,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     raw_data = df_raw,
     cleaned_data = df,
     trait_info = trait_info,
+    trait_metadata = trait_metadata,
     adjusted_means_index = adj_means,
     standardized_scores = std_means,
     weighted_contributions = weighted_contributions,
@@ -2876,6 +2862,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
     final_decision = final_decision,
     heritability_gain = heritability_gain,
     anova_full = anova_full,
+    residual_diagnostics = residual_diagnostics,
     lsd_long = lsd_all,
     lsd_wide = lsd_wide,
     ranking_plot = p_index,
@@ -3393,6 +3380,12 @@ ui <- page_navbar(
       margin: 0;
       min-width: 190px;
     }
+    .analyze-preview-selectors {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
     .analysis-output-controls .side-subpanel {
       border-bottom: 1px solid #E1DACB;
       margin: 0 14px;
@@ -3786,8 +3779,10 @@ ui <- page_navbar(
                 inputId = "diagnostic_plot_type",
                 label = NULL,
                 choices = c(
-                  "Histogram" = "Residual histogram",
+                  "Observed trait histogram" = "Raw trait histogram",
+                  "Residual histogram" = "Residual histogram",
                   "Q-Q plot" = "QQ plot",
+                  "Residuals vs fitted" = "Residuals vs fitted",
                   "Fitted vs actual" = "Observed vs fitted"
                 ),
                 selected = "QQ plot",
@@ -3881,16 +3876,42 @@ ui <- page_navbar(
               tags$div(
                 class = "analyze-preview-header",
                 uiOutput("analyze_preview_header"),
+                tags$div(
+                  class = "analyze-preview-selectors",
                 selectInput(
                   "analyze_preview_view",
                   label = NULL,
                   choices = c("Preview chart" = "chart", "Data summary" = "summary"),
                   selected = "chart"
                 )
+                )
               )
             ),
             conditionalPanel("input.analyze_preview_view == 'chart'", plotOutput("diagnostic_plot", height = "540px")),
-            conditionalPanel("input.analyze_preview_view == 'summary'", DTOutput("shapiro_table"))
+            conditionalPanel("input.analyze_preview_view == 'summary'", DTOutput("shapiro_table")),
+            tags$details(
+              tags$summary("Data cleaning review"),
+              selectInput("clean_method", "Detection method", c("Model residuals" = "residual", "IQR" = "iqr")),
+              numericInput("clean_threshold", "Flag threshold", 3, min = 0.5, step = 0.5),
+              textInput("clean_min", "Trait minimum (optional)", ""),
+              textInput("clean_max", "Trait maximum (optional)", ""),
+              actionButton("clean_check", "Check selected trait"),
+              verbatimTextOutput("clean_status"),
+              DTOutput("clean_review"),
+              selectInput("clean_action", "Selected values", c("Exclude", "Keep")),
+              textInput("clean_reason", "Reason for exclusion", ""),
+              actionButton("clean_preview", "Preview changes"),
+              uiOutput("clean_preview_ui"),
+              tags$details(
+                tags$summary("Advanced settings"),
+                uiOutput("clean_controls"),
+                checkboxInput("clean_show_all", "Show all observations", FALSE),
+                checkboxInput("clean_show_records", "Include missing values and record-identity issues", FALSE),
+                tags$p("Diagnostics follow the selected trial design. SOMMER uses a preliminary lme4 compound-symmetry fit; final diagnostics use the SOMMER model."),
+                DTOutput("clean_impact")
+              ),
+              downloadButton("download_cleaning", "Download cleaning record")
+            )
           )
         )
       )
@@ -4034,7 +4055,7 @@ ui <- page_navbar(
           tags$div(
             class = "small-note",
             style = "margin: 0 0 12px 0;",
-            "Trait cells show arithmetic mean \u00b1 raw SD or SE, calculated within each variety. Letters and critical differences come from the selected model comparison. For nonparametric traits, the LSD/HSD row shows the Kruskal-Wallis p-value and Dunn-Holm outcome; it is not a numerical critical difference. Shared letters mean a difference was not detected at alpha = 0.05."
+            "SE: adjusted mean \u00b1 model SE. SD: observed mean \u00b1 observed SD. Letters and critical differences come from the selected model comparison. Shared letters mean a difference was not detected at alpha = 0.05."
           ),
           DTOutput("lsd_wide_table")
         ),
@@ -4173,12 +4194,20 @@ ui <- page_navbar(
 
 # Server
 server <- function(input, output, session) {
+  upload_sheets <- reactive({
+    req(input$excel_file)
+    readxl::excel_sheets(input$excel_file$datapath)
+  })
+  selected_upload_sheet <- reactive({
+    upload_sheets()[1]
+  })
   uploaded_data <- reactive({
     req(input$excel_file)
     df <- tryCatch({
       si_read_excel_upload(
         input$excel_file$datapath,
-        input$excel_file$name
+        input$excel_file$name,
+        sheet = selected_upload_sheet()
       )
     }, error = function(e) {
       validate(need(FALSE, e$message))
@@ -4187,13 +4216,313 @@ server <- function(input, output, session) {
     validate(
       need(report$ok, paste(report$errors, collapse = "\n"))
     )
+    if (id_col %in% names(df)) {
+      rows <- setdiff(seq_len(nrow(df)), si_metadata_rows(df))
+      traits <- setdiff(si_detect_numeric_like_traits(df[rows, , drop = FALSE]),
+        c(id_col, rep_col, observation_id_columns, design_column_candidates))
+      metadata <- si_trait_metadata(df, traits)
+      for (column in intersect(observation_id_columns, names(df))) {
+        values <- trimws(as.character(df[[column]][rows]))
+        valid <- !is.na(values) & nzchar(values)
+        if (any(duplicated(values[valid]))) report$warnings <- c(report$warnings,
+          paste(column, "contains repeated observation IDs. Confirm each ID identifies one plot/observation."))
+      }
+      for (i in seq_len(nrow(metadata))) {
+        tr <- metadata$Trait[i]
+        values <- to_number(df[[tr]][rows])
+        if (metadata$Type[i] == "Score 1-5" && any(is.finite(values) & (values < 1 | values > 5))) {
+          report$warnings <- c(report$warnings, paste(tr, "has score values outside 1-5; review them in Data cleaning review."))
+        }
+      }
+    }
     attr(df, "si_validation_report") <- report
     df
   })
+  diagnostic_context <- reactive({
+    data <- uploaded_data()
+    method <- input$analysis_method %||% "LPSI"
+    if (method == "LPSI") return(list(kind = "single", identity = id_col,
+      rep = rep_col, model = input$lpsi_trial_model %||% "RCBD"))
+    if (method == "MET") return(list(kind = "met", identity = if (id_col %in% names(data)) id_col else "Genotype",
+      environment = if ("Environment" %in% names(data)) "Environment" else "Location",
+      rep = input$met_rep_col %||% rep_col, block = input$met_block_col %||% "",
+      model = input$met_model_type %||% "LMM"))
+    if (method == "MULTIFACTOR") return(list(kind = "multifactor",
+      identity = if (id_col %in% names(data)) id_col else input$mf_factor_a,
+      factors = c(input$mf_factor_a, input$mf_factor_b, if (identical(input$mf_factor_count, "3")) input$mf_factor_c),
+      rep = input$mf_rep, design = input$mf_design %||% "factorial",
+      randomization = input$mf_randomization %||% "RCBD", model = input$mf_model %||% "ANOVA"))
+    identity <- input$clean_identity %||% id_col
+    list(kind = "generic", identity = identity,
+      predictors = input$clean_predictors %||% intersect(c(identity, rep_col, "Environment", "Location"), names(data)),
+      model = "LM")
+  })
+  cleaning <- reactiveValues(review = si_clean_empty(), approved = si_clean_empty(),
+    settings = data.frame(), approved_settings = data.frame(), pending = FALSE,
+    needs_check = FALSE, has_approved = FALSE, notes = character(), baseline = NULL, baseline_type = NULL,
+    preview = NULL, preview_settings = NULL)
+  analysis_data <- reactive({ si_clean_apply(uploaded_data(), cleaning$approved) })
+  cleaning_impact <- reactive({
+    raw <- uploaded_data()
+    traits <- unique(cleaning$approved$Trait)
+    bind_rows(lapply(traits, function(tr) {
+      identity <- cleaning$approved_settings$Identifier[match(tr, cleaning$approved_settings$Trait)]
+      if (!length(identity) || is.na(identity)) identity <- id_col
+      rows <- si_clean_rows(raw, identity)
+      before <- to_number(raw[[tr]][rows])
+      after <- to_number(analysis_data()[[tr]][rows])
+      ids <- as.character(raw[[identity]][rows])
+      before_n <- table(ids[is.finite(before)])
+      after_n <- table(factor(ids[is.finite(after)], levels = names(before_n)))
+      data.frame(Trait = tr, Available_before = sum(is.finite(before)),
+        Available_after = sum(is.finite(after)), Excluded = sum(is.finite(before) & !is.finite(after)),
+        Entries_with_no_data = paste(names(after_n)[after_n == 0], collapse = ", "),
+        Entries_with_one_observation = paste(names(after_n)[after_n == 1], collapse = ", "))
+    }))
+  })
+  attach_cleaning <- function(result) {
+    if (is.null(result)) return(result)
+    raw <- isolate(uploaded_data())
+    identity <- if (id_col %in% names(raw)) id_col else isolate(input$clean_identity)
+    traits <- if (!is.null(result$trait_info$Trait)) result$trait_info$Trait else
+      if (!is.null(result$met_trait_names)) result$met_trait_names else
+      setdiff(si_detect_numeric_like_traits(raw[setdiff(seq_len(nrow(raw)), si_metadata_rows(raw, identity)), , drop = FALSE]),
+        c(identity, rep_col, observation_id_columns, design_column_candidates, type_col_candidates))
+    result$trait_metadata <- si_trait_metadata(raw, traits, identity)
+    result$cleaning_review <- isolate(cleaning$approved)
+    result$cleaning_settings <- isolate(cleaning$approved_settings)
+    result$cleaning_impact <- isolate(cleaning_impact())
+    result$cleaning_rank_changes <- data.frame()
+    baseline <- isolate(cleaning$baseline)
+    if (!is.null(baseline) && identical(isolate(cleaning$baseline_type), isolate(input$analysis_method))) {
+      for (field in c("index_ranking", "final_decision", "met_integrated_ranking", "met_decision_board")) {
+        before <- as.data.frame(baseline[[field]] %||% data.frame())
+        after <- as.data.frame(result[[field]] %||% data.frame())
+        key <- intersect(c("Genotype", "ID"), intersect(names(before), names(after)))
+        cols <- intersect(names(before), names(after))
+        cols <- cols[grepl("rank|decision|action", cols, ignore.case = TRUE)]
+        if (length(key) && length(cols)) {
+          key <- key[1]
+          changes <- merge(before[, unique(c(key, cols)), drop = FALSE],
+            after[, unique(c(key, cols)), drop = FALSE], by = key, all = TRUE,
+            suffixes = c("_before", "_after"))
+          changes$Source <- field
+          result$cleaning_rank_changes <- bind_rows(result$cleaning_rank_changes, changes)
+        }
+      }
+    }
+    result
+  }
+  output$result_cleaning_record <- renderDT({
+    req(analysis_results())
+    datatable(analysis_results()$cleaning_review %||% si_clean_empty(), rownames = FALSE,
+      options = list(scrollX = TRUE, pageLength = 5))
+  })
+  output$result_trait_metadata <- renderDT({
+    req(analysis_results())
+    datatable(analysis_results()$trait_metadata %||% data.frame(), rownames = FALSE,
+      options = list(pageLength = 10, scrollX = TRUE))
+  })
+  output$result_cleaning_changes <- renderDT({
+    req(analysis_results())
+    datatable(analysis_results()$cleaning_rank_changes %||% data.frame(), rownames = FALSE,
+      options = list(scrollX = TRUE, pageLength = 5))
+  })
+  clean_selected_trait <- reactive(input$eval_trait %||% input$clean_trait)
+  output$clean_controls <- renderUI({
+    data <- uploaded_data()
+    columns <- names(data)
+    numeric_cols <- setdiff(columns[vapply(data, function(x) any(is.finite(to_number(x))), logical(1))], c(observation_id_columns, design_column_candidates))
+    tagList(
+      selectInput("clean_identity", "Genotype / entry identifier", columns,
+        selected = isolate(input$clean_identity) %||% if (id_col %in% columns) id_col else columns[1]),
+      selectInput("clean_predictors", "Design columns (include identifier and trial factors)", columns,
+        selected = isolate(input$clean_predictors) %||% intersect(c(id_col, rep_col, "Environment"), columns), multiple = TRUE)
+    )
+  })
+  observeEvent(list(input$excel_file, selected_upload_sheet()), {
+    cleaning$review <- si_clean_empty(); cleaning$approved <- si_clean_empty()
+    cleaning$settings <- data.frame(); cleaning$approved_settings <- data.frame()
+    cleaning$pending <- FALSE; cleaning$needs_check <- FALSE; cleaning$notes <- character()
+    cleaning$has_approved <- FALSE
+    cleaning$baseline <- NULL; cleaning$baseline_type <- NULL
+    cleaning$preview <- NULL; cleaning$preview_settings <- NULL
+  }, ignoreInit = TRUE)
+  observeEvent(list(input$clean_identity, clean_selected_trait(), input$clean_predictors, diagnostic_context(),
+    input$clean_method, input$clean_threshold, input$clean_min, input$clean_max,
+    input$analysis_method, input$met_model_type, input$lpsi_trial_model,
+    input$met_rep_col, input$met_block_col, input$mf_model, input$mf_design), {
+    if (nrow(cleaning$settings)) {
+      cleaning$needs_check <- TRUE
+      cleaning$preview <- NULL
+    }
+  }, ignoreInit = TRUE)
+  observeEvent(input$clean_check, {
+    req(clean_selected_trait())
+    context <- diagnostic_context()
+    identity <- context$identity
+    predictors <- unique(c(context$identity, context$rep, context$environment, context$block, context$factors,
+      context$predictors, input$clean_predictors))
+    predictors <- intersect(predictors, names(uploaded_data()))
+    tryCatch({
+      lower <- suppressWarnings(as.numeric(input$clean_min)); upper <- suppressWarnings(as.numeric(input$clean_max))
+      if (!length(lower)) lower <- NA_real_
+      if (!length(upper)) upper <- NA_real_
+      if (is.finite(lower) && is.finite(upper) && lower > upper) stop("Minimum must not exceed maximum.")
+      checked <- si_clean_screen(uploaded_data(), clean_selected_trait(), identity,
+        predictors, input$clean_method %||% "residual", input$clean_threshold %||% 3, lower, upper, context = diagnostic_context())
+      prior <- cleaning$review
+      tab <- checked$review
+      key <- paste(tab$Row, tab$Trait); old <- match(key, paste(prior$Row, prior$Trait))
+      matched <- !is.na(old)
+      tab$Action[matched] <- prior$Action[old[matched]]; tab$Reason[matched] <- prior$Reason[old[matched]]
+      cleaning$review <- bind_rows(prior[prior$Trait != clean_selected_trait(), , drop = FALSE], tab)
+      setting <- data.frame(Trait = clean_selected_trait(), Identifier = identity,
+        Predictors = paste(predictors, collapse = ", "), Method = input$clean_method %||% "residual",
+        Threshold = input$clean_threshold %||% 3, Minimum = lower, Maximum = upper,
+        Diagnostic_model = paste(unlist(diagnostic_context()), collapse = "; "),
+        Checked_at = format(Sys.time(), tz = "UTC", usetz = TRUE))
+      cleaning$settings <- bind_rows(cleaning$settings[cleaning$settings$Trait != clean_selected_trait(), , drop = FALSE], setting)
+      cleaning$notes <- checked$notes
+      cleaning$pending <- TRUE
+      cleaning$needs_check <- FALSE
+      cleaning$preview <- NULL
+    }, error = function(e) showNotification(conditionMessage(e), type = "error"))
+  })
+  clean_visible_rows <- reactive({
+    tab <- cleaning$review
+    selected_trait <- tab$Trait == clean_selected_trait()
+    if (isTRUE(input$clean_show_all)) return(which(selected_trait))
+    flagged <- if (isTRUE(input$clean_show_records)) nzchar(tab$Flag) else si_clean_value_flag(tab$Flag)
+    which(selected_trait & (flagged | tab$Action == "Exclude"))
+  })
+  observeEvent(list(input$clean_show_all, input$clean_show_records), {
+    selectRows(dataTableProxy("clean_review", session = session), NULL)
+    if (!is.null(cleaning$preview)) {
+      cleaning$preview <- NULL
+    }
+  }, ignoreInit = TRUE)
+  output$clean_review <- renderDT({
+    tab <- cleaning$review[clean_visible_rows(), , drop = FALSE]
+    if (nrow(tab)) {
+      raw <- uploaded_data()
+      context <- intersect(unique(c(input$clean_identity %||% id_col,
+        input$clean_predictors %||% c(rep_col, "Environment"))), names(raw))
+      tab <- cbind(tab, raw[tab$Row, context, drop = FALSE])
+    }
+    datatable(tab, rownames = FALSE, selection = "multiple",
+      options = list(pageLength = 10, scrollX = TRUE))
+  })
+  observeEvent(input$clean_preview, {
+    tryCatch({
+      if (!clean_selected_trait() %in% cleaning$settings$Trait) stop("Check the selected trait before previewing changes.")
+      if (isTRUE(cleaning$needs_check)) stop("Settings changed. Click Check data again before applying cleaning.")
+      selected <- clean_visible_rows()[input$clean_review_rows_selected %||% integer()]
+      draft <- cleaning$review
+      if (length(selected)) {
+        action <- input$clean_action %||% "Exclude"
+        reason <- input$clean_reason %||% ""
+        if (action == "Exclude" && !nzchar(trimws(reason))) stop("Enter a reason for the selected exclusions.")
+        draft$Action[selected] <- action
+        draft$Reason[selected] <- reason
+      }
+      proposed_data <- si_clean_apply(uploaded_data(), draft)
+      trait_rows <- si_clean_rows(proposed_data, input$clean_identity %||% id_col)
+      if (!any(is.finite(to_number(proposed_data[[clean_selected_trait()]][trait_rows])))) {
+        stop("No usable observations would remain for this trait. Keep some values before previewing.")
+      }
+      cleaning$preview <- draft
+      cleaning$preview_settings <- cleaning$settings
+      cleaning$pending <- TRUE
+    }, error = function(e) showNotification(conditionMessage(e), type = "error"))
+  })
+  observeEvent(list(input$clean_review_rows_selected, input$clean_action, input$clean_reason), {
+    if (!is.null(cleaning$preview)) {
+      cleaning$preview <- NULL
+    }
+  }, ignoreInit = TRUE)
+  observeEvent(input$clean_apply, {
+    tryCatch({
+      if (is.null(cleaning$preview) || isTRUE(cleaning$needs_check)) stop("Preview the current changes before accepting reviewed data.")
+      cleaning$review <- cleaning$preview
+      cleaning$approved <- cleaning$preview
+      cleaning$approved_settings <- cleaning$preview_settings
+      cleaning$pending <- FALSE
+      cleaning$has_approved <- TRUE
+      if (!is.null(analysis_results())) {
+        cleaning$baseline <- analysis_results()
+        cleaning$baseline_type <- analysis_used()
+      }
+      si_reset_analysis_state(analysis_results, analysis_used, analysis_message, saved_results,
+        reason = "Reviewed data accepted. Run analysis to continue.")
+      impact <- cleaning_impact()
+      if (nrow(impact) && any(nzchar(impact$Entries_with_no_data) | nzchar(impact$Entries_with_one_observation))) {
+        showNotification("Some entries have zero or one remaining observation. Review the cleaning impact table before interpreting rankings.",
+          type = "warning", duration = NULL)
+      }
+    }, error = function(e) showNotification(conditionMessage(e), type = "error"))
+  })
+  output$clean_preview_ui <- renderUI({
+    if (is.null(cleaning$preview)) return(NULL)
+    tagList(
+      plotOutput("clean_preview_plot", height = "440px"),
+      if (cleaning$pending) tags$p("These changes are a preview. Analysis data changes only when you accept below.") else
+        tags$p("Reviewed data accepted. Continue with Run analysis."),
+      if (cleaning$pending) actionButton("clean_apply", "Accept reviewed data")
+    )
+  })
+  output$clean_preview_plot <- renderPlot({
+    req(!is.null(cleaning$preview), clean_selected_trait(), input$diagnostic_plot_type)
+    raw <- make_diagnostic_data(uploaded_data(), diagnostic_context())
+    proposed <- make_diagnostic_data(si_clean_apply(uploaded_data(), cleaning$preview), diagnostic_context())
+    trait <- clean_selected_trait()
+    excluded <- cleaning$preview[cleaning$preview$Action == "Exclude", , drop = FALSE]
+    proposed$excluded_counts <- as.list(table(excluded$Trait))
+    p_raw <- make_diagnostic_plot(raw, trait, input$diagnostic_plot_type, "raw") +
+      labs(title = paste("Raw:", trait)) + theme_bw()
+    p_proposed <- make_diagnostic_plot(proposed, trait, input$diagnostic_plot_type, "trimmed") +
+      labs(title = paste("Proposed:", trait), subtitle = sub("Approved cleaned data", "Proposed data",
+        si_diagnostic_preview(proposed, trait, "trimmed")$note, fixed = TRUE)) + theme_bw()
+    # Fixed histogram bin boundaries keep the before/after display comparable.
+    if (input$diagnostic_plot_type %in% c("Raw trait histogram", "Residual histogram")) {
+      values <- if (input$diagnostic_plot_type == "Raw trait histogram") raw$data[[trait]] else
+        c(p_raw$data$Residual, p_proposed$data$Residual)
+      limits <- range(values, na.rm = TRUE)
+      width <- diff(limits) / 20
+      if (is.finite(width) && width > 0) {
+        p_raw$layers[[1]]$stat_params$binwidth <- width
+        p_proposed$layers[[1]]$stat_params$binwidth <- width
+        p_raw$layers[[1]]$stat_params$boundary <- limits[1]
+        p_proposed$layers[[1]]$stat_params$boundary <- limits[1]
+        p_raw <- p_raw + coord_cartesian(xlim = limits)
+        p_proposed <- p_proposed + coord_cartesian(xlim = limits)
+      }
+    }
+    p_raw + p_proposed
+  })
+  output$clean_status <- renderText({
+    if (!nrow(cleaning$settings)) return("Choose a trait above, then check its data.")
+    tab <- cleaning$review[cleaning$review$Trait == clean_selected_trait(), , drop = FALSE]
+    record_issues <- sum(grepl("Repeated identifier|Missing identifier|Missing or non-numeric", tab$Flag))
+    paste(sum(si_clean_value_flag(tab$Flag)), "unusual values |",
+      record_issues, "missing/identity issues (Advanced settings) |",
+      sum(cleaning$approved$Action == "Exclude"), "excluded.",
+      if (!cleaning$pending) "Accepted data is ready for analysis. To change cleaning, check the selected trait again." else if (cleaning$needs_check) "Draft settings changed: check again." else if (!is.null(cleaning$preview)) "Preview ready. Compare the charts, then accept reviewed data." else "Choose exclusions, then preview changes.",
+      paste(cleaning$notes, collapse = " | "))
+  })
+  output$clean_impact <- renderDT({ datatable(cleaning_impact(), rownames = FALSE) })
+  output$download_cleaning <- downloadHandler(
+    filename = function() "PhenoSelect_cleaning.xlsx",
+    content = function(file) writexl::write_xlsx(list(Original = uploaded_data(),
+      Approved_data = analysis_data(), Review = cleaning$approved,
+      Settings = cleaning$approved_settings, Impact = cleaning_impact()), file))
   diagnostic_data <- reactive({
     req(uploaded_data())
     tryCatch({
-      make_diagnostic_data(uploaded_data())
+      diag <- make_diagnostic_data(uploaded_data(), diagnostic_context())
+      excluded <- cleaning$approved[cleaning$approved$Action == "Exclude", , drop = FALSE]
+      diag$excluded_counts <- as.list(table(excluded$Trait))
+      diag
     }, error = function(e) {
       NULL
     })
@@ -4286,6 +4615,7 @@ server <- function(input, output, session) {
       values <- si_to_number(x)
       sum(is.finite(values)) > 0
     }, logical(1))]
+    traits <- setdiff(traits, c(observation_id_columns, design_column_candidates))
     count <- as.integer(input$mf_factor_count %||% 2)
     design <- input$mf_design %||% "factorial"
     randomization <- input$mf_randomization %||% "RCBD"
@@ -4326,7 +4656,7 @@ server <- function(input, output, session) {
     prior <- intersect(input$mf_checks %||% character(0), values)
     selectInput("mf_checks", "Check level(s)", values, selected = if (length(prior)) prior else head(values, 1), multiple = TRUE)
   })
-  observeEvent(input$excel_file, {
+  observeEvent(list(input$excel_file, selected_upload_sheet()), {
     si_reset_analysis_state(
       analysis_results,
       analysis_used,
@@ -4391,7 +4721,7 @@ server <- function(input, output, session) {
   })
   run_lpsi_with_settings <- function(settings = lpsi_settings()) {
     run_selection_pipeline(
-      uploaded_data(),
+      analysis_data(),
       check_varieties = settings$checks,
       model_type = settings$model,
       advance_cutoff = settings$advance,
@@ -4437,6 +4767,7 @@ server <- function(input, output, session) {
       NULL
     })
     if (!is.null(res)) {
+      res <- attach_cleaning(res)
       analysis_results(res)
       saved_results$LPSI <- res
       analysis_message("Single-Location Trial decision settings updated.")
@@ -4486,7 +4817,8 @@ server <- function(input, output, session) {
     build_met_integrated_ranking(
       uploaded_data(),
       analysis_results()$met_by_trait,
-      component_weights = met_component_weights()
+      component_weights = met_component_weights(),
+      trait_cols = analysis_results()$settings$Trait
     )
   })
   met_selection_pct <- reactive({
@@ -4627,7 +4959,7 @@ server <- function(input, output, session) {
       lpsi_views <- if (identical(lpsi_mode, "multi")) {
         c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot")
       } else {
-        c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot")
+        c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot", "lpsi_diagnostics_plot")
       }
       if (!(view %in% lpsi_views)) {
         view <- unname(lpsi_views)[1]
@@ -4643,8 +4975,11 @@ server <- function(input, output, session) {
       view <- "diversity_superiority_plot"
     }
     
-    if (view %in% c("lpsi_direct_plot", "lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot", "lpsi_gain_curve", "lpsi_mean_comparison_plot")) {
+    if (view %in% c("lpsi_direct_plot", "lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot", "lpsi_gain_curve", "lpsi_mean_comparison_plot", "lpsi_diagnostics_plot")) {
       lpsi <- lpsi_result()
+      if (view == "lpsi_diagnostics_plot") return(list(
+        plot = si_lpsi_diagnostic_plot(lpsi, input$lpsi_chart_trait %||% lpsi$trait_info$Trait[1]),
+        name = paste0("Single-Location_Trial_diagnostics_", input$lpsi_chart_trait)))
       if (view == "lpsi_mean_comparison_plot") {
         comparison <- lpsi_selected_mean_comparison()
         comparison_trait <- comparison$trait
@@ -4752,7 +5087,7 @@ server <- function(input, output, session) {
       validate(need(!is.null(trait_name) && trait_name != "", "Choose a trait."))
       return(list(
         plot = breeding_plot_distribution_shift(
-          uploaded_data(),
+          si_observation_data(analysis_data(), input$breeding_genotype_col),
           trait = trait_name,
           generation_col = generation_col
         ),
@@ -4853,6 +5188,7 @@ server <- function(input, output, session) {
         "Single-Location_Trial_trait_correlation"
       ),
       lpsi_anova = list(list(ANOVA = lpsi_result()$anova_full), "Single-Location_Trial_ANOVA"),
+      lpsi_diagnostics = list(list(Diagnostics = lpsi_result()$residual_diagnostics), "Single-Location_Trial_diagnostics"),
       lpsi_lsd = {
         comparison <- lpsi_all_traits_mean_comparison()
         list(
@@ -4964,7 +5300,7 @@ server <- function(input, output, session) {
       lpsi_views <- if (identical(lpsi_mode, "multi")) {
         c("lpsi_ranking_plot", "lpsi_heatmap", "lpsi_correlation_plot")
       } else {
-        c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot")
+        c("lpsi_mean_comparison_plot", "lpsi_gain_curve", "lpsi_direct_plot", "lpsi_diagnostics_plot")
       }
       if (!(view %in% lpsi_views)) {
         view <- unname(lpsi_views)[1]
@@ -4983,6 +5319,7 @@ server <- function(input, output, session) {
       view,
       lpsi_direct_plot = "lpsi_direct_plot",
       lpsi_mean_comparison_plot = "lpsi_mean_comparison_plot",
+      lpsi_diagnostics_plot = "lpsi_diagnostics_plot",
       lpsi_ranking_plot = "ranking_plot",
       lpsi_heatmap = "heatmap_plot",
       lpsi_correlation_plot = "lpsi_correlation_plot",
@@ -5038,10 +5375,25 @@ server <- function(input, output, session) {
       NULL
     })
     cat("Upload successful\n")
+    cat("File:", input$excel_file$name, "\n")
+    ids <- intersect(observation_id_columns, names(data))
+    cat("Observation ID:", if (length(ids)) paste(ids, collapse = ", ") else "Not present in this worksheet", "\n")
+    if (id_col %in% names(data)) {
+      labels <- toupper(trimws(as.character(data[[id_col]])))
+      if (!any(labels %in% c(trait_type_row_labels, unit_row_labels))) {
+        cat("No TYPE/UNIT metadata found. Save the metadata on the first worksheet and upload the updated workbook.\n")
+      }
+    }
     cat("Number of rows:", nrow(data), "\n")
     cat("Number of columns:", ncol(data), "\n")
+    report <- attr(data, "si_validation_report")
+    summary_warnings <- report$warnings[!grepl("has score values outside 1-5", report$warnings, fixed = TRUE)]
+    if (length(summary_warnings)) cat(paste(summary_warnings, collapse = "\n"), "\n")
     if (!is.null(diag)) {
       cat("Number of traits observed:", length(diag$trait_cols), "\n")
+      metadata <- si_trait_metadata(data, diag$trait_cols)
+      cat("Scoring traits (1-5):", sum(metadata$Type == "Score 1-5"), "\n")
+      cat("Quantitative traits:", sum(metadata$Type == "Quantitative"), "\n")
       cat("Replication number:", n_distinct(diag$data$Rep), "\n")
     } else {
       cat("Trait and replication information could not be detected.\n")
@@ -5068,7 +5420,10 @@ server <- function(input, output, session) {
       return(tags$div(
         class = "panel-heading",
         tags$div(class = "panel-title", "Data summary by trait"),
-        tags$div(class = "panel-subtitle", "Residual normality test for every measured trait")
+      tags$div(class = "panel-subtitle", paste(
+        "Residual normality test for every measured trait |",
+        "Raw data before cleaning"
+      ))
       ))
     }
     trait <- input$eval_trait %||% "selected trait"
@@ -5130,6 +5485,7 @@ server <- function(input, output, session) {
       lpsi_index_summary = "Selection Index summary",
       lpsi_correlation = "Trait correlation",
       lpsi_anova = "Single-Location Trial analysis of variance",
+      lpsi_diagnostics = "Fitted-model diagnostics",
       lpsi_lsd = "Mean comparison",
       lpsi_superiority = "Trait superiority vs mean check benchmark",
       lpsi_heritability = "Heritability and genetic gain",
@@ -5192,7 +5548,7 @@ server <- function(input, output, session) {
           ),
           selectInput(
             "lpsi_mean_spread", NULL,
-            choices = c("Raw SE" = "se", "Raw SD" = "sd"),
+            choices = c("SE" = "se", "SD" = "sd"),
             selected = lpsi_mean_spread_r()
           )
         ))
@@ -5887,10 +6243,7 @@ server <- function(input, output, session) {
       matched <- candidates[candidates %in% all_cols]
       if (length(matched) > 0) matched[1] else ""
     }
-    choose_required_col <- function(current_value, candidates) {
-      selected <- choose_optional_col(current_value, candidates)
-      if (selected != "") selected else all_cols[1]
-    }
+    design_cols <- met_design_column_choices(prepared)
     check_choices <- unique(clean_text(prepared$data$Genotype))
     check_choices <- check_choices[!is.na(check_choices) & check_choices != ""]
     priority_traits <- prepared$trait_info$Trait[
@@ -5927,8 +6280,8 @@ server <- function(input, output, session) {
       selectInput(
         inputId = "met_rep_col",
         label = "Replication column",
-        choices = all_cols,
-        selected = choose_required_col(input$met_rep_col, met_rep_col_candidates)
+        choices = c("Choose replication column" = "", setdiff(design_cols, selected_traits)),
+        selected = met_default_replication_col(prepared, input$met_rep_col)
       ),
       selectInput(
         inputId = "met_model_type",
@@ -5943,8 +6296,11 @@ server <- function(input, output, session) {
       selectInput(
         inputId = "met_block_col",
         label = "Block column",
-        choices = c("No block column" = "", all_cols),
-        selected = choose_optional_col(input$met_block_col, met_block_col_candidates)
+        choices = c("No block column" = "", setdiff(design_cols, selected_traits)),
+        selected = {
+          chosen <- choose_optional_col(input$met_block_col, met_block_col_candidates)
+          if (chosen %in% design_cols) chosen else ""
+        }
       ),
       numericInput(
         inputId = "met_min_envs_for_biplot",
@@ -6184,12 +6540,12 @@ server <- function(input, output, session) {
     }
     rep_default <- choose_default(c(rep_col, "Replication", "REP", "Block", "Replicate"), all_cols, allow_empty = TRUE)
     genotype_values_upper <- toupper(clean_text(data[[genotype_col]]))
-    metadata_rows <- genotype_values_upper %in% c(weight_row_labels, direction_row_labels)
+    metadata_rows <- genotype_values_upper %in% metadata_row_labels
     trait_detection_data <- data[!metadata_rows, , drop = FALSE]
     numeric_cols <- all_cols[vapply(trait_detection_data, function(column) {
       sum(!is.na(to_number(column))) > 0
     }, logical(1))]
-    trait_choices <- setdiff(numeric_cols, c(genotype_col, rep_default))
+    trait_choices <- setdiff(numeric_cols, c(genotype_col, rep_default, observation_id_columns, design_column_candidates))
     if (length(trait_choices) == 0) trait_choices <- numeric_cols
     check_choices <- unique(clean_text(trait_detection_data[[genotype_col]]))
     check_choices <- check_choices[!is.na(check_choices) & check_choices != ""]
@@ -6244,6 +6600,7 @@ server <- function(input, output, session) {
     trait_candidates <- setdiff(
       numeric_cols,
       c(
+        observation_id_columns, design_column_candidates,
         "Rep", "Replication", "Block", "Male", "Female",
         "Parent1", "Parent2", "Parent 1", "Parent 2",
         "Line", "Tester", "Type", "type"
@@ -6318,7 +6675,7 @@ server <- function(input, output, session) {
     }, logical(1))]
     numeric_cols <- setdiff(
       numeric_cols,
-      c("Rep", "Replication", "Block", "Cycle", "Generation", "Stage")
+      c(rep_col, "Replication", "Block", "Cycle", "Generation", "Stage", observation_id_columns, design_column_candidates)
     )
     if (length(numeric_cols) == 0) {
       numeric_cols <- all_cols
@@ -6445,22 +6802,21 @@ server <- function(input, output, session) {
     make_diagnostic_plot(
       diag = diagnostic_data(),
       trait = input$eval_trait,
-      plot_type = input$diagnostic_plot_type
+      plot_type = input$diagnostic_plot_type,
+      stage = "raw"
     )
   })
   output$shapiro_table <- renderDT({
     req(diagnostic_data())
-    summary_table <- make_shapiro_table(diagnostic_data()) %>%
+    summary_table <- make_shapiro_table(diagnostic_data(), "raw") %>%
       transmute(
         Trait,
         `Residual observations` = N_residual,
         `Shapiro W` = Shapiro_W,
         `P value` = p_value,
-        `Shapiro result` = ifelse(
-          Normality_note == "Yes",
-          "Residuals are approximately normal",
-          "Review residual distribution"
-        )
+        `Shapiro result` = ifelse(!is.finite(p_value), "Test unavailable",
+          ifelse(Normality_note == "Yes", "No Shapiro-Wilk rejection",
+            "Normality warning: inspect residuals"))
       )
     datatable(
       summary_table,
@@ -6469,7 +6825,13 @@ server <- function(input, output, session) {
     )
   })
   observeEvent(input$run_analysis, {
-    req(uploaded_data())
+    req(analysis_data())
+    if (isTRUE(cleaning$pending) && !isTRUE(cleaning$has_approved)) {
+      showNotification("No cleaning review has been accepted yet. Preview and accept reviewed data before analysis.", type = "error"); return()
+    }
+    if (isTRUE(cleaning$pending) && isTRUE(cleaning$has_approved)) {
+      showNotification("Using your last accepted data. Unaccepted review changes are not included.", type = "message")
+    }
     analysis_results(NULL)
     analysis_used(input$analysis_method)
     if (input$analysis_method == "MATING") {
@@ -6487,7 +6849,7 @@ server <- function(input, output, session) {
       analysis_message("Running mating analysis...")
       res <- tryCatch({
         run_mating_pipeline(
-          df = uploaded_data(),
+          df = analysis_data()[setdiff(seq_len(nrow(analysis_data())), si_metadata_rows(analysis_data())), , drop = FALSE],
           design = input$mating_design,
           trait_col = input$mating_trait_col,
           replication_col = input$mating_rep_col,
@@ -6505,6 +6867,7 @@ server <- function(input, output, session) {
         )
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$MATING <- res
@@ -6552,7 +6915,7 @@ server <- function(input, output, session) {
       analysis_message("Running Pre-Breeding Analysis...")
       res <- tryCatch({
         out <- breeding_run_gain_pipeline(
-          data = uploaded_data(),
+          data = analysis_data()[setdiff(seq_len(nrow(analysis_data())), si_metadata_rows(analysis_data(), input$breeding_genotype_col)), , drop = FALSE],
           traits = input$breeding_trait_cols,
           genotype = input$breeding_genotype_col,
           replication = rep_col_used,
@@ -6566,7 +6929,7 @@ server <- function(input, output, session) {
         if (!is.null(generation_col_used)) {
           out$generation_stats <- purrr::map_dfr(input$breeding_trait_cols, function(trait_name) {
             breeding_compute_generation_stats(
-              data = uploaded_data(),
+              data = si_observation_data(analysis_data(), input$breeding_genotype_col),
               trait = trait_name,
               genotype = input$breeding_genotype_col,
               replication = rep_col_used,
@@ -6596,6 +6959,7 @@ server <- function(input, output, session) {
         )
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$BREEDING <- res
@@ -6615,19 +6979,20 @@ server <- function(input, output, session) {
                        if (identical(input$mf_factor_count, "3")) input$mf_factor_c)
       analysis_message("Running Multi-factor analysis...")
       res <- tryCatch(mf_run_traits(
-        df = uploaded_data(), response_cols = input$mf_response,
+        df = analysis_data(), response_cols = input$mf_response,
         directions = stats::setNames(lapply(input$mf_response, mf_resolved_direction), input$mf_response),
         factor_cols = factor_cols, design = input$mf_design,
         randomization = input$mf_randomization, model_type = input$mf_model,
         replication_col = input$mf_rep, comparison_factor = "A",
         checks = input$mf_checks,
         comparison_method = input$mf_result_method %||% "tukey",
-        metadata_col = if (id_col %in% names(uploaded_data())) id_col else input$mf_factor_a,
-        metadata_labels = c(weight_row_labels, direction_row_labels)
+        metadata_col = if (id_col %in% names(analysis_data())) id_col else input$mf_factor_a,
+        metadata_labels = metadata_row_labels
       ), error = function(e) {
         showNotification(paste("Multi-factor analysis failed:", e$message), type = "error", duration = NULL)
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$MULTIFACTOR <- res
@@ -6649,6 +7014,7 @@ server <- function(input, output, session) {
         )
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$LPSI <- res
@@ -6667,7 +7033,7 @@ server <- function(input, output, session) {
     } else if (input$analysis_method == "MET") {
       met_traits <- input$met_trait_cols
       if (is.null(met_traits) || length(met_traits) == 0) {
-        met_traits <- tryCatch(head(get_met_trait_cols(uploaded_data()), 3), error = function(e) character(0))
+        met_traits <- tryCatch(head(get_met_trait_cols(analysis_data()), 3), error = function(e) character(0))
       }
       validate(need(length(met_traits) > 0, "Choose at least one MET trait to run."))
       met_rep_col <- if (!is.null(input$met_rep_col) && input$met_rep_col != "") input$met_rep_col else NULL
@@ -6679,7 +7045,7 @@ server <- function(input, output, session) {
       analysis_message(paste0("Running MET analysis for ", length(met_traits), " selected trait(s)..."))
       res <- tryCatch({
         run_met_all_traits(
-          uploaded_data(),
+          analysis_data(),
           check_varieties = input$met_reference_checks,
           trait_cols = met_traits,
           replication_col = met_rep_col,
@@ -6689,12 +7055,13 @@ server <- function(input, output, session) {
         )
       }, error = function(e) {
         showNotification(
-          paste("MET pipeline failed:", conditionMessage(e)),
+          paste("MET pipeline failed:", si_plain_error_message(e)),
           type = "error",
           duration = NULL
         )
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$MET <- res
@@ -6736,14 +7103,14 @@ server <- function(input, output, session) {
       } else {
         NULL
       }
-      diversity_data <- uploaded_data()
+      diversity_data <- analysis_data()
       diversity_trait_info <- make_diversity_trait_info(
         diversity_data,
         input$diversity_genotype_col,
         input$diversity_trait_cols
       )
       genotype_values_upper <- toupper(clean_text(diversity_data[[input$diversity_genotype_col]]))
-      metadata_rows <- genotype_values_upper %in% c(weight_row_labels, direction_row_labels)
+      metadata_rows <- genotype_values_upper %in% metadata_row_labels
       if (any(metadata_rows, na.rm = TRUE)) {
         diversity_data <- diversity_data[!metadata_rows, , drop = FALSE]
       }
@@ -6775,6 +7142,7 @@ server <- function(input, output, session) {
         )
         NULL
       })
+      res <- attach_cleaning(res)
       analysis_results(res)
       if (!is.null(res)) {
         saved_results$DIVERSITY <- res
@@ -7245,6 +7613,13 @@ server <- function(input, output, session) {
       lpsi_results = result
     ))
   }, res = 96, execOnResize = TRUE)
+  output$lpsi_diagnostics_table <- renderDT({
+    datatable(lpsi_result()$residual_diagnostics, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+  })
+  output$lpsi_diagnostics_plot <- renderPlot({
+    result <- lpsi_result()
+    print(si_lpsi_diagnostic_plot(result, input$lpsi_chart_trait %||% result$trait_info$Trait[1]))
+  }, res = 96)
   output$lpsi_mean_comparison_plot <- renderPlot({
     result <- lpsi_result()
     validate(need(!is.null(input$lpsi_chart_trait) && input$lpsi_chart_trait != "", "Choose a trait."))
@@ -7315,7 +7690,7 @@ server <- function(input, output, session) {
     ))
     validate(need(!is.null(input$breeding_plot_trait) && input$breeding_plot_trait != "", "Choose a trait."))
     print(breeding_plot_distribution_shift(
-      uploaded_data(),
+      si_observation_data(analysis_data(), input$breeding_genotype_col),
       trait = input$breeding_plot_trait,
       generation_col = input$breeding_generation_col
     ))

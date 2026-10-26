@@ -836,7 +836,7 @@ build_met_multitrait_methods <- function(df_raw, met_results, integrated_ranking
     dplyr::arrange(dplyr::desc(GYT_index))
   gge_score <- dplyr::bind_rows(lapply(traits, function(tr) {
     tab <- as.data.frame(met_ds_null(met_results[[tr]]$gge_mean_stability_decision, data.frame()))
-    if (!all(c("Genotype", "Direction_adjusted_mean_rank", "Stability_rank") %in% names(tab))) return(data.frame())
+    if (!all(c("Genotype", "Direction_adjusted_mean_rank", "Stability_rank") %in% names(tab))) return(data.frame(Genotype = character(), Trait = character(), GGE_score = numeric(), Weight = numeric()))
     tab %>%
       dplyr::transmute(
         Genotype = as.character(Genotype),
@@ -1040,7 +1040,7 @@ build_met_decision_board <- function(df_raw, met_results, integrated_ranking, me
 
   coverage <- dplyr::bind_rows(lapply(traits, function(tr) {
     pres <- as.data.frame(met_ds_null(met_results[[tr]]$presence, data.frame()))
-    if (!all(c("Genotype", "n_envs") %in% names(pres))) return(data.frame())
+    if (!all(c("Genotype", "n_envs") %in% names(pres))) return(data.frame(Genotype = character(), Trait = character(), Observed_locations = numeric(), Total_locations = integer(), Coverage_pct = numeric()))
     env_cols <- setdiff(names(pres), c("Genotype", "n_envs"))
     data.frame(
       Genotype = as.character(pres$Genotype),
@@ -1103,7 +1103,7 @@ build_met_decision_board <- function(df_raw, met_results, integrated_ranking, me
       win_tab %>%
         dplyr::count(Genotype = as.character(Winner), name = "Winning_locations")
     } else data.frame(Genotype = character(), Winning_locations = integer())
-    if (nrow(mean_part) == 0) return(data.frame())
+    if (nrow(mean_part) == 0) return(data.frame(Genotype = character(), Trait = character(), Broad_stable = logical(), Broad_high = logical(), Broad_class = character(), Winning_locations = integer()))
     mean_part %>% dplyr::left_join(winner_part, by = "Genotype") %>%
       dplyr::mutate(Winning_locations = tidyr::replace_na(Winning_locations, 0L))
   })) %>%
@@ -1269,7 +1269,7 @@ build_met_decision_board <- function(df_raw, met_results, integrated_ranking, me
     )
   winner_envs <- dplyr::bind_rows(lapply(traits, function(tr) {
     win <- as.data.frame(met_ds_null(met_results[[tr]]$gge_winner_decision, data.frame()))
-    if (!all(c("Environment", "Winner") %in% names(win))) return(data.frame())
+    if (!all(c("Environment", "Winner") %in% names(win))) return(data.frame(Genotype = character(), Win = character()))
     data.frame(Genotype = as.character(win$Winner), Win = paste(tr, win$Environment, sep = "@"), stringsAsFactors = FALSE)
   })) %>%
     dplyr::group_by(Genotype) %>%
@@ -2584,7 +2584,8 @@ prepare_met_input_frame <- function(df_raw) {
 pick_met_numeric_traits <- function(df, protected_cols) {
   candidate_cols <- setdiff(names(df), protected_cols)
   numeric_count <- sapply(candidate_cols, function(tr) sum(!is.na(to_number(df[[tr]]))))
-  trait_cols <- candidate_cols[numeric_count > 0]
+  empty_traits <- vapply(df[candidate_cols], function(x) all(is.na(x) | trimws(as.character(x)) == ""), logical(1))
+  trait_cols <- candidate_cols[numeric_count > 0 | empty_traits]
   if (length(trait_cols) == 0) {
     stop("MET requires at least one numeric trait column.")
   }
@@ -2600,14 +2601,14 @@ prepare_met_trait_settings <- function(df_raw) {
   direction_rows <- which(genotype_values_upper %in% direction_row_labels)
   weight_row <- if (length(weight_rows) > 0) tail(weight_rows, 1) else integer(0)
   direction_row <- if (length(direction_rows) > 0) tail(direction_rows, 1) else integer(0)
-  metadata_rows <- sort(unique(c(weight_rows, direction_rows)))
+  metadata_rows <- si_metadata_rows(df, "Genotype")
   df_data <- df
   if (length(metadata_rows) > 0) {
     df_data <- df_data[-metadata_rows, , drop = FALSE]
   }
   trait_cols <- pick_met_numeric_traits(
     df_data,
-    c("Genotype", "Environment", met_rep_col_candidates, met_block_col_candidates)
+    c("Genotype", "Environment", met_rep_col_candidates, met_block_col_candidates, observation_id_columns, design_column_candidates)
   )
   weights_raw_used <- setNames(rep(1, length(trait_cols)), trait_cols)
   if (length(weight_row) > 0) {
@@ -2650,15 +2651,31 @@ prepare_met_trait_settings <- function(df_raw) {
     Raw_weight = as.numeric(weights_raw_used[trait_cols]),
     stringsAsFactors = FALSE
   )
+  trait_metadata <- si_trait_metadata(df, trait_cols, "Genotype")
+  trait_info <- cbind(trait_info, trait_metadata[, c("Type", "Unit", "Metadata_source"), drop = FALSE])
   list(
     data = df_data,
     trait_cols = trait_cols,
+    trait_metadata = trait_metadata,
     weights_raw_used = weights_raw_used,
     trait_direction = trait_direction,
     target_traits = target_traits,
     trait_info = trait_info
   )
 }
+# Design columns must not reuse the genotype, environment, or response.
+met_design_column_choices <- function(prepared) {
+  setdiff(names(prepared$data), c("Genotype", "Environment", id_col, "Location",
+                                observation_id_columns))
+}
+
+met_default_replication_col <- function(prepared, current_value = NULL) {
+  choices <- met_design_column_choices(prepared)
+  if (length(current_value) == 1 && current_value %in% choices) return(current_value)
+  detected <- intersect(c(rep_col, met_rep_col_candidates), choices)
+  if (length(detected)) detected[1] else ""
+}
+
 make_met_data <- function(df_raw, trait_used = NULL, replication_col = NULL, block_col = NULL) {
   prepared <- prepare_met_trait_settings(df_raw)
   df <- prepared$data
@@ -2668,6 +2685,16 @@ make_met_data <- function(df_raw, trait_used = NULL, replication_col = NULL, blo
   }
   if (!trait_used %in% trait_cols) {
     stop("Selected MET trait was not found or is not numeric: ", trait_used)
+  }
+  identity_columns <- c("Genotype", "Environment", id_col, "Location")
+  if (length(replication_col) == 1 && replication_col %in% c(identity_columns, trait_used)) {
+    stop("Invalid MET replication column: ", replication_col,
+         ". Select the actual Rep/Replication column, not genotype, location, or the response trait.", call. = FALSE)
+  }
+  if (length(block_col) == 1 && nzchar(block_col) &&
+      block_col %in% c(identity_columns, trait_used, replication_col)) {
+    stop("Invalid MET block column: ", block_col,
+         ". Select a separate block column or No block column.", call. = FALSE)
   }
   df$Weight <- to_number(df[[trait_used]])
   use_replication <- !is.null(replication_col) && replication_col != "" && replication_col %in% names(df)
@@ -2985,9 +3012,27 @@ met_standardize_component <- function(x) {
   out
 }
 
-build_met_integrated_ranking <- function(df_raw, met_results, component_weights = c(mean = 1, fw = 0, asv = 0)) {
+build_met_integrated_ranking <- function(df_raw, met_results, component_weights = c(mean = 1, fw = 0, asv = 0),
+                                         trait_cols = NULL) {
   prepared <- prepare_met_trait_settings(df_raw)
+  # Explicit run scope excludes unselected upload traits, never failed requested traits.
+  if (!is.null(trait_cols)) {
+    selected_traits <- intersect(as.character(trait_cols), prepared$trait_cols)
+    if (!length(selected_traits)) stop("Choose at least one valid MET trait for integrated ranking.", call. = FALSE)
+    prepared$trait_cols <- selected_traits
+    prepared$trait_info <- prepared$trait_info[prepared$trait_info$Trait %in% selected_traits, , drop = FALSE]
+  }
   successful_traits <- intersect(prepared$trait_cols, names(met_results))
+  requested_weights <- prepared$weights_raw_used[prepared$trait_cols]
+  requested_weights[!is.finite(requested_weights)] <- 1
+  requested_weights[requested_weights < 0] <- 0
+  if (sum(requested_weights) <= 0) requested_weights[] <- 1
+  missing_models <- setdiff(names(requested_weights)[requested_weights > 0], successful_traits)
+  if (length(missing_models)) stop("Selection index unavailable: required MET trait models are missing: ",
+    paste(missing_models, collapse = ", "), ". Complete these analyses or revise weights for all entries. No weight redistribution was used.", call. = FALSE)
+  evidence <- prepared$data
+  for (tr in prepared$trait_cols) evidence[[tr]] <- to_number(evidence[[tr]])
+  si_require_index_coverage(evidence, "Genotype", prepared$trait_cols, requested_weights)
   if (length(successful_traits) == 0) {
     return(list(
       ranking = data.frame(),
@@ -3078,16 +3123,18 @@ build_met_integrated_ranking <- function(df_raw, met_results, component_weights 
   score_long <- trait_blups %>%
     dplyr::select(Genotype, Trait, Standardized_score) %>%
     mutate(Normalized_weight = as.numeric(weights[Trait]))
+  score_coverage <- score_long %>%
+    tidyr::pivot_wider(id_cols = Genotype, names_from = Trait, values_from = Standardized_score)
+  expected_genotypes <- data.frame(Genotype = unique(as.character(prepared$data$Genotype)))
+  score_coverage <- dplyr::left_join(expected_genotypes, score_coverage, by = "Genotype")
+  si_require_index_coverage(score_coverage, "Genotype", successful_traits, weights)
   integrated <- score_long %>%
     group_by(Genotype) %>%
     summarise(
       N_traits_used = sum(!is.na(Standardized_score)),
       Weight_coverage = sum(Normalized_weight[!is.na(Standardized_score)], na.rm = TRUE),
-      Integrated_MET_Index = ifelse(
-        Weight_coverage > 0,
-        sum(Standardized_score * Normalized_weight, na.rm = TRUE) / Weight_coverage,
-        NA_real_
-      ),
+      Missing_trait_policy = "All positive-weight traits required; no imputation or weight redistribution",
+      Integrated_MET_Index = sum(Standardized_score[Normalized_weight > 0] * Normalized_weight[Normalized_weight > 0]),
       .groups = "drop"
     ) %>%
     arrange(desc(Integrated_MET_Index)) %>%
@@ -3864,15 +3911,15 @@ run_met_pipeline <- function(
     min_envs_for_biplot <- min(min_envs_for_biplot, n_envs_total)
   }
   ammi_gge_available <- n_envs_total >= MET_MIN_ENVS_FOR_BIPLOT
-  notes <- c()
+  notes <- c("IQR extremes are flagged only; no automatic outlier deletion. Approved trait exclusions are applied before MET input preparation.")
   cell_bounds <- dat %>% group_by(Genotype, Environment) %>% summarise(Lower_c = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper_c = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
-  dat_stepA <- dat %>% left_join(cell_bounds, by = c("Genotype", "Environment")) %>% filter(!(Weight < Lower_c | Weight > Upper_c)) %>% dplyr::select(-Lower_c, -Upper_c)
+  dat_stepA <- dat # Only breeder-approved exclusions are applied upstream.
   if (nrow(dat_stepA) == 0) stop("All MET rows were removed by cell-level outlier filtering.")
   env_bounds <- dat_stepA %>% group_by(Environment) %>% summarise(Lower = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
-  p_before <- ggplot(dat_stepA %>% left_join(env_bounds, by = "Environment") %>% mutate(outlier_env = Weight < Lower | Weight > Upper), aes(x = Weight, fill = outlier_env)) + geom_histogram(bins = 30, color = "white", linewidth = 0.2) + geom_vline(data = env_bounds, aes(xintercept = Lower), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + geom_vline(data = env_bounds, aes(xintercept = Upper), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + facet_wrap(~Environment, scales = "free", ncol = 2) + scale_fill_manual(values = c("FALSE" = "#3498DB", "TRUE" = "#E74C3C"), labels = c("Kept", "Outlier")) + labs(title = paste0(trait_used, " distribution after cell-clean, before env-clean"), x = trait_used, y = "Count", fill = NULL) + theme_bw()
-  dat_clean <- dat_stepA %>% left_join(env_bounds, by = "Environment") %>% filter(!(Weight < Lower | Weight > Upper)) %>% dplyr::select(-Lower, -Upper)
+  p_before <- ggplot(dat_stepA %>% left_join(env_bounds, by = "Environment") %>% mutate(outlier_env = Weight < Lower | Weight > Upper), aes(x = Weight, fill = outlier_env)) + geom_histogram(bins = 30, color = "white", linewidth = 0.2) + geom_vline(data = env_bounds, aes(xintercept = Lower), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + geom_vline(data = env_bounds, aes(xintercept = Upper), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + facet_wrap(~Environment, scales = "free", ncol = 2) + scale_fill_manual(values = c("FALSE" = "#3498DB", "TRUE" = "#E74C3C"), labels = c("Unflagged", "Flagged (retained)")) + labs(title = paste0(trait_used, " approved data distribution with IQR flags"), x = trait_used, y = "Count", fill = NULL) + theme_bw()
+  dat_clean <- dat_stepA
   if (nrow(dat_clean) == 0) stop("All MET rows were removed by environment-level outlier filtering.")
-  p_after <- ggplot(dat_clean, aes(x = Weight)) + geom_histogram(bins = 30, fill = "#2ECC71", color = "white", linewidth = 0.2) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = paste0(trait_used, " distribution after both outlier steps"), x = trait_used, y = "Count") + theme_bw()
+  p_after <- ggplot(dat_clean, aes(x = Weight)) + geom_histogram(bins = 30, fill = "#2ECC71", color = "white", linewidth = 0.2) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = paste0(trait_used, " approved analysis distribution"), x = trait_used, y = "Count") + theme_bw()
   outlier_summary <- data.frame(Trait_used = trait_used, Rows_original = nrow(dat), Rows_after_cell_clean = nrow(dat_stepA), Rows_after_environment_clean = nrow(dat_clean), Removed_total = nrow(dat) - nrow(dat_clean), stringsAsFactors = FALSE)
   presence <- dat_clean %>% distinct(Genotype, Environment) %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment), present = 1) %>% pivot_wider(names_from = Environment, values_from = present, values_fill = 0) %>% mutate(n_envs = rowSums(across(-Genotype))) %>% arrange(desc(n_envs), Genotype)
   selected_controls <- unique(clean_text(check_varieties))
@@ -4040,7 +4087,7 @@ run_met_pipeline <- function(
       dplyr::select(Genotype, Mean, Locations_tested, Replications_by_location, Blocks_by_location, N_observations)
   }
   model_summary <- data.frame(Trait_used = trait_used, Model = model_label, N_rows_clean = nrow(dat_clean), N_genotypes = n_distinct(dat_clean$Genotype), N_environments = n_distinct(dat_clean$Environment), Replication_column = input$replication_col %||% "", Block_column = input$block_col %||% "", AMMI_GGE_min_observed_locations = min_envs_for_biplot, Trait_direction = trait_direction, Target_value = ifelse(identical(trait_direction, "Target trait"), target_value, NA_real_), Input_trait_weight = trait_weight, N_replications = if (has_replication) n_distinct(dat_clean$Rep) else NA_integer_, N_blocks = if (has_block) n_distinct(dat_clean$Block) else NA_integer_, Model_formula = paste(deparse(full_formula), collapse = " "), Harmonic_replication = round(n_r, 3), Stability_ratio_G_over_G_plus_GxE = round(stability_ratio, 4), Broad_sense_H2 = round(H2, 4), Controls_used = paste(controls_used, collapse = ", "), Notes = paste(notes, collapse = " | "), stringsAsFactors = FALSE)
-  p_variance <- ggplot(variance_components %>% mutate(Source = fct_reorder(Source, -Percent)), aes(x = Source, y = Percent, fill = Source)) + geom_bar(stat = "identity", width = 0.6) + geom_text(aes(label = paste0(Percent, "%")), vjust = -0.5, size = 4) + scale_fill_manual(values = c("#9B59B6", "#3498DB", "#E67E22", "#2ECC71")) + labs(title = paste0("Variance partitioning â€” ", trait_used), x = NULL, y = "% of Total Variance") + theme_bw() + theme(legend.position = "none")
+  p_variance <- ggplot(variance_components %>% mutate(Source = fct_reorder(Source, -Percent)), aes(x = Source, y = Percent, fill = Source)) + geom_bar(stat = "identity", width = 0.6) + geom_text(aes(label = paste0(Percent, "%")), vjust = -0.5, size = 4) + scale_fill_manual(values = rep(c("#9B59B6", "#3498DB", "#E67E22", "#2ECC71", "#7F8C8D", "#1ABC9C"), length.out = nrow(variance_components))) + labs(title = paste0("Variance partitioning â€” ", trait_used), x = NULL, y = "% of Total Variance") + theme_bw() + theme(legend.position = "none")
   res_df <- data.frame(fitted = fitted(m_full), residual = residuals(m_full))
   p_qq <- ggplot(res_df, aes(sample = residual)) + stat_qq(color = "#3498DB", alpha = 0.6) + stat_qq_line(color = "#E74C3C", linewidth = 0.8) + labs(title = "Normal Q-Q", x = "Theoretical", y = "Sample") + theme_bw()
   p_rvf <- ggplot(res_df, aes(x = fitted, y = residual)) + geom_point(color = "#3498DB", alpha = 0.5, size = 1.5) + geom_hline(yintercept = 0, linetype = "dashed", color = "#E74C3C", linewidth = 0.8) + geom_smooth(method = "loess", se = FALSE, color = "#F39C12", linewidth = 0.8, span = 0.8) + labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residuals") + theme_bw()
@@ -4494,19 +4541,29 @@ run_met_pipeline <- function(
     arrange(desc(Favorable_GenMean))
   p_fw_mean_sens <- ggplot(FW_results, aes(x = GenMean, y = Sens, color = b_interp, label = Genotype)) + geom_point(size = 3) + geom_text(vjust = -0.8, size = 3) + geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") + scale_color_manual(values = c("Responsive" = "#E74C3C", "Average" = "#F39C12", "Stable" = "#2ECC71")) + labs(title = "Finlay-Wilkinson: mean vs sensitivity", subtitle = paste0("Decision direction: ", trait_direction), x = paste("Genotype", estimate_label, "mean"), y = "Sensitivity (b)", color = "Stability") + theme_bw()
   # Use the same numeric leave-one-out index and linear model as FW_results.
+  # Each location label is centered on its genotype-specific index values.
+  fw_environment_axis <- FW_dat_loo %>%
+    group_by(Environment) %>%
+    summarise(EnvIndex = mean(EnvIndex), .groups = "drop") %>%
+    arrange(EnvIndex) %>%
+    group_by(EnvIndex) %>%
+    summarise(Environment = paste(as.character(Environment), collapse = " / "), .groups = "drop")
   p_fw_regression <- ggplot(FW_dat_loo, aes(x = EnvIndex, y = BLUP_env, color = Genotype, group = Genotype)) +
     geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.8, na.rm = TRUE) +
     geom_point(size = 3.5, na.rm = TRUE) +
+    scale_x_continuous(
+      breaks = fw_environment_axis$EnvIndex,
+      labels = fw_environment_axis$Environment
+    ) +
     labs(
       title = paste0("Finlay-Wilkinson regression - ", trait_used),
       subtitle = paste0("Points: environment-specific ", estimate_label, ". Lines: fitted FW regressions."),
-      caption = "Environmental index = mean estimate of all other genotypes in each environment. Line slopes match FW sensitivity (b).",
-      x = "Environmental index (mean of other genotypes)",
+      x = "Environment / environmental index (mean of other genotypes)",
       y = paste0(estimate_label, " for ", trait_used),
       color = "Genotype"
     ) +
     theme_bw(base_size = 13) +
-    theme(legend.position = "right", axis.text.x = element_text(size = 11),
+    theme(legend.position = "right", axis.text.x = element_text(size = 10, angle = 30, hjust = 1),
           axis.title = element_text(size = 13))
   metan_single <- if (ammi_gge_available) {
     run_met_single_trait_extensions(dat_clean)
@@ -4718,9 +4775,10 @@ run_met_all_traits <- function(
   if (length(results) == 0) {
     stop("MET pipeline failed for all numeric traits: ", paste(failures$Error, collapse = " | "))
   }
-  integrated <- build_met_integrated_ranking(df_raw, results)
+  integrated <- build_met_integrated_ranking(df_raw, results, trait_cols = trait_cols)
   methods <- build_met_multitrait_methods(df_raw, results, integrated$ranking)
   list(
+    trait_metadata = prepare_met_trait_settings(df_raw)$trait_metadata,
     met_multitrait_methods = methods,
     settings = data.frame(
       Trait = trait_cols,

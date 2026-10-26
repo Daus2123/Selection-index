@@ -32,9 +32,25 @@ for (model_type in c("LMM", "ANOVA_RCBD", "SOMMER")) {
     length(result$met_trait_names) == 1,
     length(build_export_tables("MET", result)) > 0
   )
+  # Multi-trait aggregation must retain valid estimates and decision rows.
+  # The dedicated two-location test covers unavailable GGE results.
+  multi_trial <- trial
+  multi_trial$Height <- multi_trial$Yield
+  multi_results <- list(Yield = trait_result, Height = trait_result)
+  integrated <- build_met_integrated_ranking(multi_trial, multi_results)
+  methods <- build_met_multitrait_methods(multi_trial, multi_results, integrated$ranking)
+  stopifnot(is.list(methods))
+  decision <- build_met_decision_board(multi_trial, multi_results, integrated$ranking,
+                                      check_genotypes = "A")
+  stopifnot(nrow(decision$board) == 3, nrow(decision$passport) == 3,
+            setequal(decision$board$Genotype, setdiff(trial$Variety, "A")))
   chart <- trait_result$p_fw_regression
-  stopifnot(identical(chart$labels$x, "Environmental index (mean of other genotypes)"),
+  stopifnot(identical(chart$labels$x, "Environment / environmental index (mean of other genotypes)"),
             setequal(unique(as.character(chart$data$Environment)), unique(trial$Environment)))
+  axis <- chart$scales$get_scales("x")
+  stopifnot(length(axis$breaks) == 3,
+            setequal(axis$labels, unique(as.character(trial$Environment))),
+            is.null(chart$labels$caption))
   built <- ggplot2::ggplot_build(chart)
   stopifnot(nrow(built$data[[2]]) == 12,
             all(is.finite(built$data[[2]]$x)),

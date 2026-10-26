@@ -38,13 +38,13 @@ stopifnot(
   identical(names(rcbd$means), names(rcbd$summary)),
   identical(names(rcbd$means), c("ID", "Original_ID", "Yield", "Yield Group", "Score", "Score Group")),
   grepl(" \u00b1 ", rcbd$means$Yield[1]),
-  grepl("\u00b1", rcbd$means$Score[1]),
+  rcbd$means$Score[1] == "Adjusted estimate unavailable",
   rcbd$summary$Yield[1] == "7.90%",
   rcbd$summary$Yield[2] == "0.680",
   is.finite(as.numeric(rcbd$summary$Yield[3])),
   grepl("^p=0.01 \\(KW; Dunn: [1-9]", rcbd$summary$Score[3]),
   any(nzchar(rcbd$means$`Score Group`)),
-  rcbd$means$Yield[1] == sprintf("%.2f \u00b1 %.2f", mean(trial$Yield[trial$ID == "1"]), stats::sd(trial$Yield[trial$ID == "1"]) / 2),
+  rcbd$means$Yield[1] == with(as.data.frame(emmeans(fit_single_location_model(trial, "Yield", "RCBD"), ~ ID))[1, ], sprintf("%.2f \u00b1 %.2f", emmean, SE)),
   all(rcbd$summary$`Yield Group` == ""),
   all(rcbd$summary$`Score Group` == "")
 )
@@ -64,6 +64,18 @@ stopifnot(grepl(sprintf("%.2f", stats::sd(trial$Yield[trial$ID == "1"])), sd_vie
 unbalanced <- trial[!(trial$ID == "3" & trial$Rep == "4"), , drop = FALSE]
 unequal <- si_lpsi_mean_comparison_view(make_result(unbalanced), "lsd")
 stopifnot(unequal$summary$Yield[3] == "Varies by pair")
+for (model in c("CRD", "RCBD", "LMM")) {
+  displayed <- si_lpsi_mean_comparison_view(make_result(unbalanced, model), "lsd", "se")
+  expected <- as.data.frame(emmeans(fit_single_location_model(unbalanced, "Yield", model), ~ ID))
+  stopifnot(identical(displayed$means$Yield,
+    sprintf("%.2f \u00b1 %.2f", expected$emmean, expected$SE)))
+  observed <- si_lpsi_mean_comparison_view(make_result(unbalanced, model), "lsd", "sd")
+  expected_raw <- vapply(as.character(observed$means$ID), function(id) {
+    x <- unbalanced$Yield[unbalanced$ID == id]
+    sprintf("%.2f \u00b1 %.2f", mean(x), sd(x))
+  }, character(1))
+  stopifnot(identical(observed$means$Yield, unname(expected_raw)))
+}
 
 lmm <- si_lpsi_mean_comparison_view(make_result(trial, "LMM"), "lsd")
 stopifnot(lmm$summary$Yield[2] == "Not estimated")

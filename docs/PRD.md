@@ -45,8 +45,8 @@ dominate the index) lead to advancing the wrong material.
   already be a valid RCBD (or similar) design.
 - Not multi-tenant / multi-user data storage — one workbook per session,
   nothing persisted server-side beyond the session.
-- Not responsible for raw-data QA beyond the built-in upload validation and
-  the automatic cell-/environment-level outlier filtering.
+- Source-data correctness still requires breeder review. Upload validation and
+  reviewable trait-level cleaning flag problems without automatically deleting extremes.
 
 ## 5. Feature: Single-Location Trial (LPSI)
 
@@ -85,8 +85,9 @@ Requirements:
 - Accept data with an `Environment` column; fit either a **linear mixed
   model (LMM)**, giving BLUPs, or a **joint ANOVA (RCBD)**, giving adjusted
   means (BLUEs) — user-selectable per run.
-- Two-stage outlier cleaning (cell-level, then environment-level, via
-  IQR fencing) with before/after diagnostic plots and a row-count summary.
+- Reviewable cleaning before final analysis: preliminary residual or IQR flags,
+  optional trait limits, Keep/Exclude decisions with reasons, and approved-data
+  diagnostics. MET IQR distributions flag extremes without automatic deletion.
 - Handle genotypes with missing environments; flag genotypes present in only
   one environment as high-uncertainty rather than silently ranking them
   alongside fully-tested ones.
@@ -111,7 +112,7 @@ Requirements:
 
 ## 7. Cross-cutting requirements
 
-- One Excel upload (≤ 50 MB) per session; first-sheet data only.
+- One Excel upload (≤ 50 MB) per session; the first worksheet is read automatically.
 - Every result table must be exportable (xlsx, and CSV for single tables).
 - Every chart must be downloadable as PNG (300 DPI) or PDF, at a
   user-chosen size.
