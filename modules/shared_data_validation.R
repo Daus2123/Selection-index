@@ -2,12 +2,17 @@
 # These functions are intentionally independent of the Shiny server so they can
 # be reused by LPSI, MET, breeding, and mating workflows.
 
-si_read_excel_upload <- function(path, name) {
+si_read_excel_upload <- function(path, name, sheet = NULL) {
   ext <- tolower(tools::file_ext(name))
   if (!ext %in% c("xlsx", "xls")) {
     stop("Please upload Excel file only: .xlsx or .xls", call. = FALSE)
   }
-  as.data.frame(readxl::read_excel(path, .name_repair = "minimal"), check.names = FALSE)
+  sheets <- readxl::excel_sheets(path)
+  if (is.null(sheet)) sheet <- sheets[1]
+  if (!sheet %in% sheets) stop("The selected worksheet was not found in this workbook.")
+  df <- as.data.frame(readxl::read_excel(path, sheet = sheet, .name_repair = "minimal"), check.names = FALSE)
+  attr(df, "si_source_sheet") <- sheet
+  df
 }
 
 si_to_number <- function(x) {
@@ -16,6 +21,47 @@ si_to_number <- function(x) {
 
 si_blank <- function(x) {
   is.na(x) | trimws(as.character(x)) == ""
+}
+
+si_metadata_rows <- function(df, identity_col = id_col) {
+  if (length(identity_col) != 1 || !identity_col %in% names(df)) return(integer())
+  which(toupper(trimws(as.character(df[[identity_col]]))) %in% metadata_row_labels)
+}
+
+si_observation_data <- function(df, identity_col = id_col) {
+  df[setdiff(seq_len(nrow(df)), si_metadata_rows(df, identity_col)), , drop = FALSE]
+}
+
+si_trait_metadata <- function(df, traits, identity_col = id_col) {
+  labels <- if (length(identity_col) == 1 && identity_col %in% names(df)) toupper(trimws(as.character(df[[identity_col]]))) else rep("", nrow(df))
+  type_rows <- which(labels %in% trait_type_row_labels)
+  unit_rows <- which(labels %in% unit_row_labels)
+  if (length(type_rows) > 1 || length(unit_rows) > 1) stop("Use only one TYPE row and one UNIT row.")
+  data_rows <- setdiff(seq_len(nrow(df)), si_metadata_rows(df, identity_col))
+  normalize_type <- function(x) {
+    x <- tolower(trimws(as.character(x)))
+    if (is.na(x) || !nzchar(x)) return("")
+    if (x %in% c("score", "score 1-5", "score 1–5")) return("Score 1-5")
+    if (x %in% c("quantitative", "continuous", "continues", "quant", "numeric")) return("Quantitative")
+    stop("Unknown TYPE value: ", x, ". Use score or quantitative (continuous is also accepted).")
+  }
+  out <- lapply(traits, function(tr) {
+    declared <- if (length(type_rows)) normalize_type(df[[tr]][type_rows]) else ""
+    unit <- if (length(unit_rows)) tolower(trimws(as.character(df[[tr]][unit_rows]))) else ""
+    if (is.na(unit)) unit <- ""
+    unit_type <- if (unit %in% c("score", "score 1-5", "score 1–5", "quantitative", "continuous", "continues")) normalize_type(unit) else ""
+    if (nzchar(declared) && nzchar(unit_type) && declared != unit_type) stop("Conflicting TYPE and UNIT for trait: ", tr)
+    if (declared == "Score 1-5" && nzchar(unit) && !unit %in% c("score", "score 1-5", "score 1–5")) stop("A score trait cannot have measurement unit '", unit, "': ", tr)
+    source <- if (nzchar(declared)) "TYPE row" else if (nzchar(unit)) "UNIT row" else "Inferred (legacy)"
+    type <- if (nzchar(declared)) declared else if (nzchar(unit_type)) unit_type else if (nzchar(unit)) "Quantitative" else ""
+    values <- si_to_number(df[[tr]][data_rows]); values <- values[is.finite(values)]
+    if (!nzchar(type)) type <- if (length(values) && all(values == floor(values) & values >= 1 & values <= 5)) "Score 1-5" else "Quantitative"
+    if (unit %in% c("quantitative", "continuous", "continues")) unit <- ""
+    if (type == "Score 1-5") unit <- "score"
+    data.frame(Trait = tr, Type = type, Unit = unit, Metadata_source = source, stringsAsFactors = FALSE)
+  })
+  if (!length(out)) return(data.frame(Trait = character(), Type = character(), Unit = character(), Metadata_source = character()))
+  do.call(rbind, out)
 }
 
 si_detect_numeric_like_traits <- function(df, protected_cols = character(0), min_numeric = 1) {
@@ -27,9 +73,7 @@ si_detect_numeric_like_traits <- function(df, protected_cols = character(0), min
 
 si_validate_uploaded_table <- function(df, id_col = "Variety", rep_col = "Rep",
                                        remove_cols = character(0),
-                                       metadata_labels = c("WEIGHT", "WEIGHTS", "IMPORTANCE",
-                                                           "IMPORTANT", "DIRECTION",
-                                                           "DIRECTIONS", "TRAIT_DIRECTION")) {
+                                       metadata_labels = metadata_row_labels) {
   errors <- character(0)
   warnings <- character(0)
 
@@ -85,7 +129,7 @@ si_validate_uploaded_table <- function(df, id_col = "Variety", rep_col = "Rep",
     }
   }
 
-  protected <- unique(c(id_col, rep_col, remove_cols))
+  protected <- unique(c(id_col, rep_col, remove_cols, observation_id_columns, design_column_candidates, type_col_candidates))
   trait_cols <- si_detect_numeric_like_traits(df[data_rows, , drop = FALSE], protected)
   if (length(trait_cols) == 0) {
     errors <- c(errors, "No numeric-like trait columns were detected after excluding ID/replication columns.")
@@ -612,4 +656,27 @@ si_breeder_recommendation_table <- function(lpsi_results = NULL, met_results = N
                  "MET_action", "Reason", "LPSI_reason", "MET_reason")]
   out[order(match(out$Final_action, c("ADVANCE", "RETEST", "DISCARD")),
             -out$Support_count, out$LPSI_rank, out$MET_rank, na.last = TRUE), , drop = FALSE]
+}
+si_require_index_coverage <- function(data, genotype, traits, weights = NULL) {
+  if (is.null(weights)) weights <- stats::setNames(rep(1, length(traits)), traits)
+  required <- traits[is.finite(weights[traits]) & weights[traits] > 0]
+  if (!length(required)) required <- traits
+  ids <- unique(as.character(data[[genotype]]))
+  ids <- ids[!is.na(ids) & nzchar(trimws(ids))]
+  gaps <- unlist(lapply(ids, function(id) {
+    rows <- !is.na(data[[genotype]]) & as.character(data[[genotype]]) == id
+    absent <- required[!vapply(required, function(tr) any(is.finite(data[[tr]][rows])), logical(1))]
+    if (length(absent)) paste0(id, " [", paste(absent, collapse = ", "), "]") else character()
+  }), use.names = FALSE)
+  if (length(gaps)) stop("Selection index unavailable: missing required traits for ",
+    paste(gaps, collapse = "; "),
+    ". Each entry needs evidence for every positive-weight trait. Restore measurements, remove the entry explicitly, or revise trait weights for all entries. No imputation or weight redistribution was used.",
+    call. = FALSE)
+  invisible(TRUE)
+}
+
+
+# Notifications are plain text; cli/rlang errors may contain terminal colors.
+si_plain_error_message <- function(error) {
+  gsub("\033\\[[0-?]*[ -/]*[@-~]", "", conditionMessage(error), perl = TRUE)
 }

@@ -2,6 +2,30 @@
 
 ## 1. Shape of the app
 
+### Missing traits in selection indices
+
+The single-location mean-comparison selector uses SE for adjusted means plus
+model-based SEs from emmeans under the selected CRD/RCBD/LMM fit, and SD for
+observed arithmetic means plus within-genotype sample SDs. Statistical letters
+remain based on model comparisons. The shared display/export builder applies
+the same selection to downloads. Unavailable adjusted estimates (including
+legacy nonparametric results) are labelled unavailable without a raw-mean fallback.
+
+Single-trial and integrated MET indices require usable evidence for every
+positive-weight trait for every entry. Missing individual plot measurements are
+allowed when the fitted trait model remains estimable. A genotype with an entirely
+unmeasured required trait stops index generation with the genotype/trait names;
+the app does not impute values or redistribute weights across remaining traits.
+Entirely missing required traits and missing required MET model results also stop
+index generation. Resolve the records, explicitly remove an entry, or revise
+weights consistently for all entries before rerunning. Non-estimable adjusted
+means continue to stop the analysis. Zero-weight traits do not contribute to sums.
+Constant observed traits standardize to zero; missing values remain missing.
+The policy is included in existing weight/ranking tables and their exports.
+The optional metan multivariate selection engine requires complete trait records
+and now rejects partial records instead of silently deleting plots. MET stability
+component availability remains separately reported in Component_notes.
+
 A single Shiny app (`bslib` page with `nav_panel`s: **Data → Analyze →
 Results → Charts → Export**), backed by numbered `modules/*.R` files sourced
 once at startup:
@@ -129,7 +153,7 @@ or failed FA returns an explanatory unavailable result, never a substituted
 distance method. FA notes also appear in pipeline review. FA selection does not
 change the existing decision-board method-support counts.
 
-Input workbook (first sheet), long format, one row per plot/observation:
+Input workbook (first worksheet), long format, one row per plot/observation:
 
 | Column | Role | Configured by |
 |---|---|---|
@@ -192,12 +216,12 @@ Engine: `run_met_pipeline()` in `module_5_met.R`. Runs once per trait
 1. **Input prep** — `make_met_data()` reshapes to `(Genotype, Environment,
    Rep, Weight)` and reads that trait's `trait_direction` / `target_value` /
    `trait_weight`.
-2. **Two-stage outlier cleaning**:
-   - cell-level: per (Genotype × Environment) IQR fence
-   - environment-level: per Environment IQR fence on the cell-cleaned data
-   Both steps produce a before/after histogram and an `outlier_summary` row
-   count table; if a step removes every row, the pipeline stops with a clear
-   error rather than modeling empty data.
+2. **Approved cleaning**: `modules/data_cleaning.R` provides trait-level screening
+   and review. Original upload row numbers are retained. Only approved exclusions
+   become missing trait measurements before analysis. MET IQR fences flag values
+   for exploration and never delete them automatically. Historical outlier_summary
+   fields remain for compatibility and report zero automatic removals. Applied
+   exclusions and settings export separately in QC tables.
 3. **Presence/control resolution** — builds a genotype × environment
    presence matrix (`presence`), resolves the check/control set from
    `check_varieties` or (fallback) genotypes present in *every* environment,
@@ -302,3 +326,125 @@ should never diverge.
   extend `lpsi_settings()` / the LPSI engine.
 - **New analysis type entirely:** follow the five-part pattern in
   `AGENTS.md` §3.
+
+## Single-trial LMM CV and heritability
+
+`si_lpsi_lmm_statistics()` in `advanced_analysis_extensions.R` separates two fits:
+the selected comparison model `trait ~ ID + (1 | Rep)` supplies residual CV,
+100 * residual SD / abs(observed trait mean), while a separate REML model
+`trait ~ 1 + (1 | ID) + (1 | Rep)` supplies genetic variance and generalized
+Cullis H2 = 1 - mean PEV of genotype differences / (2 * genetic variance).
+The joint mixed-model equations include fixed-effect uncertainty and pairwise
+covariance; the calculation supports unbalanced data. Mean comparisons retain
+their original fixed-genotype model.
+
+The mean-table footer labels LMM outputs Residual CV (%) and Broad-sense H2
+(Cullis). The existing `heritability_gain` table, Results view and export carry
+the estimates, separate CV-model residual variance, mean difference PEV, method,
+model and diagnostic notes. Error_variance is from the H2 variance model; it
+need not equal CV_model_residual_variance. ANOVA mean squares are not invented
+for REML fits. Zero genetic variance with positive residual variation is reported
+as H2=0 using a labelled zero-reliability limiting convention, rather than direct
+division by zero in Cullis' formula. Nonconvergence and unidentifiable fits leave
+H2 unavailable; a failed H2 fit does not discard an available CV.
+Boundary nuisance variances are retained with notes. Near-zero means suppress CV.
+Exact constant/additive score datasets with residual degrees of freedom are
+recognized before optimization: residual CV is zero (unless the trait mean is
+zero), while H2 is labelled Constant trait or Zero residual variation instead of
+forcing a non-regular variance ratio. Regular models use standardized responses
+with variances restored to original units and alternate optimizers on failure.
+Per-trait CV_status and H2_status explain unavailable footer values and export
+with the full diagnostic notes. This does not prove independent replication or
+perfect heritability for score values copied across repetitions.
+No conventional genetic-advance value is inferred from generalized H2.
+See the [genotype-difference heritability formulation](https://pmc.ncbi.nlm.nih.gov/articles/PMC6707473/).
+
+## Reviewed data cleaning
+
+`modules/data_cleaning.R` supplies `si_clean_screen()` and `si_clean_apply()`.
+The Analyze review panel accumulates per-trait decisions, requires exclusion reasons,
+and preserves metadata rows and all other trait measurements. Residual screening
+uses `si_trial_diagnostic_fit()` for both flags and diagnostic plots. Runtime
+context comes from selected single-trial, MET or Multi-factor controls; it keeps
+fixed/random and split-plot error strata consistent. MET includes environment,
+GxE and nested replication/block terms. SOMMER preview diagnostics are explicitly
+labelled preliminary lme4 CS approximations; final MET diagnostics use the actual
+SOMMER fit. No spatial covariance model is introduced by this change.
+The initial diagnostic chart always uses raw observations. The review uses the
+existing trait selector, visible detection settings and flagged values by default.
+Preview changes builds a draft dataset and raw/proposed comparison charts without
+mutating approved data or clearing results. Accept reviewed data commits the draft
+and invalidates saved analyses. Changed settings or selected decisions invalidate
+the preview, so it must be regenerated before acceptance. Column mapping and
+the full-observation view are inside Advanced settings.
+Applying cleaning invalidates all saved results; the next run uses approved data.
+QC sheets store review, settings, impact and, when a prior matching analysis exists,
+before/after rank/action tables. Original and approved data are available in the
+cleaning download. No automatic model refit-and-delete loop is performed.
+
+## TYPE and UNIT input metadata
+
+Below the observations, metadata labels belong in the configured genotype column
+(`Variety` by default). Optional TYPE accepts `score` or `quantitative`;
+`continuous` and `continues` are accepted quantitative aliases. Optional UNIT
+accepts `score`, `gr`, `kg`, `number`, `cm`, `percent`, `brix`, or other unit text.
+UNIT-only `score` declares a score; measurement units declare quantitative data.
+TYPE overrides legacy value-based inference, and conflicting TYPE/UNIT declarations
+or duplicate TYPE/UNIT rows produce errors. A missing declaration preserves the
+legacy integer-1-to-5 heuristic; the metadata table labels this source as inferred.
+
+Shared `si_trait_metadata()` returns Trait, Type, Unit and Metadata_source.
+All WEIGHT/DIRECTION/TYPE/UNIT rows are excluded from observations. Entry/ID/plot
+columns and common design fields are excluded from automatic trait detection.
+Declared scores allow fractions within 1-5; out-of-range scores and percentages
+are review flags, not automatic deletions. Units do not convert measurements or
+introduce new model families. The Data and Results metadata tables and full
+workbook exports expose declarations. A single comma or dot remains a decimal
+separator; multiple/mixed separators fail numeric conversion rather than being
+interpreted as thousands. Excel's stored numeric value is authoritative.
+
+The app automatically reads the first worksheet through `si_read_excel_upload()`.
+The raw preview preserves all rows/columns of the selected sheet, including input
+metadata. Upload status displays filename, worksheet, ID columns and TYPE/UNIT
+row counts, plus scoring and quantitative trait counts. The extra trait/unit table
+and worksheet selector are not displayed. Uploading a new file resets cleaning
+approvals and saved analyses.
+
+## Analysis reliability: design preservation and estimation failures
+
+`get_lpsi_normality_decision()` tests residuals of the selected CRD/RCBD/LMM model.
+Shapiro-Wilk p-values and warnings are reported in `anova_full`; they never trigger
+automatic unblocked Kruskal-Wallis. Existing rendering of historical KW/Dunn
+results remains supported, but new single-trial runs retain the selected model.
+
+Single-trial adjusted estimation fails explicitly on model/emmeans errors or
+non-estimable means, before rankings are generated. There is no substitution of
+raw means. Explicit descriptive raw-mean displays remain labelled raw. The shared
+diversity BLUE/BLUP estimator also refuses to substitute raw means when replication
+or the required estimation package is absent.
+
+`residual_diagnostics` records observed/fitted values and raw/standardized residuals
+from each final single-trial fit. Diagnostics are accessed in Analyze; duplicate
+Model diagnostics entries are omitted from Results and Charts.
+`build_export_tables()` retains the final diagnostics table for reproducibility.
+
+### MET with two locations
+
+Core MET modeling, integrated ranking, decisions, and workbook exports remain
+available with two locations. AMMI/GGE require at least three locations under
+the app policy. Optional GGE summaries retain typed empty columns before
+grouping, so unavailable geometry does not abort otherwise valid MET results.
+MET notifications strip terminal ANSI colors before displaying error messages.
+
+MET replication selection never falls back to the first uploaded column. It
+prefers a recognized replication name, rejects identity/environment choices,
+and otherwise leaves an explicit unselected prompt. The pipeline validates
+that replication and optional block columns are distinct from identity,
+environment, and the response before fitting models.
+
+Integrated MET ranking accepts an explicit trait scope from the analysis run.
+Only selected traits are required; a failed selected positive-weight trait still
+blocks the index. The result settings carry this scope into reactive ranking,
+charts, and export recalculation. Unselected workbook traits are not treated as
+failed models. Two-location regression checks render the non-AMMI/GGE charts
+and exercise selections smaller than the uploaded trait set.
