@@ -276,6 +276,9 @@ build_export_tables <- function(analysis_type, results) {
     add_sheet("10", "method_compare", si_lpsi_method_comparison(results, default_trait, 15))
   } else if (analysis_type == "MET") {
     add_sheet("00", "settings", results$settings)
+    combined <- met_combined_comparison_tables(results)
+    add_sheet("03d", "combined_mean_comparison", combined$Means)
+    add_sheet("03d", "combined_comparison_anova", combined$ANOVA)
     for (trait in results$met_trait_names) {
       result <- results$met_by_trait[[trait]]
       if (!is.null(result)) {
@@ -288,6 +291,9 @@ build_export_tables <- function(analysis_type, results) {
         ) "joint_anova" else "lmm_variance"
         add_sheet("03_model", paste(model_result_name, trait, sep = "_"), result$variance_components)
         add_sheet("03b_model_tests", trait, result$lrt_table)
+        for (field in c("anova", "simple_tests", "means", "pairwise", "notes")) {
+          add_sheet(paste0("03c_mc_", field), trait, result$mean_comparison[[field]])
+        }
         estimate_result_name <- if (met_result_uses_anova(result)) "blue" else "blup"
         add_sheet(
           "04_genotype_estimates",
@@ -3284,6 +3290,32 @@ ui <- page_navbar(
     .side-subpanel .form-group {
       margin-bottom: 14px;
     }
+    #met_mean_view, #met_mean_method,
+    #met_mean_chart_view, #met_mean_chart_method {
+      font-size: 9pt;
+    }
+    #met_mean_view > label, #met_mean_method > label,
+    #met_mean_chart_view > label, #met_mean_chart_method > label {
+      font-size: 10pt;
+    }
+    #met_mean_view .radio label, #met_mean_method .radio label,
+    #met_mean_chart_view .radio label, #met_mean_chart_method .radio label,
+    #met_mean_view .form-check-label, #met_mean_method .form-check-label,
+    #met_mean_chart_view .form-check-label, #met_mean_chart_method .form-check-label,
+    #met_mean_view .shiny-options-group, #met_mean_method .shiny-options-group,
+    #met_mean_chart_view .shiny-options-group, #met_mean_chart_method .shiny-options-group {
+      font-size: 9pt;
+      line-height: 1.4;
+    }
+    #met_mean_view input[type=radio], #met_mean_method input[type=radio],
+    #met_mean_chart_view input[type=radio], #met_mean_chart_method input[type=radio] {
+      width: 12px;
+      height: 12px;
+    }
+    #met_mean_view .shiny-options-group, #met_mean_method .shiny-options-group,
+    #met_mean_chart_view .shiny-options-group, #met_mean_chart_method .shiny-options-group {
+      margin-left: 12px;
+    }
     .button-radio-menu {
       width: 100%;
     }
@@ -3997,7 +4029,7 @@ ui <- page_navbar(
                 condition = paste0(
                   "input.result_module == 'met' && ",
                   "(input.result_view || '').indexOf('met_') == 0 && ",
-                  "input.result_view != 'met_integrated'"
+                  "input.result_view != 'met_integrated' && input.result_view != 'met_means'"
                 ),
                 selectInput("met_result_trait", "Trait", choices = character(0))
               ),
@@ -4067,6 +4099,9 @@ ui <- page_navbar(
         conditionalPanel("input.result_view == 'met_variance'", DTOutput("met_variance_table")),
         conditionalPanel("input.result_view == 'met_blup'", DTOutput("met_blup_table")),
         conditionalPanel("input.result_view == 'met_env_blup'", DTOutput("met_env_blup_table")),
+        conditionalPanel("input.result_view == 'met_means'",
+          tags$h4("ANOVA"), DTOutput("met_mean_anova"),
+          tags$h4("Mean comparison"), DTOutput("met_mean_table")),
         conditionalPanel("input.result_view == 'met_fw'", DTOutput("met_fw_table")),
         conditionalPanel(
           "input.result_view == 'met_ammi'",
@@ -4781,6 +4816,12 @@ server <- function(input, output, session) {
     validate(need(!is.null(result), "This MET trait result is not available."))
     result
   })
+  met_combined_mean_tables <- reactive({
+    req(analysis_results())
+    validate(need(identical(analysis_used(), "MET"), "Run MET analysis to view these tables."))
+    met_combined_comparison_tables(analysis_results(),
+      input$met_mean_view %||% "within_environment", input$met_mean_method %||% "tukey")
+  })
   met_result_for_plot <- reactive({
     validate(need(
       !is.null(analysis_results()) && identical(analysis_used(), "MET"),
@@ -4968,7 +5009,7 @@ server <- function(input, output, session) {
     if (chart_module == "breeding" && !(view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution"))) {
       view <- "breeding_trend"
     }
-    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
+    if (chart_module == "met" && !(view %in% c("met_mean_plot", "met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
       view <- "met_env_cor"
     }
     if (chart_module == "diversity" && !(view %in% c("diversity_superiority_plot", "diversity_dendrogram_plot", "diversity_corr_heatmap_plot"))) {
@@ -5147,6 +5188,9 @@ server <- function(input, output, session) {
       met_ammi2 = list(result$p_ammi2, "MET_AMMI2"),
       met_gge = list(met_plot_gge_selected(result, input$met_gge_view), met_gge_chart_file_slug(input$met_gge_view)),
       met_env_cor = list(result$p_env_cor, "MET_environment_correlation"),
+      met_mean_plot = list(met_plot_mean_comparison(result,
+        input$met_mean_chart_view %||% "within_environment", input$met_mean_chart_method %||% "tukey",
+        input$met_mean_chart_display %||% "adjusted_se"), "MET_mean_comparison"),
       met_performance_heatmap = list(
         met_plot_performance_heatmap(result, input$met_performance_heatmap_view),
         met_performance_heatmap_file_slug(input$met_performance_heatmap_view)
@@ -5204,6 +5248,9 @@ server <- function(input, output, session) {
       lpsi_ranking = list(list(Recommendation = lpsi_result()$final_decision), "Single-Location_Trial_recommendation"),
       lpsi_direct = list(list(Direct_selection = lpsi_direct_selection_r()), "Single-Location_Trial_direct_selection"),
       lpsi_compare = list(list(Method_comparison = lpsi_method_comparison_r()), "Single-Location_Trial_method_comparison"),
+      met_means = {
+        list(met_combined_mean_tables(), "MET_mean_comparison_all_traits")
+      },
       met_summary = list(list(Summary = met_result_for_table()$genotype_summary), paste0("MET_summary_", safe_name(trait))),
       met_qc = list(list(Quality_control = build_met_qc_table(met_result_for_table())), paste0("MET_quality_control_", safe_name(trait))),
       met_variance = {
@@ -5309,7 +5356,7 @@ server <- function(input, output, session) {
     if (chart_module == "breeding" && !(view %in% c("breeding_trend", "breeding_gam", "breeding_h2_heatmap", "breeding_distribution"))) {
       view <- "breeding_trend"
     }
-    if (chart_module == "met" && !(view %in% c("met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
+    if (chart_module == "met" && !(view %in% c("met_mean_plot", "met_env_cor", "met_performance_heatmap", "met_fw_plot", "met_ammi1", "met_ammi2", "met_gge", "met_selection_plot", "met_multi_selection_plot"))) {
       view <- "met_env_cor"
     }
     if (chart_module == "diversity" && !(view %in% c("diversity_superiority_plot", "diversity_dendrogram_plot", "diversity_corr_heatmap_plot"))) {
@@ -5334,6 +5381,7 @@ server <- function(input, output, session) {
       met_ammi2 = "met_ammi2_plot",
       met_gge = "met_gge_plot",
       met_env_cor = "met_env_cor_plot",
+      met_mean_plot = "met_mean_plot",
       met_performance_heatmap = "met_performance_heatmap",
       met_multi_selection_plot = "met_multi_selection_plot",
       diversity_dendrogram_plot = "diversity_dendrogram_plot",
@@ -5493,6 +5541,7 @@ server <- function(input, output, session) {
       lpsi_direct = "Direct selection on primary trait",
       lpsi_compare = "Selection method comparison",
       met_summary = paste("MET summary -", trait),
+      met_means = paste("MET adjusted mean comparison -", trait),
       met_qc = paste("MET quality control -", trait),
       met_variance = if (met_model_is_anova) paste("Joint ANOVA -", trait) else paste("LMM variance components -", trait),
       met_blup = if (met_estimate_is_anova) paste("Genotype adjusted means (BLUEs) -", trait) else paste("Genotype BLUPs -", trait),
@@ -5903,6 +5952,8 @@ server <- function(input, output, session) {
         selected = if (input$result_met_gge_view %in% c("met_gge", "met_gge_mean_stability", "met_gge_winners", "met_gge_environment")) input$result_met_gge_view else "met_gge",
         style = "slicer"
       )
+    } else if (identical(selected_view, "met_means")) {
+      sidebar_detail_panel("Mean comparison", controls = uiOutput("met_mean_controls"))
     } else {
       NULL
     }
@@ -5930,6 +5981,7 @@ server <- function(input, output, session) {
       "Model" = "met_variance",
       "Genotype Estimates" = "met_blup",
       "Genotype x Location" = "met_env_blup",
+      "Mean comparison" = "met_means",
       "Stability (FW)" = "met_fw",
       "AMMI" = "met_ammi",
       "GGE" = "met_gge",
@@ -5956,6 +6008,8 @@ server <- function(input, output, session) {
         selected = if (isTRUE((input$result_met_gge_view %||% "") %in% c("met_gge", "met_gge_mean_stability", "met_gge_winners", "met_gge_environment"))) input$result_met_gge_view else "met_gge",
         style = "slicer"
       )
+    } else if (identical(selected_view, "met_means")) {
+      sidebar_detail_panel("Mean comparison", controls = uiOutput("met_mean_controls"))
     } else {
       NULL
     }
@@ -6058,6 +6112,7 @@ server <- function(input, output, session) {
   output$chart_met_detail <- renderUI({
     choices <- c(
       "Environment Correlation" = "met_env_cor",
+      "Mean comparison" = "met_mean_plot",
       "Genotype x Location" = "met_performance_heatmap",
       "FW" = "met_fw_plot",
       "AMMI-1" = "met_ammi1",
@@ -6083,6 +6138,11 @@ server <- function(input, output, session) {
     selected_view <- if (current %in% choices) current else "met_env_cor"
     sub_content <- switch(
       selected_view,
+      met_mean_plot = sidebar_detail_panel("Mean comparison", controls = tagList(
+        radioButtons("met_mean_chart_view", "Compare", met_mean_comparison_views(),
+          selected = input$met_mean_chart_view %||% "within_environment"),
+        radioButtons("met_mean_chart_method", "Method", c("Tukey" = "tukey", "Protected LSD" = "lsd"),
+          selected = input$met_mean_chart_method %||% "tukey"))),
       met_fw_plot = sidebar_detail_panel(
         "FW charts",
         choices = met_fw_chart_choices(),
@@ -7695,6 +7755,32 @@ server <- function(input, output, session) {
       generation_col = input$breeding_generation_col
     ))
   }, res = 96, execOnResize = TRUE)
+  output$met_mean_controls <- renderUI({
+    tagList(radioButtons("met_mean_view", "Compare", met_mean_comparison_views(),
+      selected = input$met_mean_view %||% "within_environment"),
+      radioButtons("met_mean_method", "Method", c("Tukey" = "tukey", "Protected LSD" = "lsd"),
+        selected = input$met_mean_method %||% "tukey"))
+  })
+  output$met_mean_notes <- renderDT({
+    notes <- met_result_for_table()$mean_comparison$notes
+    if (is.null(notes)) notes <- data.frame(Note = "Rerun MET to calculate mean comparisons.")
+    datatable(notes, options = list(dom = "t", scrollX = TRUE), rownames = FALSE)
+  })
+  output$met_mean_anova <- renderDT({ datatable(met_combined_mean_tables()$ANOVA,
+    options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$met_mean_tests <- renderDT({ datatable(met_comparison_table(met_result_for_table(), "simple_tests",
+    input$met_mean_view %||% "within_environment"), options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$met_mean_table <- renderDT({
+    table <- met_combined_mean_tables()$Means
+    datatable(table, options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE) %>%
+      formatRound(intersect(c("Raw_mean", "Adjusted_mean", "Observed_SD", "Adjusted_SE"), names(table)), 2)
+  })
+  output$met_mean_pairwise <- renderDT({ datatable(met_comparison_table(met_result_for_table(), "pairwise",
+    input$met_mean_view %||% "within_environment", input$met_mean_method %||% "tukey"),
+    options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) })
+  output$met_mean_plot <- renderPlot({ print(met_plot_mean_comparison(met_result_for_plot(),
+    input$met_mean_chart_view %||% "within_environment", input$met_mean_chart_method %||% "tukey",
+    input$met_mean_chart_display %||% "adjusted_se")) })
   output$met_summary_table <- renderDT({
     datatable(met_result_for_table()$genotype_summary, options = list(pageLength = 50, scrollX = TRUE))
   })
