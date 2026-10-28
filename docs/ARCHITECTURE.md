@@ -2,6 +2,38 @@
 
 ## 1. Shape of the app
 
+### MET mean comparisons
+
+Each MET trait now includes `mean_comparison` with `anova`, `simple_tests`,
+`means`, `pairwise`, and `notes`. A separate REML companion model fits fixed
+Genotype * Environment and random replication/block terms nested in environment.
+This inference model is explicitly labelled and does not replace the user's
+LMM, SOMMER, or ANOVA_RCBD prediction engine. Type III tests use Satterthwaite
+degrees of freedom. Without random design terms the companion uses a fixed
+linear model. Comparisons use equally weighted emmeans, with four separate views:
+genotypes within environment, environments within genotype, overall genotypes,
+and overall environments. Missing cells remain visible as non-estimable results.
+
+Tukey adjustments are per displayed comparison family. Protected LSD uses the
+matching emmeans joint/simple-effect test as its alpha-0.05 gate; when this gate
+fails, pairwise p-values and significance flags are unavailable and letters are
+blank. Pair-specific critical differences are retained, avoiding a misleading
+single LSD for unbalanced trials. Tables place adjusted means, observed plot SD,
+and grouping letters together. Chart error bars show observed SD around adjusted
+means and are explicitly labelled as descriptive, not confidence intervals.
+Direction/target metadata orders displayed means; letters are significance groups,
+not breeding ranks. Singular fits, convergence issues, missing cells, and a
+descriptive residual-SD ratio above two across environments are noted. Residual
+homogeneity is an assumption, not automatically corrected by this feature.
+
+Results and Charts have independent comparison/method selectors. Selected-table
+downloads follow the Results selectors, chart downloads follow the Charts
+selectors, and the full workbook exports both methods and all views per trait,
+including companion ANOVA, simple-effect tests, and notes.
+
+References: Lenth (2016), doi:10.18637/jss.v069.i01; Piepho (2004),
+doi:10.1198/1061860043515; Hayter (1986), doi:10.1080/01621459.1986.10478364.
+
 ### Missing traits in selection indices
 
 The single-location mean-comparison selector uses SE for adjusted means plus
@@ -429,6 +461,39 @@ Model diagnostics entries are omitted from Results and Charts.
 `build_export_tables()` retains the final diagnostics table for reproducibility.
 
 ### MET with two locations
+
+MET mean comparisons reuse the fitted main model for ANOVA_RCBD, preserving
+fixed replication/block terms and sequential ANOVA. LMM and SOMMER use a
+labelled companion model with fixed genotype, environment and GxE and random
+design units; these adjusted means are distinct from breeding-model BLUPs.
+The four views (Variety [overall], varieties across environments [separate
+comparisons within each environment], environment, and variety x environment
+combinations) retain equal-weight marginal means,
+family-wise Tukey comparisons, protected LSD and non-estimable cells.
+Mean comparison Results combine all run traits into two tables with a Trait
+column. The Results Trait selector is hidden only for this view. Compare and
+Method apply across traits; the selected-table download uses the same combined
+tables. Failed/unavailable trait comparisons remain as status rows. Full
+workbooks also include combined default-view tables and retain detailed
+per-trait sheets for all comparison views and methods. Charts remain per trait.
+The Results and Charts sidebars hold Compare and Method as visible radio
+lists with all four comparison choices. The main comparison
+panel shows only ANOVA and Trait, Level, Raw_mean_SD, Group and Adjusted_mean;
+within-environment Level labels include the environment to identify families.
+The selected-table download matches this layout. Full workbook exports retain
+N, model SE, pairwise tests and diagnostic notes for traceability.
+The combination view compares all genotype-environment cell means together;
+protected LSD uses a joint test of equality of these cell means, rather than
+the interaction-only test. Chart previews and downloads show observed mean
++/- observed SD with exact Group letters from the selected Results comparison,
+only for families with a significant
+overall/simple-effect test (p < 0.05). Other families are omitted; when no family
+passes, the chart reports no significant difference. Tables retain all means
+and comparison letters. The chart display selector has been removed. Chart
+headings and axis titles use 10 pt; supporting text uses 9 pt and group letters
+use 10.5 pt. Sidebar list options are indented 12 px beneath their headings.
+Overall comparisons must be interpreted alongside GxE. No multi-factor
+heritability footer is substituted for MET genetic statistics.
 
 Core MET modeling, integrated ranking, decisions, and workbook exports remain
 available with two locations. AMMI/GGE require at least three locations under
