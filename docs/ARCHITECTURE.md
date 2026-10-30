@@ -1,26 +1,180 @@
 # Architecture — Selection Index Pipeline
 
+### Selective GxE restoration — 30 October 2026
+
+GxE/stability functions, ranking, FA-MGIDI, decision rules and plots are restored
+from commit `68862510149ed9561e555a968c3175e1c1aa21a1` (26 October).
+`met_run_gxe_20261026()` contains the historical single-trait engine.
+`run_met_pipeline()` retains the current public mode contract and dispatches
+GxE runs to that engine. The GxE Analyze controls again expose the historical
+minimum-observed-location flag setting. Later joint prediction-SE calculations,
+prediction-evidence gates, connectivity restrictions and two-location FW changes
+do not apply to this restored path. Historical limitations are intentional.
+The current SOMMER package API adapter is retained because installed releases
+reject the October 26 optimizer arguments and changed variance-table columns;
+the compound-symmetry model specification and downstream calculations are kept.
+
+Mean Comparison remains current: `met_run_mean_comparison()` retains its
+pre-restoration preparation and early-return workflow, with the same BLUP
+comparison grid, covariance, tests, tables, boxplots, Environment slicer,
+Observed/Adjusted slicer, CV-only footer and exports. Its connectivity helpers
+remain available without changing GxE behavior. The two UI modes stay separate;
+the legacy programmatic combined mode runs the historical GxE engine and then
+the current comparison helper. No module is added and no result fields are
+renamed. Source and numerical equivalence are checked by
+`tests/test_met_selective_restore.R`. The pre-restoration source snapshot is
+recorded in `tmp/met_gxe_restore_snapshot.txt`.
+
+This restoration supersedes the later GxE-specific sections below. The current
+Mean Comparison sections still apply.
+
+### Single-stage mixed-model mean comparisons
+
+Mean-comparison charts use boxplots of approved observed plot values, ordered
+by adjusted performance, with adjusted-model comparison letters above the data.
+Untested cells use diamond estimates and SE whiskers, never fabricated boxplots.
+This supersedes earlier adjusted-mean bar-chart descriptions.
+Interaction chart navigation offers a location slicer, defaulting to the first
+available location. Both the preview and chart download use that single location;
+changing location does not refit models or change Results tables. Programmatic
+plot calls can omit `environment` to retain the full faceted overview.
+
+Connected LMM mean-comparison runs now fit original plots with fixed environment,
+random genotype and genotype-by-environment, and nested random design effects.
+The SOMMER selection uses this explicitly labeled lme4 comparison engine; the
+GxE SOMMER engine is unchanged. Fixed ANOVA retains its existing BLUE workflow.
+Disconnected comparisons retain fixed-model estimability limitations and notes.
+
+`met_comparison_blup_grid()` constructs a complete genotype/environment grid and
+joint prediction-error covariance from the penalized mixed-model equations.
+Unobserved interactions have zero predicted effect with their fitted interaction
+variance added to prediction-error variance. Variance-component uncertainty is
+not included. Predictions are never fitted again as observed data.
+
+Overall genotype/GxE significance uses approximate random-effect LRTs; environment
+uses a Satterthwaite fixed-effect test. Prediction contrasts use the joint grid
+covariance with asymptotic normal/Tukey approximations. These are explicitly
+labeled prediction comparisons, not classical fixed-genotype inference. Existing
+means/pairwise/notes fields, Results, Charts and workbook exports are retained;
+means additionally carry Estimate_type and Evidence_status. All earlier claims
+that mixed-model mean comparison fixes the full interaction are superseded.
+
 ## 1. Shape of the app
 
-### MET mean comparisons
+### Complete MET prediction/evidence workflow
 
-Each MET trait now includes `mean_comparison` with `anova`, `simple_tests`,
-`means`, `pairwise`, and `notes`. A separate REML companion model fits fixed
-Genotype * Environment and random replication/block terms nested in environment.
-This inference model is explicitly labelled and does not replace the user's
-LMM, SOMMER, or ANOVA_RCBD prediction engine. Type III tests use Satterthwaite
-degrees of freedom. Without random design terms the companion uses a fixed
-linear model. Comparisons use equally weighted emmeans, with four separate views:
-genotypes within environment, environments within genotype, overall genotypes,
-and overall environments. Missing cells remain visible as non-estimable results.
+Both modes prepare original plot observations, approved exclusions and trait
+metadata, then report connectivity from observed genotype/environment cells.
+Selected checks are counted separately: all shared entries may link trials,
+and selecting a check does not introduce artificial observations or a check-only
+imputation model. `trial_connectivity` and `environment_links` are visible in
+Results (QC and Mean Comparison) and exported per trait.
 
-Tukey adjustments are per displayed comparison family. Protected LSD uses the
-matching emmeans joint/simple-effect test as its alpha-0.05 gate; when this gate
-fails, pairwise p-values and significance flags are unavailable and letters are
-blank. Pair-specific critical differences are retained, avoiding a misleading
-single LSD for unbalanced trials. Tables place adjusted means, observed plot SD,
-and grouping letters together. Chart error bars show observed SD around adjusted
-means and are explicitly labelled as descriptive, not confidence intervals.
+Check-superiority probabilities and rank-confidence simulations remain explicitly labelled exploratory marginal-normal approximations; they are not the separate Tukey/LSD inference outputs.
+
+GxE estimates carry Confidence_status, Confidence_reason, Observed_locations,
+Coverage_pct, Connected_group, Prediction_SE_ratio and Confidence_rule. Statuses
+are Tested, Untested - predicted, Low confidence and Unsupported. Screening
+flags are fewer than three observed locations, fewer than two replications in a
+tested cell, missing prediction SE, or SE exceeding the observed trait SD.
+Unconfirmed model convergence also flags supported cells. These are explicit
+screening rules, not calibrated confidence probabilities. No unsupported
+cross-group prediction is reported; original measurements remain unchanged.
+
+For the current lme4 random-intercept model, prediction SE uses the inverse
+penalized mixed-model precision in spherical coordinates. Fixed/random and
+cross-effect covariance are included, including unseen interaction variance for
+untested cells. Overall mean SE and random-genotype PEV for reliability are
+separate quantities. Variance parameters are held at fitted values; parameter-
+estimation uncertainty is not included. A failed uncertainty calculation returns
+unavailable SEs and a note, never the old independent-component approximation.
+Sommer keeps its covariance-aware PEV; fixed-model BLUEs use emmeans SEs.
+
+Internal RCBD fallback values are not reportable and no longer enter stability
+matrices. AMMI/GGE are withheld without a complete supported matrix. Both
+heatmaps retain the same axes; predicted cells are faded, low-confidence cells
+have dashed red borders, and unsupported cells are gray. FW regression points
+are restricted to observed genotype/environment combinations; the environmental
+index uses available model estimates. Two-location FW remains descriptive.
+
+The decision board and passport expose tested/predicted/low-confidence/
+unsupported cell counts. Low-confidence or unsupported evidence in positive-
+weight traits gates candidates to RETEST. Missing random-genotype reliability
+is not treated as not-applicable BLUE reliability. Unsupported integrated
+rankings also withhold FA MGIDI rather than ranking disconnected trial groups.
+The weighted non-FA option is labelled Weighted Ideotype Distance; MGIDI with FA
+retains its factor-analysis meaning and equal-trait-importance behavior.
+
+LMM predictions retain REML. Reduced LRT models are fitted by ML and one ML
+full-model refit is reused across tests. Ordinary chi-square boundary p-values
+remain approximate and are labelled in notes. Original observations, not filled
+prediction tables, feed inference models. Mean Comparison keeps its independent
+ANOVA/effect tests, Observe/Adjusted table and adjusted-only bars.
+
+### Current MET supporting comparison outputs
+
+Mean Comparison provides three views: Variety, Environment and Variety x
+Environment. A single combined DT table aligns all completed/failed traits by
+level; interaction rows also retain Environment. A top-right Observe / Adjusted
+radio slicer switches raw mean plus observed SD versus adjusted mean plus SE,
+without inference or refitting. Footer rows contain pooled comparison-model CV,
+H2 only when supplied by an appropriate main MET model (otherwise Not estimated),
+and a common or pair-specific critical difference. Non-significant/unavailable
+tests have explicit Not applied footers and no letters.
+
+Charts use adjusted-mean bars and SE whiskers only. Both Tukey and protected LSD
+require a significant relevant test. Interaction displays compare varieties
+within each environment, gated by the interaction test and each environment's
+simple variety test. The former all-cell interaction contrast family is removed.
+Non-significant means remain visible. Non-estimable values remain in tables.
+
+One reference grid, overall joint tests, and within-environment joint tests are
+reused. Family contrasts are formed only when gates pass. Letters are generated
+from the same adjusted p-values as exported comparisons (coefficient indices,
+not parsing genotype names). Critical differences reuse contrast confidence
+limits, avoiding duplicate Tukey quantile computation. No model simplification,
+imputation for inference, or change of degrees-of-freedom method is introduced.
+
+Multi-location ANOVA and all-trait Variety/Environment/Interaction effect tests
+are shown in Results and exported. Detailed workbook sheets retain effect_tests,
+simple_tests, means, pairwise and notes; display downloads include Means, ANOVA
+and Effects. These current rules supersede historical all-cell/four-view and
+raw-chart behavior described below. GxE remains a separate analysis mode.
+
+### MET analysis modes and mean comparisons
+
+The Analyze sidebar places `met_analysis_mode` (GxE & Stability / Mean Comparison)
+between Replication and Model. The default UI mode is `gxe`. The run records its
+mode, comparison view and comparison method in settings and the result object.
+Results/Charts navigation and workbook contents follow the completed mode,
+not pending changes to Analyze controls.
+
+`run_met_pipeline()` and `run_met_all_traits()` accept `analysis_mode`,
+`comparison_view` and `comparison_method`. Their legacy `combined` default is
+retained for existing programmatic callers; the UI always explicitly requests
+`gxe` or `means`. GxE mode preserves the selected LMM/SOMMER/RCBD workflow and
+both observed and model-estimated heatmaps, but never calls mean comparison.
+Mean-only mode exits after common data validation, approved-data preparation,
+coverage/connectivity checks and the requested comparison; it does not fit the
+main prediction model, run stability extensions, or build integrated rankings.
+
+Mean-only LMM and SOMMER selections use the existing lme4 companion inference
+model: fixed Genotype * Environment with random replication/block terms nested
+in environment. This actual inference engine is explicitly labeled. RCBD uses
+fixed environment, replication/block, genotype and interaction terms. Missing
+cells remain visible as non-estimable results. No main-model heritability is
+reported for a mean-only run.
+
+Mean Comparison calculates all four views with both Tukey and protected LSD in one run. Compare and Method selectors live in the Results and Charts sidebars and independently filter completed tables and charts. They are not shown in Analyze. Tukey adjustment is
+within each displayed family. Protected LSD requires the corresponding
+joint/simple-effect test at alpha 0.05; failed or unavailable gates suppress
+letters, pairwise p-values and significance flags. It does not strongly control
+familywise error for many means. Adjusted_mean_SE and Raw_mean_SD are available
+in comparison exports. Results and Charts can switch between adjusted mean with
+SE and raw mean with SD without rerunning models. Letters always refer to the
+adjusted-model comparison. Changing view, method or raw/adjusted display does not refit a model. The Analysis mode stays in Analyze, so GxE continues to skip comparisons.
+Non-significant families remain visible, and pair-specific thresholds are kept.
+
 Direction/target metadata orders displayed means; letters are significance groups,
 not breeding ranks. Singular fits, convergence issues, missing cells, and a
 descriptive residual-SD ratio above two across environments are noted. Residual
@@ -33,6 +187,22 @@ including companion ANOVA, simple-effect tests, and notes.
 
 References: Lenth (2016), doi:10.18637/jss.v069.i01; Piepho (2004),
 doi:10.1198/1061860043515; Hayter (1986), doi:10.1080/01621459.1986.10478364.
+
+### Incomplete and two-location MET trials
+
+Model choice remains explicit: LMM, SOMMER, or ANOVA_RCBD. The SOMMER adapter
+supports both legacy mmes optimizer arguments and the newer mmes_control API.
+Two-location trials retain core estimates and estimable comparisons, while FW,
+AMMI and GGE stability outputs are unavailable. FW requires at least three
+observed locations per genotype. Disconnected environment groups retain core
+outputs for review, but AMMI/GGE and overall integrated ranking are withheld.
+Missing adjusted performance under RCBD similarly withholds integrated ranking
+without discarding trait models or supported within-environment comparisons.
+Single-trait ranking uses common available stability components and reports
+effective weights; non-estimable performance is never assigned an artificial rank.
+The decision board routes unavailable stability evidence to RETEST. Comparison
+letters do not enter decision scores. Existing model, selection, FW and integrated
+weight tables carry these notes through Results and workbook exports.
 
 ### Missing traits in selection indices
 
@@ -51,7 +221,8 @@ the app does not impute values or redistribute weights across remaining traits.
 Entirely missing required traits and missing required MET model results also stop
 index generation. Resolve the records, explicitly remove an entry, or revise
 weights consistently for all entries before rerunning. Non-estimable adjusted
-means continue to stop the analysis. Zero-weight traits do not contribute to sums.
+MET means withhold overall ranking while preserving core trait results and
+estimable comparisons. Zero-weight traits do not contribute to sums.
 Constant observed traits standardize to zero; missing values remain missing.
 The policy is included in existing weight/ranking tables and their exports.
 The optional metan multivariate selection engine requires complete trait records
@@ -470,18 +641,36 @@ The four views (Variety [overall], varieties across environments [separate
 comparisons within each environment], environment, and variety x environment
 combinations) retain equal-weight marginal means,
 family-wise Tukey comparisons, protected LSD and non-estimable cells.
-Mean comparison Results combine all run traits into two tables with a Trait
-column. The Results Trait selector is hidden only for this view. Compare and
-Method apply across traits; the selected-table download uses the same combined
-tables. Failed/unavailable trait comparisons remain as status rows. Full
+Mean comparison Results align all traits by Levels, with adjacent Adjusted_mean_SE
+and Group columns under each trait header. Within-environment comparisons show
+a separate wide table for each environment. The Results Trait selector is hidden
+only for this view. Compare and Method apply across traits; selected-table and
+full-workbook exports use the same wide layout (with an Environment column to
+identify stacked families). Failed/unavailable traits retain their columns with
+explicit status messages. Full
 workbooks also include combined default-view tables and retain detailed
 per-trait sheets for all comparison views and methods. Charts remain per trait.
 The Results and Charts sidebars hold Compare and Method as visible radio
 lists with all four comparison choices. The main comparison
-panel shows only ANOVA and Trait, Level, Raw_mean_SD, Group and Adjusted_mean;
-within-environment Level labels include the environment to identify families.
-The selected-table download matches this layout. Full workbook exports retain
+panel shows ANOVA and the wide mean tables. Each comparison family ends with
+CV (%), Heritability H2, and LSD (5%) or Tukey HSD (5%) rows. CV is 100 times
+the comparison model residual sigma divided by the absolute observed grand mean;
+zero means return unavailable. H2 comes from the main MET entry-mean model and
+is shown only for overall genotype comparisons. Environment-specific CV and H2
+are unavailable rather than copied from pooled results. A common critical
+difference is shown only when all pairwise thresholds agree within numerical
+tolerance; otherwise the footer says Pair-specific. Protected LSD reports when
+its omnibus gate fails. Paging, ordering and searching are disabled to keep the
+footers below their levels. Group letters still refer to adjusted model means.
+Full workbook exports retain
 N, model SE, pairwise tests and diagnostic notes for traceability.
+Sparse mean-comparison designs retain aliased/missing genotype-environment
+cells. ANOVA, omnibus, letter-group and pairwise failures are isolated so one
+singular hypothesis does not discard other means or families. Failed tests are
+reported in comparison notes, with unavailable p-values and blank letters where
+appropriate; protected LSD never passes an unavailable omnibus test. Internal
+emmeans singular-test console errors are replaced by readable notes when it
+returns unavailable tests. The selected model and estimability rules are unchanged.
 The combination view compares all genotype-environment cell means together;
 protected LSD uses a joint test of equality of these cell means, rather than
 the interaction-only test. Chart previews and downloads show observed mean
@@ -513,3 +702,20 @@ blocks the index. The result settings carry this scope into reactive ranking,
 charts, and export recalculation. Unselected workbook traits are not treated as
 failed models. Two-location regression checks render the non-AMMI/GGE charts
 and exercise selections smaller than the uploaded trait set.
+
+### MET Tukey-only update
+The Tukey-only behavior described above supersedes older references below to
+MET protected LSD or raw mean/SD comparison displays. Other analysis modules
+retain their existing comparison methods.
+
+### MET split-mode update
+The analysis-mode description above supersedes earlier historical MET notes
+about eager all-view/two-method computation or Tukey-only comparison displays.
+No new module is introduced. Existing result field names and legacy combined
+programmatic calls remain supported.
+### Mean-comparison navigation update
+Mean-only UI runs now request every comparison view and both methods. Settings record the full lists; detailed workbook sheets include every view/method. The combined workbook summary defaults to within-environment Tukey. Results and Chart downloads follow their respective display selectors. This supersedes earlier selected-family-only UI behavior; precomputation increases run time.
+
+AMMI/GGE uses a fixed standard minimum of three locations, including the per-genotype coverage flag. The former half-of-locations default and adjustable UI threshold are removed. Legacy min_envs_for_biplot arguments remain accepted for API compatibility but do not override the standard. Connectivity and matrix/rank checks still apply; two-location MET retains core estimates and heatmaps.
+
+FW now permits two observed locations per genotype in a connected design, provided the environmental index varies. Two-location slopes are labelled descriptive response rather than stable/responsive categories. AMMI and GGE retain their three-location minimum.
