@@ -1,3 +1,5 @@
+# GxE/stability restored from commit 68862510149ed9561e555a968c3175e1c1aa21a1.
+# Current mean-comparison helpers and explicit mode routing are preserved below.
 # Module 5 - Multi-Environment Trial (MET)
 #
 # This is the single production source for MET preparation, modelling,
@@ -3442,6 +3444,7 @@ met_sommer_prediction_se <- function(model, ci_indices, extra_variance = 0) {
   sqrt(max(prediction_variance, 0))
 }
 
+# Retain the installed sommer API adapter; model structure remains historical.
 run_met_sommer_cs <- function(
     dat_clean,
     raw_genotype_summary,
@@ -3521,19 +3524,28 @@ run_met_sommer_cs <- function(
   vsm <- sommer::vsm
   ism <- sommer::ism
 
-  model <- tryCatch(
-    sommer::mmes(
+  sommer_args <- list(
       fixed = Weight ~ 1,
       random = random_formula,
       rcov = ~ units,
-      data = dat_sommer,
+      data = dat_sommer)
+  # New sommer releases moved optimizer settings into mmes_control().
+  if ("control" %in% names(formals(sommer::mmes))) {
+    sommer_args$control <- sommer::mmes_control(
+      convergence = list(maxIters = 50, likelihoodTol = 1e-05, parameterTol = 1e-05),
+      output = list(inverse = 1L),
+      diagnostics = list(verbose = FALSE, dateWarning = FALSE))
+  } else {
+    sommer_args <- c(sommer_args, list(
       nIters = 50,
       tolParConvLL = 1e-05,
       tolParConvNorm = 1e-05,
       getPEV = TRUE,
       dateWarning = FALSE,
-      verbose = FALSE
-    ),
+      verbose = FALSE))
+  }
+  model <- tryCatch(
+    do.call(sommer::mmes, sommer_args),
     error = function(e) {
       stop("sommer MET model failed: ", e$message, call. = FALSE)
     }
@@ -3565,7 +3577,14 @@ run_met_sommer_cs <- function(
   names(effects) <- random_terms
 
   vc_raw <- as.data.frame(summary(model)$varcomp)
-  vc_raw$Component <- sub(":mu:mu$", "", rownames(vc_raw))
+  if (all(c("term", "estimate", "StdError") %in% names(vc_raw))) {
+    vc_raw$Component <- sub("^vsm\\(ism\\(([^)]+)\\)\\)$", "\\1", vc_raw$term)
+    vc_raw$VarComp <- vc_raw$estimate
+    vc_raw$VarCompSE <- vc_raw$StdError
+    vc_raw$Constraint <- "Not reported"
+  } else {
+    vc_raw$Component <- sub(":mu:mu$", "", rownames(vc_raw))
+  }
   component_labels <- c(
     Environment = "Environment (E)",
     EnvRep = "Replication within environment",
@@ -3868,7 +3887,7 @@ run_met_sommer_cs <- function(
   )
 }
 
-run_met_pipeline <- function(
+met_run_gxe_20261026 <- function(
     df_raw,
     trait_used = NULL,
     check_varieties = NULL,
@@ -4729,39 +4748,174 @@ run_met_pipeline <- function(
     component_weights = c(mean = MET_W_YIELD, fw = MET_W_FW, asv = MET_W_ASV)
   )
   p_met_selection <- plot_met_selection_ranking(selection, trait_used, estimate_label = estimate_label)
-  mean_comparison <- tryCatch(
-    met_build_mean_comparison(dat_clean, has_replication, has_block, trait_direction, target_value,
-      fitted_model = if (identical(model_type, "ANOVA_RCBD")) m_full else NULL),
-    error = function(e) list(notes = data.frame(Note = paste("Mean comparison unavailable:", conditionMessage(e))))
-  )
-  model_summary$Notes <- paste(model_summary$Notes,
-    paste(mean_comparison$notes$Note, collapse = " | "), sep = " | ")
-  return(list(mean_comparison = mean_comparison, raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean, trait_direction = trait_direction, target_value = target_value, trait_weight = trait_weight, outlier_summary = outlier_summary, presence = presence, genotype_summary = genotype_summary, model_summary = model_summary, variance_components = variance_components, lrt_table = lrt_table, blups_main = BLUPs_main, blups_environment = BLUPs_env_full, gxe_matrix = GxE_matrix_wide %>% rownames_to_column("Genotype"), fw_results = FW_results, ammi_notes = ammi_notes, ammi_support = ammi_support, ammi_genotype = AMMI_geno, ammi_environment = AMMI_env, gge_decision_notes = gge_decision_notes, gge_mean_stability_decision = gge_mean_stability_decision, gge_winner_decision = gge_winner_decision, gge_environment_decision = gge_environment_decision, gge_pc_variance = gge_pc_variance, gge_genotype = GGE_geno, gge_environment = GGE_env, met_selection = selection, p_before = p_before, p_after = p_after, p_variance = p_variance, p_residual = p_residual, p_blup = p_blup, p_accuracy = p_accuracy, p_perf_heatmap_observed = p_perf_heatmap_observed, p_perf_heatmap = p_perf_heatmap, p_fw_mean_sens = p_fw_mean_sens, p_fw_regression = p_fw_regression, p_ammi1 = p_ammi1, p_ammi2 = p_ammi2, p_gge_mean_stability = p_gge_mean_stability, p_gge_which_won = p_gge_which_won, p_gge_environment = p_gge_environment, p_gge_genotype_ranking = p_gge_genotype_ranking, p_gge_environment_ranking = p_gge_environment_ranking, p_gge = p_gge, p_env_cor = p_env_cor, p_met_selection = p_met_selection))
+  return(list(raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean, trait_direction = trait_direction, target_value = target_value, trait_weight = trait_weight, outlier_summary = outlier_summary, presence = presence, genotype_summary = genotype_summary, model_summary = model_summary, variance_components = variance_components, lrt_table = lrt_table, blups_main = BLUPs_main, blups_environment = BLUPs_env_full, gxe_matrix = GxE_matrix_wide %>% rownames_to_column("Genotype"), fw_results = FW_results, ammi_notes = ammi_notes, ammi_support = ammi_support, ammi_genotype = AMMI_geno, ammi_environment = AMMI_env, gge_decision_notes = gge_decision_notes, gge_mean_stability_decision = gge_mean_stability_decision, gge_winner_decision = gge_winner_decision, gge_environment_decision = gge_environment_decision, gge_pc_variance = gge_pc_variance, gge_genotype = GGE_geno, gge_environment = GGE_env, met_selection = selection, p_before = p_before, p_after = p_after, p_variance = p_variance, p_residual = p_residual, p_blup = p_blup, p_accuracy = p_accuracy, p_perf_heatmap_observed = p_perf_heatmap_observed, p_perf_heatmap = p_perf_heatmap, p_fw_mean_sens = p_fw_mean_sens, p_fw_regression = p_fw_regression, p_ammi1 = p_ammi1, p_ammi2 = p_ammi2, p_gge_mean_stability = p_gge_mean_stability, p_gge_which_won = p_gge_which_won, p_gge_environment = p_gge_environment, p_gge_genotype_ranking = p_gge_genotype_ranking, p_gge_environment_ranking = p_gge_environment_ranking, p_gge = p_gge, p_env_cor = p_env_cor, p_met_selection = p_met_selection))
 }
+# Preserved current Mean Comparison workflow ---------------------------------
+met_trial_evidence <- function(data, checks = character()) {
+  cells <- unique(data.frame(Genotype = as.character(data$Genotype), Environment = as.character(data$Environment)))
+  environments <- unique(cells$Environment); remaining <- environments
+  components <- stats::setNames(rep(NA_integer_, length(environments)), environments)
+  component <- 0L
+  while (length(remaining)) {
+    component <- component + 1L; reached <- remaining[1]
+    repeat {
+      genotypes <- cells$Genotype[cells$Environment %in% reached]
+      expanded <- unique(cells$Environment[cells$Genotype %in% genotypes])
+      if (setequal(reached, expanded)) break
+      reached <- expanded
+    }
+    components[reached] <- component; remaining <- setdiff(remaining, reached)
+  }
+  checks <- unique(as.character(checks)); checks <- checks[!is.na(checks) & nzchar(checks)]
+  coverage <- dplyr::bind_rows(lapply(environments, function(environment) {
+    entries <- cells$Genotype[cells$Environment == environment]
+    observed_checks <- intersect(checks, entries)
+    data.frame(Environment = environment, Connected_group = unname(components[environment]),
+      Genotypes_tested = length(entries), Selected_checks_tested = length(observed_checks),
+      Selected_checks = paste(observed_checks, collapse = ", "),
+      Check_status = if (!length(checks)) "No checks selected" else if (!length(observed_checks))
+        "No selected checks tested" else "Selected checks observed")
+  }))
+  pairs <- if (length(environments) >= 2L) combn(environments, 2L, simplify = FALSE) else list()
+  links <- dplyr::bind_rows(lapply(pairs, function(pair) {
+    shared <- intersect(cells$Genotype[cells$Environment == pair[1]], cells$Genotype[cells$Environment == pair[2]])
+    data.frame(Environment_1 = pair[1], Environment_2 = pair[2], Shared_genotypes = length(shared),
+      Shared_selected_checks = length(intersect(shared, checks)),
+      Shared_check_names = paste(intersect(shared, checks), collapse = ", "),
+      Connected_directly_or_indirectly = unname(components[pair[1]] == components[pair[2]]))
+  }))
+  genotype_groups <- stats::setNames(unname(components[cells$Environment]), cells$Genotype)
+  notes <- c(paste("Observed trial connectivity:", component, "connected group(s). Predictions are not additional observations."),
+    if (length(setdiff(checks, cells$Genotype))) paste("Selected checks absent from this trait:",
+      paste(setdiff(checks, cells$Genotype), collapse = ", ")))
+  list(coverage = coverage, links = links, environment_groups = components, genotype_groups = genotype_groups, notes = notes)
+}
+
+met_design_connected <- function(data) {
+  cells <- unique(data.frame(Genotype = as.character(data$Genotype),
+    Environment = as.character(data$Environment)))
+  reached <- unique(cells$Environment)[1]
+  repeat {
+    genotypes <- cells$Genotype[cells$Environment %in% reached]
+    expanded <- unique(cells$Environment[cells$Genotype %in% genotypes])
+    if (setequal(reached, expanded)) break
+    reached <- expanded
+  }
+  length(reached) == length(unique(cells$Environment))
+}
+
 met_mean_comparison_views <- function() {
   c("Variety" = "genotypes",
-    "Varieties across environments" = "within_environment",
     "Environment" = "environments",
     "Variety x Environment" = "interaction")
 }
 
-# Companion inference model: named varieties/environments fixed, design units random.
-# Lenth (2016), doi:10.18637/jss.v069.i01; Piepho (2004), doi:10.1198/1061860043515.
+met_comparison_blup_grid <- function(data, has_replication, has_block) {
+  random <- c("(1|Genotype)", "(1|Genotype:Environment)",
+    if (has_replication) "(1|Environment:Rep)",
+    if (has_block) if (has_replication) "(1|Environment:Rep:Block)" else "(1|Environment:Block)")
+  formula <- stats::as.formula(paste("Weight ~ Environment +", paste(random, collapse = " + ")))
+  model <- lmerTest::lmer(formula, data = data, REML = TRUE,
+    contrasts = list(Environment = "contr.sum"),
+    control = lme4::lmerControl(optimizer = "bobyqa"))
+  grid <- expand.grid(Genotype = levels(data$Genotype), Environment = levels(data$Environment),
+    stringsAsFactors = FALSE)
+  x <- lme4::getME(model, "X"); lambda <- lme4::getME(model, "Lambda")
+  z <- Matrix::t(lme4::getME(model, "Zt"))
+  w <- cbind(x, z %*% lambda)
+  precision <- Matrix::forceSymmetric(Matrix::crossprod(w) +
+    Matrix::Diagonal(ncol(w), c(rep(0, ncol(x)), rep(1, ncol(z)))))
+  factor <- Matrix::Cholesky(precision, LDL = FALSE)
+  fixed <- stats::model.matrix(~ Environment, grid, contrasts.arg = attr(x, "contrasts"))
+  fixed <- fixed[, colnames(x), drop = FALSE]
+  cnms <- lme4::getME(model, "cnms"); flist <- lme4::getME(model, "flist")
+  gp <- lme4::getME(model, "Gp")
+  ii <- jj <- integer(); extra <- rep(0, nrow(grid))
+  vc <- as.data.frame(lme4::VarCorr(model))
+  for (k in seq_along(cnms)) {
+    columns <- strsplit(names(cnms)[k], ":", fixed = TRUE)[[1]]
+    # Replication/block effects are nuisance effects, marginalized to zero.
+    if (!all(columns %in% names(grid))) next
+    key <- function(d) do.call(paste, c(lapply(d[columns], as.character), sep = "\r"))
+    mapping <- stats::setNames(gp[k] + as.integer(flist[[names(cnms)[k]]]), key(data))
+    index <- unname(mapping[key(grid)]); valid <- !is.na(index)
+    ii <- c(ii, which(valid)); jj <- c(jj, index[valid])
+    if (setequal(columns, c("Genotype", "Environment")))
+      extra[!valid] <- vc$vcov[match(names(cnms)[k], vc$grp)]
+  }
+  random_design <- Matrix::sparseMatrix(i = ii, j = jj, x = 1,
+    dims = c(nrow(grid), ncol(z))) %*% lambda
+  design <- cbind(fixed, random_design)
+  covariance <- as.matrix(design %*% Matrix::solve(factor, Matrix::t(design), system = "A")) *
+    stats::sigma(model)^2 + diag(extra, nrow(grid))
+  estimates <- as.numeric(stats::predict(model, newdata = transform(grid,
+    Rep = NA, Block = NA), allow.new.levels = TRUE))
+  reference_grid <- emmeans::emmobj(bhat = estimates, V = covariance,
+    levels = list(Genotype = levels(data$Genotype), Environment = levels(data$Environment)),
+    df = Inf, estName = "emmean")
+  reference_grid@grid$.wgt. <- 1
+  simple_tests <- dplyr::bind_rows(lapply(levels(data$Environment), function(environment) {
+    ids <- which(grid$Environment == environment)
+    contrast <- diag(length(ids))[-1, , drop = FALSE]
+    contrast[, 1] <- -1
+    difference <- as.numeric(contrast %*% estimates[ids])
+    variance <- contrast %*% covariance[ids, ids, drop = FALSE] %*% t(contrast)
+    eig <- eigen(variance, symmetric = TRUE)
+    valid <- eig$values > max(eig$values) * 1e-10 & eig$values > 0
+    statistic <- if (any(valid)) sum(as.numeric(crossprod(eig$vectors[, valid, drop = FALSE], difference))^2 /
+      eig$values[valid]) else NA_real_
+    data.frame(model.term = "Genotype", Environment = environment,
+      df1 = sum(valid), df2 = Inf, F.ratio = statistic / sum(valid),
+      p.value = if (any(valid)) stats::pchisq(statistic, sum(valid), lower.tail = FALSE) else NA_real_)
+  }))
+  # Omnibus random-effect tests are model tests, not ANOVA on predicted cells.
+  random_tests <- as.data.frame(lmerTest::ranova(model, reduce.terms = FALSE))
+  random_tests$Source <- rownames(random_tests)
+  list(model = model, grid = reference_grid, random_tests = random_tests, simple_tests = simple_tests)
+}
+
 met_build_mean_comparison <- function(data, has_replication, has_block,
                                       direction = "Higher better", target_value = NA_real_,
-                                      fitted_model = NULL) {
+                                      fitted_model = NULL, views = unname(met_mean_comparison_views()),
+                                      methods = "tukey") {
+  stopifnot(length(views) > 0, all(views %in% c(unname(met_mean_comparison_views()), "within_environment")),
+    length(methods) > 0, all(methods %in% c("tukey", "lsd")))
   notes <- c("Adjusted means use a companion model with fixed genotype, environment and interaction; replication/block within environment are random. Existing MET predictions are unchanged.",
     "Equal weights are used across the other factor for overall comparisons. Missing cells may make comparisons non-estimable; no entries are removed.",
-    "Observed SD describes plot variation, not uncertainty of adjusted means. Shared letters do not establish equivalence. Tukey adjustment is within each displayed family.",
-    "Protected LSD requires the corresponding overall/simple-effect test at alpha 0.05; it does not strongly control familywise error for many means (Hayter 1986).",
+    "Whiskers show adjusted-mean SE. Shared letters do not establish equivalence. Tukey adjustment is within each displayed family.",
+    "Both post-hoc methods require a significant relevant effect. Interaction charts compare varieties within each environment and require both interaction and simple-effect significance. No all-cell pairwise family is calculated.",
+    "Raw mean with observed SD is descriptive; letters always compare adjusted model means. Protected LSD requires the corresponding joint/simple-effect p-value below 0.05; it does not strongly control familywise error for many means.",
     "The companion model assumes homogeneous residual variance; inspect residuals before interpreting comparisons. Environment differences describe these observed trials.")
   data <- droplevels(as.data.frame(data))
+  data$Genotype <- factor(data$Genotype); data$Environment <- factor(data$Environment)
+  use_blup <- is.null(fitted_model) && met_design_connected(data)
+  blup <- if (use_blup) met_comparison_blup_grid(data, has_replication, has_block) else NULL
+  if (use_blup) notes <- c(
+    "Single-stage LMM fitted to original observed plots: environment fixed; genotype, GxE and design effects random. Shared entries (including checks) connect trials; no synthetic observations are added.",
+    "Adjusted values are BLUP-based predicted performance. Untested interactions shrink to zero; their variance is included in prediction-error covariance.",
+    "Pairwise prediction comparisons use joint covariance and asymptotic normal/Tukey approximations, conditional on fitted variance components. These are not conventional fixed-variety BLUE tests. Letters do not establish equivalence.",
+    "Overall genotype and GxE tests are approximate random-effect likelihood-ratio tests (boundary p-values approximate); environment uses a fixed-effect test. Within-environment prediction tests are approximate Wald tests.",
+    "Equal environment weights are used. Homogeneous residual variance is assumed. Predictions and comparisons require review of convergence, coverage and residual diagnostics.") else if (is.null(fitted_model))
+      notes <- c(notes, "Disconnected trials: pooled BLUP comparisons withheld; fixed-model estimable comparisons retained. No cross-group prediction is supplied.")
+  # A failed hypothesis test must not discard estimable means or other families.
+  comparison_attempt <- function(expr, context, fallback) {
+    # emmeans also catches some singular solves internally with try(), printing
+    # an error before returning NA tests. Report those results through notes.
+    previous_show_error <- getOption("show.error.messages")
+    options(show.error.messages = FALSE)
+    on.exit(options(show.error.messages = previous_show_error), add = TRUE)
+    tryCatch(expr, error = function(e) {
+      notes <<- c(notes, paste0(context, " unavailable: ", conditionMessage(e),
+        ". Entries are retained; no significance is inferred from this failed test."))
+      fallback
+    })
+  }
   random <- c(if (has_replication) "(1|Environment:Rep)",
               if (has_block) if (has_replication) "(1|Environment:Rep:Block)" else "(1|Environment:Block)")
   formula <- stats::as.formula(paste("Weight ~ Genotype * Environment",
     if (length(random)) paste("+", paste(random, collapse = " + ")) else ""))
   contrasts <- list(Genotype = "contr.sum", Environment = "contr.sum")
-  model <- if (!is.null(fitted_model)) fitted_model else if (length(random)) lmerTest::lmer(formula, data = data, REML = TRUE,
+  model <- if (use_blup) blup$model else if (!is.null(fitted_model)) fitted_model else if (length(random)) lmerTest::lmer(formula, data = data, REML = TRUE,
     contrasts = contrasts, control = lme4::lmerControl(optimizer = "bobyqa")) else
     stats::lm(formula, data = data, contrasts = contrasts)
   formula <- stats::formula(model)
@@ -4777,24 +4931,103 @@ met_build_mean_comparison <- function(data, has_replication, has_block,
   if (all(is.finite(residual_sd)) && min(residual_sd) > 0 && max(residual_sd) / min(residual_sd) > 2)
     notes <- c(notes, "Residual SD differs by more than two-fold between environments. This descriptive flag suggests checking a model with environment-specific residual variances before using pooled comparisons.")
   if (any(table(data$Genotype, data$Environment) == 0))
-    notes <- c(notes, "Some genotype-environment cells are missing. Non-estimable means and contrasts are retained without significance labels.")
-  anova <- if (!is.null(fitted_model)) as.data.frame(stats::anova(model)) else if (inherits(model, "merMod"))
+    notes <- c(notes, if (use_blup)
+      "Some genotype-environment cells are missing. Untested cells use model predictions with interaction uncertainty; no observed values or replications are invented." else
+      "Some genotype-environment cells are missing. Non-estimable means and contrasts are retained without significance labels.")
+  dropped <- if (inherits(model, "merMod")) length(attr(lme4::getME(model, "X"), "col.dropped")) else sum(is.na(stats::coef(model)))
+  if (dropped > 0) notes <- c(notes, paste(dropped,
+    "fixed-effect coefficients are aliased because the design is rank deficient. Missing combinations remain visible; some hypotheses cannot be estimated."))
+  anova <- comparison_attempt(if (!is.null(fitted_model)) as.data.frame(stats::anova(model)) else if (inherits(model, "merMod"))
     as.data.frame(stats::anova(model, type = 3, ddf = "Satterthwaite")) else
-    as.data.frame(car::Anova(model, type = 3, singular.ok = TRUE))
+    as.data.frame(car::Anova(model, type = 3, singular.ok = TRUE)), "Comparison ANOVA",
+    data.frame(Status = "Not estimable: singular or unsupported hypothesis test", row.names = "Comparison ANOVA"))
   anova <- tibble::rownames_to_column(anova, "Source")
+  reference_grid <- if (use_blup) blup$grid else emmeans::ref_grid(model, lmer.df = "satterthwaite")
+  overall_tests <- if (use_blup) data.frame() else comparison_attempt(
+    suppressMessages(as.data.frame(emmeans::joint_tests(reference_grid))), "Overall effect tests", data.frame())
+  effect_names <- c("Genotype", "Environment", "Genotype:Environment")
+  term_key <- function(x) vapply(strsplit(as.character(x), ":", fixed = TRUE),
+    function(parts) paste(sort(parts), collapse = ":"), character(1))
+  effect_tests <- dplyr::bind_rows(lapply(seq_along(effect_names), function(i) {
+    row <- if (nrow(overall_tests)) overall_tests[term_key(overall_tests[[1]]) == term_key(effect_names[i]), , drop = FALSE] else data.frame()
+    p <- if (nrow(row) && "p.value" %in% names(row)) row$p.value[1] else NA_real_
+    data.frame(Effect = c("Variety", "Environment", "Variety x Environment")[i],
+      Model_term = effect_names[i], Numerator_df = if (nrow(row)) row$df1[1] else NA_real_,
+      Denominator_df = if (nrow(row)) row$df2[1] else NA_real_,
+      F_value = if (nrow(row)) row$F.ratio[1] else NA_real_, p.value = p,
+      Status = if (!is.finite(p)) "Not estimable" else if (p < 0.05) "Significant" else "Not significant")
+  }))
+  if (use_blup) {
+    fixed_tests <- as.data.frame(stats::anova(model, type = 3, ddf = "Satterthwaite"))
+    effect_tests$Test_method <- c("Approximate random-effect LRT", "Satterthwaite fixed-effect F", "Approximate random-effect LRT")
+    for (i in c(1L, 3L)) {
+      term <- if (i == 1L) "Genotype" else "Genotype:Environment"
+      row <- blup$random_tests[blup$random_tests$Source == paste0("(1 | ", term, ")"), , drop = FALSE]
+      effect_tests$p.value[i] <- if (nrow(row)) row$`Pr(>Chisq)`[1] else NA_real_
+      effect_tests$Numerator_df[i] <- if (nrow(row)) row$Df[1] else NA_real_
+      effect_tests$Denominator_df[i] <- NA_real_; effect_tests$F_value[i] <- NA_real_
+    }
+    effect_tests$p.value[2] <- fixed_tests["Environment", "Pr(>F)"]
+    effect_tests$F_value[2] <- fixed_tests["Environment", "F value"]
+    effect_tests$Numerator_df[2] <- fixed_tests["Environment", "NumDF"]
+    effect_tests$Denominator_df[2] <- fixed_tests["Environment", "DenDF"]
+    effect_tests$Status <- ifelse(!is.finite(effect_tests$p.value), "Not estimable",
+      ifelse(effect_tests$p.value < .05, "Significant", "Not significant"))
+    anova <- data.frame(Source = effect_tests$Model_term, effect_tests[, -c(1, 2)],
+      LRT = c(NA_real_, NA_real_, NA_real_))
+    for (i in c(1L, 3L)) {
+      row <- blup$random_tests[blup$random_tests$Source == paste0("(1 | ", effect_names[i], ")"), , drop = FALSE]
+      if (nrow(row)) anova$LRT[i] <- row$LRT[1]
+    }
+  }
+  simple <- NULL
+  if (any(views %in% c("interaction", "within_environment"))) simple <- if (use_blup) blup$simple_tests else comparison_attempt(
+    suppressMessages(as.data.frame(emmeans::joint_tests(reference_grid, by = "Environment"))),
+    "Within-environment variety tests", data.frame())
+  # Construct letters from the same pairwise p-values used in the table.
+  # Coefficient indices avoid parsing genotype names containing '-' or spaces.
+  grouping_letters <- function(part, pair, means, contrast_grid) {
+    ids <- which(is.finite(means$emmean))
+    if (length(ids) < 2 || !nrow(pair)) return(rep("", nrow(means)))
+    order_score <- if (identical(direction, "Target trait") && is.finite(target_value))
+      abs(means$emmean[ids] - target_value) else if (direction == "Higher better") -means$emmean[ids] else means$emmean[ids]
+    ids <- ids[order(order_score)]
+    coefficients <- as.data.frame(stats::coef(contrast_grid))
+    coefficients <- as.matrix(coefficients[, grepl("^c\\.", names(coefficients)), drop = FALSE])
+    probabilities <- matrix(NA_real_, nrow(means), nrow(means)); diag(probabilities) <- 1
+    for (k in seq_len(min(ncol(coefficients), nrow(pair)))) {
+      positive <- which(coefficients[, k] > 0); negative <- which(coefficients[, k] < 0)
+      if (length(positive) == 1 && length(negative) == 1 && is.finite(pair$p.value[k]))
+        probabilities[positive, negative] <- probabilities[negative, positive] <- pair$p.value[k]
+    }
+    probabilities <- probabilities[ids, ids, drop = FALSE]
+    if (any(!is.finite(probabilities))) return(rep("", nrow(means)))
+    dimnames(probabilities) <- list(as.character(ids), as.character(ids))
+    groups <- multcompView::multcompLetters(probabilities, threshold = 0.05)$Letters
+    out <- rep("", nrow(means)); out[ids] <- unname(groups[as.character(ids)]); out
+  }
   tables <- list(); tests <- list()
-  for (view in unname(met_mean_comparison_views())) {
+  for (view in views) {
     factor <- switch(view, genotypes = "Genotype", within_environment = "Genotype", environments = "Environment",
-      interaction = c("Genotype", "Environment"))
+      interaction = "Genotype")
     level_key <- function(x) do.call(paste, c(lapply(x[factor], as.character), sep = " \u00d7 "))
-    by <- if (view == "within_environment") "Environment" else NULL
+    by <- if (view %in% c("within_environment", "interaction")) "Environment" else NULL
     specs <- stats::as.formula(paste("~", paste(factor, collapse = "*"), if (length(by)) paste("|", by) else ""))
-    emm <- suppressMessages(emmeans::emmeans(model, specs, weights = "equal", lmer.df = "satterthwaite"))
-    joint <- suppressMessages(as.data.frame(emmeans::joint_tests(model, by = by, lmer.df = "satterthwaite")))
-    term_col <- names(joint)[1]
-    joint <- if (view == "interaction") {
-      as.data.frame(emmeans::test(emmeans::contrast(emm, "eff"), joint = TRUE))
-    } else joint[joint[[term_col]] == factor, , drop = FALSE]
+    emm <- comparison_attempt(suppressMessages(emmeans::emmeans(reference_grid, specs,
+      weights = "equal", lmer.df = "satterthwaite")), paste("Adjusted means for", view), NULL)
+    if (is.null(emm)) next
+    joint <- if (length(by)) simple else if (use_blup) data.frame(
+      model.term = c("Genotype", "Environment"), p.value = effect_tests$p.value[1:2]) else overall_tests
+    joint <- if (nrow(joint)) joint[as.character(joint[[1]]) == factor, , drop = FALSE] else
+      data.frame(p.value = NA_real_, Status = "Not estimable")
+    if (length(by) && !by %in% names(joint)) {
+      joint <- joint[rep(1L, nlevels(data[[by]])), , drop = FALSE]
+      joint[[by]] <- levels(data[[by]])
+    }
+    if (!nrow(joint) || !"p.value" %in% names(joint) || any(!is.finite(joint$p.value))) {
+      notes <- c(notes, paste("Some omnibus hypotheses for", view,
+        "are not estimable or have singular covariance. Means remain visible, without letters or post-hoc tests for unsupported families."))
+    }
     joint$View <- rep(view, nrow(joint)); tests[[view]] <- joint
     families <- if (length(by)) levels(data[[by]]) else "Overall"
     for (family in families) {
@@ -4805,49 +5038,81 @@ met_build_mean_comparison <- function(data, has_replication, has_block,
       raw <- raw %>% dplyr::group_by(dplyr::across(dplyr::all_of(factor))) %>%
         dplyr::summarise(Raw_mean = mean(Weight), Observed_SD = stats::sd(Weight), N = dplyr::n(), .groups = "drop")
       means <- dplyr::left_join(means, raw, by = factor)
-      p <- if (nrow(joint)) {
+      p <- if (nrow(joint) && "p.value" %in% names(joint)) {
         j <- if (length(by)) joint[as.character(joint[[by]]) == family, , drop = FALSE] else joint
         if (nrow(j)) j$p.value[1] else NA_real_
       } else NA_real_
-      for (method in c("tukey", "lsd")) {
-        gate <- method == "tukey" || (is.finite(p) && p < 0.05)
+      if (use_blup && !length(by)) p <- effect_tests$p.value[if (view == "genotypes") 1 else 2]
+      effect_p <- if (view == "interaction") effect_tests$p.value[3] else p
+      gate <- is.finite(p) && p < 0.05 && is.finite(effect_p) && effect_p < 0.05
+      gate_status <- if (!is.finite(p) || !is.finite(effect_p)) "Not applied - test not estimable" else
+        if (!gate) "Not applied - effect not significant" else "Applied"
+      convergence_messages <- if (inherits(model, "merMod")) model@optinfo$conv$lme4$messages else character()
+      if (use_blup && (any(model@optinfo$conv$opt != 0) ||
+          any(!grepl("boundary.*singular", convergence_messages)))) {
+        gate <- FALSE
+        gate_status <- "Not applied - model convergence warning"
+      }
+      contrast_grid <- if (gate && sum(is.finite(means$emmean)) >= 2)
+        comparison_attempt(pairs(part, by = NULL, adjust = "none"), "Family contrasts", NULL) else NULL
+      if (gate && is.null(contrast_grid)) {
+        gate <- FALSE
+        gate_status <- "Not applied - fewer than two estimable means or contrasts unavailable"
+      }
+      for (method in methods) {
         adjust <- if (method == "tukey") "tukey" else "none"
         m <- means; m$Group <- ""
-        if (gate && sum(is.finite(m$emmean)) >= 2) {
-          letters <- suppressMessages(as.data.frame(multcomp::cld(part, by = NULL,
-            adjust = adjust, Letters = c(base::letters, LETTERS),
-            sort = TRUE, reversed = identical(direction, "Higher better"))))
-          m$Group <- trimws(letters$.group[match(level_key(m), level_key(letters))])
-          m$Group[!is.finite(m$emmean)] <- ""
-        }
+        pair <- if (!is.null(contrast_grid)) comparison_attempt(
+          suppressMessages(as.data.frame(summary(contrast_grid, adjust = adjust, infer = c(TRUE, TRUE)))),
+          paste("Pairwise comparisons for", view, family, method), data.frame()) else data.frame()
+        if ("asymp.LCL" %in% names(pair)) pair$lower.CL <- pair$asymp.LCL
+        if ("asymp.UCL" %in% names(pair)) pair$upper.CL <- pair$asymp.UCL
+        if (nrow(pair)) m$Group <- comparison_attempt(grouping_letters(part, pair, m, contrast_grid),
+          paste("Grouping letters for", view, family, method), rep("", nrow(m)))
         m <- data.frame(View = view, Family = family, Method = method,
           Level = level_key(m),
-          Raw_mean_SD = sprintf("%.2f \u00b1 %.2f", m$Raw_mean, m$Observed_SD),
-          Group = m$Group, N = m$N, Raw_mean = m$Raw_mean, Adjusted_mean = m$emmean,
-          Observed_SD = m$Observed_SD, Adjusted_SE = m$SE,
-          Omnibus_p = p, Estimable = is.finite(m$emmean))
+          Adjusted_mean_SE = ifelse(is.finite(m$emmean), sprintf("%.2f \u00b1 %.2f", m$emmean, m$SE), "Not estimable"),
+          Raw_mean_SD = ifelse(is.finite(m$Raw_mean), sprintf("%.2f \u00b1 %.2f", m$Raw_mean, m$Observed_SD), "Not observed"),
+          Raw_mean = m$Raw_mean, Observed_SD = m$Observed_SD,
+          Group = m$Group, N = m$N, Adjusted_mean = m$emmean,
+          Adjusted_SE = m$SE,
+          Estimate_type = if (use_blup) "BLUP-based prediction" else "Adjusted mean (BLUE)",
+          Evidence_status = if (length(by)) ifelse(is.na(m$N),
+            if (use_blup) "Untested - predicted" else "Not observed - not estimable", "Tested") else
+            if (use_blup) "Model estimate across all environments" else "Adjusted observed evidence",
+          Omnibus_p = p, Effect_p = effect_p, Posthoc_status = gate_status, Estimable = is.finite(m$emmean))
         score <- if (identical(direction, "Target trait") && is.finite(target_value))
           abs(m$Adjusted_mean - target_value) else if (direction == "Higher better") -m$Adjusted_mean else m$Adjusted_mean
         m <- m[order(score, na.last = TRUE), ]
-        pair <- suppressMessages(as.data.frame(summary(pairs(part, by = NULL, adjust = adjust), infer = c(TRUE, TRUE))))
+        if (!nrow(pair)) pair <- data.frame(contrast = gate_status, estimate = NA_real_, SE = NA_real_, df = NA_real_,
+            p.value = NA_real_, lower.CL = NA_real_, upper.CL = NA_real_, Status = gate_status)
+        # Stable schema for selected-family runs and all-family workbook slices,
+        # including asymptotic BLUP contrasts and families with no post-hoc test.
+        pair_columns <- c("contrast", "estimate", "SE", "df", "lower.CL", "upper.CL",
+          "t.ratio", "z.ratio", "p.value", "Status")
+        for (column in setdiff(pair_columns, names(pair)))
+          pair[[column]] <- if (column == "Status") "Applied" else NA_real_
+        pair <- pair[, pair_columns, drop = FALSE]
         pair$View <- view; pair$Family <- family; pair$Method <- method
-        pair$Omnibus_p <- p; pair$Protected_test_passed <- gate
-        pair$Significant_0.05 <- if (gate) is.finite(pair$p.value) & pair$p.value < 0.05 else NA
-        pair$Critical_difference <- if (method == "lsd") stats::qt(0.975, pair$df) * pair$SE else
-          stats::qtukey(0.95, nrow(m), pair$df) * pair$SE / sqrt(2)
+        pair$Omnibus_p <- p; pair$Effect_p <- effect_p; pair$Protected_test_passed <- gate
+        pair$Posthoc_status <- gate_status
+        pair$Significant_0.05 <- if (gate) ifelse(is.finite(pair$p.value), pair$p.value < 0.05, NA) else NA
+        pair$Critical_difference <- (pair$upper.CL - pair$lower.CL) / 2
         if (!gate) pair$p.value <- NA_real_
         tables[[paste(view, family, method, sep = "\r")]] <- list(means = m, pairwise = pair)
       }
     }
   }
-  list(anova = anova, simple_tests = dplyr::bind_rows(tests),
+  residual_cv <- if (is.finite(mean(data$Weight)) && mean(data$Weight) != 0)
+    100 * stats::sigma(model) / abs(mean(data$Weight)) else NA_real_
+  list(residual_cv_pct = residual_cv, anova = anova, effect_tests = effect_tests, simple_tests = dplyr::bind_rows(tests),
     means = dplyr::bind_rows(lapply(tables, `[[`, "means")),
     pairwise = dplyr::bind_rows(lapply(tables, `[[`, "pairwise")),
     notes = data.frame(Note = c(notes, paste("Formula:", paste(deparse(formula), collapse = " ")),
-      "References: Lenth 2016 doi:10.18637/jss.v069.i01; Piepho 2004 doi:10.1198/1061860043515; Hayter 1986 doi:10.1080/01621459.1986.10478364")))
+      "References: Lenth 2016 doi:10.18637/jss.v069.i01; Piepho 2004 doi:10.1198/1061860043515")))
 }
 
-met_comparison_table <- function(result, field = "means", view = "within_environment", method = "tukey") {
+met_comparison_table <- function(result, field = "means", view = "genotypes", method = "tukey") {
   table <- result$mean_comparison[[field]]
   if (is.null(table)) return(data.frame(Note = "Rerun MET to calculate mean comparisons."))
   if ("View" %in% names(table)) table <- table[table$View == view, , drop = FALSE]
@@ -4855,7 +5120,7 @@ met_comparison_table <- function(result, field = "means", view = "within_environ
   table
 }
 
-met_combined_comparison_tables <- function(results, view = "within_environment", method = "tukey") {
+met_combined_comparison_tables <- function(results, view = "genotypes", method = "tukey", display = "adjusted_se") {
   traits <- unique(c(as.character(results$met_trait_names), names(results$met_by_trait),
     as.character(results$met_failed_traits$Trait)))
   tables <- lapply(traits, function(trait) {
@@ -4865,54 +5130,119 @@ met_combined_comparison_tables <- function(results, view = "within_environment",
     failure <- results$met_failed_traits$Error[match(trait, results$met_failed_traits$Trait)]
     note <- if (length(failure) && !is.na(failure)) failure else "Mean comparison unavailable; rerun MET or inspect comparison notes."
     if (!"Level" %in% names(means) || !nrow(means)) means <- data.frame(
-      Level = "Unavailable", Raw_mean_SD = "", Group = "", Adjusted_mean = NA_real_, Status = note)
+      Level = "Unavailable", Adjusted_mean_SE = "", Group = "", Adjusted_mean = NA_real_, Status = note)
     if (is.null(anova) || !nrow(anova)) anova <- data.frame(Source = "Unavailable", Status = note)
-    list(Means = cbind(Trait = trait, means), ANOVA = cbind(Trait = trait, anova))
+    effects <- result$mean_comparison$effect_tests
+    if (is.null(effects) || !nrow(effects)) effects <- data.frame(Effect = "Unavailable", Status = note)
+    list(Means = cbind(Trait = trait, means), ANOVA = cbind(Trait = trait, anova), Effects = cbind(Trait = trait, effects))
   })
-  list(Means = dplyr::bind_rows(lapply(tables, `[[`, "Means")),
-    ANOVA = dplyr::bind_rows(lapply(tables, `[[`, "ANOVA")))
+  list(Means = met_wide_mean_table(results, traits, view, method, display),
+    ANOVA = dplyr::bind_rows(lapply(tables, `[[`, "ANOVA")),
+    Effects = dplyr::bind_rows(lapply(tables, `[[`, "Effects")))
 }
 
-met_mean_display_table <- function(result, view = "within_environment", method = "tukey") {
+met_wide_mean_table <- function(results, traits, view, method, display = "adjusted_se") {
+  value_field <- if (display == "observed_sd") "Raw_mean_SD" else "Adjusted_mean_SE"
+  means <- lapply(traits, function(trait) met_comparison_table(results$met_by_trait[[trait]], "means", view, method))
+  by_environment <- view %in% c("within_environment", "interaction")
+  families <- if (by_environment) unique(unlist(lapply(means, function(x) x$Family))) else "Overall"
+  if (!length(families)) families <- "Overall"
+  format_value <- function(x, digits = 2) {
+    if (length(x) && is.finite(x[1])) formatC(x[1], digits = digits, format = "f") else "Not available"
+  }
+  sections <- lapply(families, function(family) {
+    parts <- lapply(means, function(x) {
+      if (!"Level" %in% names(x)) return(data.frame())
+      if (by_environment) x <- x[x$Family == family, , drop = FALSE]
+      x
+    })
+    levels <- unique(unlist(lapply(parts, function(x) as.character(x$Level))))
+    footer <- "CV (%)"
+    table <- data.frame(Levels = c(levels, footer), check.names = FALSE)
+    if (by_environment) table <- cbind(Environment = family, table)
+    for (i in seq_along(traits)) {
+      trait <- traits[i]; result <- results$met_by_trait[[trait]]; part <- parts[[i]]
+      available <- nrow(part) > 0
+      failure <- results$met_failed_traits$Error[match(trait, results$met_failed_traits$Trait)]
+      status <- if (length(failure) && !is.na(failure)) failure else "Comparison unavailable"
+      values <- if (available) as.character(part[[value_field]][match(levels, part$Level)]) else rep(status, length(levels))
+      if (available && display != "observed_sd" && "Evidence_status" %in% names(part)) {
+        predicted <- part$Evidence_status[match(levels, part$Level)] == "Untested - predicted"
+        values[which(predicted)] <- paste0(values[which(predicted)], " [predicted]")
+      }
+      groups <- if (available) as.character(part$Group[match(levels, part$Level)]) else rep("", length(levels))
+      values[is.na(values)] <- "Not estimable / not observed"; groups[is.na(groups)] <- ""
+      # Environment-specific statistics are not inferred from pooled MET estimates.
+      cv <- if (available) format_value(result$mean_comparison$residual_cv_pct) else "Not estimated"
+      table[[paste(trait, value_field, sep = " | ")]] <- c(values, if (available) cv else status)
+      table[[paste(trait, "Group", sep = " | ")]] <- c(groups, "")
+    }
+    table
+  })
+  dplyr::bind_rows(sections)
+}
+
+met_mean_display_table <- function(result, view = "genotypes", method = "tukey") {
   table <- met_comparison_table(result, "means", view, method)
   if (!"Level" %in% names(table)) return(table)
   if (identical(view, "within_environment"))
     table$Level <- paste(table$Family, table$Level, sep = " / ")
-  table[, c("Level", "Raw_mean_SD", "Group", "Adjusted_mean"), drop = FALSE]
+  table[, c("Level", "Adjusted_mean_SE", "Group", "Adjusted_mean"), drop = FALSE]
 }
 
-met_plot_mean_comparison <- function(result, view = "within_environment", method = "tukey",
-                                     display = "adjusted_se") {
+met_plot_mean_comparison <- function(result, view = "genotypes", method = "tukey",
+                                     display = "adjusted_se", environment = NULL) {
   d <- met_comparison_table(result, "means", view, method)
-  if (!"Adjusted_mean" %in% names(d) || !any(is.finite(d$Adjusted_mean)))
+  if (view %in% c("interaction", "within_environment") && length(environment) && "Family" %in% names(d))
+    d <- d[d$Family %in% environment, , drop = FALSE]
+  # Boxes show original approved observations; letters retain model inference.
+  mean_col <- "Adjusted_mean"
+  error_col <- "Adjusted_SE"
+  if (!mean_col %in% names(d) || !any(is.finite(d[[mean_col]])))
     return(ggplot2::ggplot() + ggplot2::annotate("text", x = 0, y = 0, label = "Mean comparisons unavailable; see comparison notes.") + ggplot2::theme_bw())
-  d <- d[is.finite(d$Omnibus_p) & d$Omnibus_p < 0.05, , drop = FALSE]
-  if (!nrow(d)) return(ggplot2::ggplot() +
-    ggplot2::annotate("text", x = 0, y = 0, label = "No significant difference at 5% for this comparison.") +
-    ggplot2::labs(y = "Observed mean \u00b1 SD") + ggplot2::theme_bw(base_size = 9))
   d$Level <- factor(d$Level, levels = unique(d$Level))
-  if (!"Raw_mean" %in% names(d)) stop("Rerun MET to calculate observed mean charts.", call. = FALSE)
-  d$Plot_mean <- d$Raw_mean
-  d$Plot_error <- d$Observed_SD
-  limits <- range(c(d$Plot_mean, d$Plot_mean - d$Plot_error,
+  d$Plot_mean <- d[[mean_col]]
+  d$Plot_error <- d[[error_col]]
+  observations <- result$met_cleaned_data
+  if (is.null(observations) || !all(c("Genotype", "Environment", "Weight") %in% names(observations)))
+    observations <- data.frame(Genotype = character(), Environment = character(), Weight = numeric())
+  observations$Level <- if (view == "environments") as.character(observations$Environment) else as.character(observations$Genotype)
+  observations$Family <- if (view %in% c("interaction", "within_environment")) as.character(observations$Environment) else rep("Overall", nrow(observations))
+  observations <- observations[is.finite(observations$Weight), , drop = FALSE]
+  observations <- dplyr::semi_join(observations, d, by = c("Level", "Family"))
+  bounds <- observations %>% dplyr::group_by(Level, Family) %>%
+    dplyr::summarise(Observed_top = if (length(Weight)) max(Weight) else NA_real_, .groups = "drop")
+  d <- dplyr::left_join(d, bounds, by = c("Level", "Family"))
+  d$Level <- factor(d$Level, levels = unique(as.character(d$Level)))
+  observations$Level <- factor(observations$Level, levels = levels(d$Level))
+  prediction_only <- d[is.na(d$Observed_top), , drop = FALSE]
+  limits <- range(c(observations$Weight, prediction_only$Plot_mean,
+    prediction_only$Plot_mean - prediction_only$Plot_error,
+    prediction_only$Plot_mean + prediction_only$Plot_error), na.rm = TRUE)
+  if (!all(is.finite(limits))) limits <- range(c(d$Plot_mean, d$Plot_mean - d$Plot_error,
     d$Plot_mean + d$Plot_error), na.rm = TRUE)
   gap <- max(diff(limits) * 0.04, 0.03)
+  d$Letter_y <- dplyr::coalesce(d$Observed_top,
+    d$Plot_mean + dplyr::coalesce(d$Plot_error, 0)) + gap
   palette <- stats::setNames(rep(c("#3498DB", "#2ECC71", "#E74C3C", "#9B59B6",
     "#F39C12", "#1ABC9C", "#E84393", "#34495E"), length.out = nlevels(d$Level)), levels(d$Level))
+  trait <- if (length(result$outlier_summary$Trait_used)) as.character(result$outlier_summary$Trait_used[1]) else "Trait value"
   ggplot2::ggplot(d, ggplot2::aes(Level, Plot_mean, fill = Level)) +
-    ggplot2::geom_col(width = 0.72, show.legend = FALSE, na.rm = TRUE) +
-    ggplot2::geom_errorbar(ggplot2::aes(ymin = Plot_mean - Plot_error,
-      ymax = Plot_mean + Plot_error), width = 0.16, na.rm = TRUE) +
-    ggplot2::geom_text(ggplot2::aes(y = Plot_mean + dplyr::coalesce(Plot_error, 0) + gap,
+    ggplot2::geom_boxplot(data = observations,
+      ggplot2::aes(x = Level, y = Weight, fill = Level), inherit.aes = FALSE,
+      width = 0.65, show.legend = FALSE, outlier.size = 1, na.rm = TRUE) +
+    ggplot2::geom_pointrange(data = prediction_only,
+      ggplot2::aes(ymin = Plot_mean - Plot_error, ymax = Plot_mean + Plot_error),
+      shape = 23, show.legend = FALSE, na.rm = TRUE) +
+    ggplot2::geom_text(ggplot2::aes(y = Letter_y,
       label = Group), size = 10.5 / (72.27 / 25.4), fontface = "bold", na.rm = TRUE) +
     ggplot2::facet_wrap(~ Family, scales = "free_x") +
     ggplot2::scale_fill_manual(values = palette) +
-    ggplot2::labs(title = paste("MET mean comparison:",
-      names(met_mean_comparison_views())[match(view, met_mean_comparison_views())]),
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(.05, .12))) +
+    ggplot2::labs(title = paste(if (method == "lsd") "LSD comparison letters" else "Tukey comparison letters", "|", trait),
       subtitle = paste(if (method == "lsd") "Protected LSD" else "Tukey",
-        "(5%); comparison families with an overall test p < 0.05"),
-      caption = "Bars: observed mean \u00b1 observed SD; letters match adjusted model comparisons in Results.",
-      x = NULL, y = "Observed mean \u00b1 SD") +
+        "(5%); letters use adjusted-model comparisons"),
+      x = NULL, y = trait) +
     ggplot2::theme_bw(base_size = 9) +
     ggplot2::theme(plot.title = ggplot2::element_text(size = 10),
       plot.subtitle = ggplot2::element_text(size = 9),
@@ -4923,6 +5253,121 @@ met_plot_mean_comparison <- function(result, view = "within_environment", method
       axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
 }
 
+met_run_mean_comparison <- function(
+    df_raw,
+    trait_used = NULL,
+    check_varieties = NULL,
+    replication_col = NULL,
+    block_col = NULL,
+    min_envs_for_biplot = NULL,
+    model_type = "LMM", analysis_mode = "combined",
+    comparison_view = unname(met_mean_comparison_views()), comparison_method = c("tukey", "lsd")) {
+  analysis_mode <- match.arg(analysis_mode, c("gxe", "means", "combined"))
+  input <- make_met_data(
+    df_raw,
+    trait_used,
+    replication_col = replication_col,
+    block_col = block_col
+  )
+  dat <- input$data
+  trait_used <- input$trait_used
+  trait_direction <- input$trait_direction %||% "Higher better"
+  target_value <- suppressWarnings(as.numeric(input$target_value %||% NA_real_))
+  trait_weight <- suppressWarnings(as.numeric(input$trait_weight %||% 1))
+  has_replication <- !is.null(input$replication_col)
+  has_block <- !is.null(input$block_col)
+  model_type <- normalize_met_model_type(model_type)
+  model_label <- met_model_label(model_type)
+  model_is_lmm <- !identical(model_type, "ANOVA_RCBD")
+  estimate_label <- if (model_is_lmm) "BLUP" else "adjusted mean (BLUE)"
+  estimate_label_plural <- if (model_is_lmm) "BLUPs" else "adjusted means (BLUEs)"
+  estimate_matrix_source <- if (identical(model_type, "SOMMER")) {
+    "sommer compound-symmetry LMM predicted BLUP matrix"
+  } else if (identical(model_type, "LMM")) {
+    "lme4 LMM predicted BLUP matrix"
+  } else {
+    "ANOVA adjusted-mean (BLUE) matrix"
+  }
+  n_envs_total <- n_distinct(dat$Environment)
+  # Keep the legacy argument for callers; the standard threshold is fixed at three.
+  min_envs_for_biplot <- MET_MIN_ENVS_FOR_BIPLOT
+  ammi_gge_available <- n_envs_total >= MET_MIN_ENVS_FOR_BIPLOT
+  notes <- c("IQR extremes are flagged only; no automatic outlier deletion. Approved trait exclusions are applied before MET input preparation.")
+  cell_bounds <- dat %>% group_by(Genotype, Environment) %>% summarise(Lower_c = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper_c = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
+  dat_stepA <- dat # Only breeder-approved exclusions are applied upstream.
+  if (nrow(dat_stepA) == 0) stop("All MET rows were removed by cell-level outlier filtering.")
+  env_bounds <- dat_stepA %>% group_by(Environment) %>% summarise(Lower = quantile(Weight, 0.25, na.rm = TRUE) - 1.5 * IQR(Weight, na.rm = TRUE), Upper = quantile(Weight, 0.75, na.rm = TRUE) + 1.5 * IQR(Weight, na.rm = TRUE), .groups = "drop")
+  p_before <- ggplot(dat_stepA %>% left_join(env_bounds, by = "Environment") %>% mutate(outlier_env = Weight < Lower | Weight > Upper), aes(x = Weight, fill = outlier_env)) + geom_histogram(bins = 30, color = "white", linewidth = 0.2) + geom_vline(data = env_bounds, aes(xintercept = Lower), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + geom_vline(data = env_bounds, aes(xintercept = Upper), linetype = "dashed", color = "#E74C3C", linewidth = 0.7) + facet_wrap(~Environment, scales = "free", ncol = 2) + scale_fill_manual(values = c("FALSE" = "#3498DB", "TRUE" = "#E74C3C"), labels = c("Unflagged", "Flagged (retained)")) + labs(title = paste0(trait_used, " approved data distribution with IQR flags"), x = trait_used, y = "Count", fill = NULL) + theme_bw()
+  dat_clean <- dat_stepA
+  if (nrow(dat_clean) == 0) stop("All MET rows were removed by environment-level outlier filtering.")
+  design_connected <- met_design_connected(dat_clean)
+  if (!design_connected) {
+    notes <- c(notes, "Disconnected design: no shared genotypes link all environments. Cross-group comparisons and stability decisions are unsupported; retain entries for review and retesting.")
+    ammi_gge_available <- FALSE
+  }
+  if (n_envs_total < 3) notes <- c(notes,
+    "Two-location MET: core estimates and estimable mean comparisons remain available. FW response is available with two observed locations; it is descriptive. AMMI and GGE require at least three locations.")
+  p_after <- ggplot(dat_clean, aes(x = Weight)) + geom_histogram(bins = 30, fill = "#2ECC71", color = "white", linewidth = 0.2) + facet_wrap(~Environment, scales = "free", ncol = 2) + labs(title = paste0(trait_used, " approved analysis distribution"), x = trait_used, y = "Count") + theme_bw()
+  outlier_summary <- data.frame(Trait_used = trait_used, Rows_original = nrow(dat), Rows_after_cell_clean = nrow(dat_stepA), Rows_after_environment_clean = nrow(dat_clean), Removed_total = nrow(dat) - nrow(dat_clean), stringsAsFactors = FALSE)
+  presence <- dat_clean %>% distinct(Genotype, Environment) %>% mutate(Genotype = as.character(Genotype), Environment = as.character(Environment), present = 1) %>% pivot_wider(names_from = Environment, values_from = present, values_fill = 0) %>% mutate(n_envs = rowSums(across(-Genotype))) %>% arrange(desc(n_envs), Genotype)
+  trial_evidence <- met_trial_evidence(dat_clean, check_varieties)
+  notes <- c(notes, trial_evidence$notes)
+  if (analysis_mode == "means") {
+    single_env <- as.character(presence$Genotype[presence$n_envs == 1])
+    if (length(single_env)) notes <- c(notes, paste("Single-environment genotypes have limited evidence:",
+      paste(single_env, collapse = ", ")))
+    comparison_model <- NULL
+    if (model_type == "ANOVA_RCBD") {
+      design_terms <- c(if (has_replication) "Environment:Rep",
+        if (has_block) if (has_replication) "Environment:Rep:Block" else "Environment:Block")
+      comparison_model <- stats::lm(stats::as.formula(paste("Weight ~",
+        paste(c("Environment", design_terms, "Genotype", "Genotype:Environment"), collapse = " + "))), data = dat_clean)
+    }
+    comparison <- met_build_mean_comparison(dat_clean, has_replication, has_block,
+      trait_direction, target_value, fitted_model = comparison_model,
+      views = comparison_view, methods = comparison_method)
+    engine_note <- if (model_type == "ANOVA_RCBD") "Fixed-design RCBD comparison model" else
+      "lme4 single-stage BLUP comparison model (also used when SOMMER is selected); approximate prediction comparisons"
+    comparison$notes <- rbind(comparison$notes, data.frame(Note = c(notes, engine_note)))
+    return(list(analysis_mode = "means", comparison_view = comparison_view,
+      comparison_method = comparison_method, mean_comparison = comparison,
+      raw_data = df_raw, met_data = dat, met_cleaned_data = dat_clean,
+      presence = presence, outlier_summary = outlier_summary,
+      trial_connectivity = trial_evidence$coverage, environment_links = trial_evidence$links,
+      trait_direction = trait_direction, target_value = target_value, trait_weight = trait_weight,
+      model_summary = data.frame(Model = model_label, Analysis = "Mean Comparison",
+        Comparison_engine = engine_note, Notes = paste(comparison$notes$Note, collapse = " | "))))
+  }
+  stop("The preserved mean-comparison runner requires analysis_mode = means.")
+}
+
+# Public dispatch keeps the current mode contract; GxE delegates to commit 6886251.
+run_met_pipeline <- function(df_raw, trait_used = NULL, check_varieties = NULL,
+    replication_col = NULL, block_col = NULL, min_envs_for_biplot = NULL,
+    model_type = "LMM", analysis_mode = "combined",
+    comparison_view = unname(met_mean_comparison_views()), comparison_method = c("tukey", "lsd")) {
+  analysis_mode <- match.arg(analysis_mode, c("gxe", "means", "combined"))
+  if (analysis_mode == "means") return(met_run_mean_comparison(
+    df_raw, trait_used, check_varieties, replication_col, block_col, min_envs_for_biplot,
+    model_type, analysis_mode = "means", comparison_view = comparison_view, comparison_method = comparison_method))
+  result <- met_run_gxe_20261026(df_raw, trait_used, check_varieties,
+    replication_col, block_col, min_envs_for_biplot, model_type)
+  result$analysis_mode <- analysis_mode
+  has_replication <- any(!is.na(result$met_cleaned_data$Rep))
+  has_block <- any(!is.na(result$met_cleaned_data$Block))
+  result$mean_comparison <- if (analysis_mode == "combined") tryCatch(
+    met_build_mean_comparison(result$met_cleaned_data, has_replication, has_block,
+      result$trait_direction, result$target_value,
+      fitted_model = if (normalize_met_model_type(model_type) == "ANOVA_RCBD")
+        stats::lm(stats::as.formula(paste("Weight ~ Environment + Genotype * Environment",
+          if (has_replication) "+ Environment:Rep" else "",
+          if (has_block) if (has_replication) "+ Environment:Rep:Block" else "+ Environment:Block" else "")),
+          data = result$met_cleaned_data) else NULL, views = comparison_view, methods = comparison_method),
+    error = function(e) list(notes = data.frame(Note = paste("Mean comparison unavailable:", conditionMessage(e))))) else
+      list(notes = data.frame(Note = "Mean comparison was not requested."))
+  result
+}
+
 run_met_all_traits <- function(
     df_raw,
     check_varieties = NULL,
@@ -4930,7 +5375,9 @@ run_met_all_traits <- function(
     replication_col = NULL,
     block_col = NULL,
     min_envs_for_biplot = NULL,
-    model_type = "LMM") {
+    model_type = "LMM", analysis_mode = "combined",
+    comparison_view = unname(met_mean_comparison_views()), comparison_method = c("tukey", "lsd")) {
+  analysis_mode <- match.arg(analysis_mode, c("gxe", "means", "combined"))
   available_traits <- get_met_trait_cols(df_raw)
   if (is.null(trait_cols) || length(trait_cols) == 0) {
     trait_cols <- available_traits
@@ -4951,7 +5398,8 @@ run_met_all_traits <- function(
         replication_col = replication_col,
         block_col = block_col,
         min_envs_for_biplot = min_envs_for_biplot,
-        model_type = model_type
+        model_type = model_type, analysis_mode = analysis_mode,
+        comparison_view = comparison_view, comparison_method = comparison_method
       )
     }, error = function(e) {
       failures <<- bind_rows(
@@ -4967,9 +5415,12 @@ run_met_all_traits <- function(
   if (length(results) == 0) {
     stop("MET pipeline failed for all numeric traits: ", paste(failures$Error, collapse = " | "))
   }
-  integrated <- build_met_integrated_ranking(df_raw, results, trait_cols = trait_cols)
-  methods <- build_met_multitrait_methods(df_raw, results, integrated$ranking)
+  integrated <- if (analysis_mode == "means") list(ranking = data.frame(), trait_weights = data.frame(),
+    adjusted_performance = data.frame(), standardized_scores = data.frame(), plot = NULL) else
+    build_met_integrated_ranking(df_raw, results, trait_cols = trait_cols)
+  methods <- if (analysis_mode == "means") list() else build_met_multitrait_methods(df_raw, results, integrated$ranking)
   list(
+    analysis_mode = analysis_mode, comparison_view = comparison_view, comparison_method = comparison_method,
     trait_metadata = prepare_met_trait_settings(df_raw)$trait_metadata,
     met_multitrait_methods = methods,
     settings = data.frame(
@@ -4978,7 +5429,9 @@ run_met_all_traits <- function(
       Replication_column = replication_col %||% "",
       Block_column = block_col %||% "",
       Model = met_model_label(model_type),
-      AMMI_GGE_min_observed_locations = min_envs_for_biplot %||% "",
+      Analysis = analysis_mode, Comparison_view = if (analysis_mode == "means") paste(comparison_view, collapse = ", ") else "",
+      Comparison_method = if (analysis_mode == "means") paste(comparison_method, collapse = ", ") else "",
+      AMMI_GGE_min_observed_locations = MET_MIN_ENVS_FOR_BIPLOT,
       stringsAsFactors = FALSE
     ),
     met_by_trait = results,
