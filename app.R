@@ -1997,6 +1997,34 @@ plot_lpsi_mean_comparison <- function(results, trait) {
 
 
 # Main LPSI function
+# Reserve space for the genotype axis and margins when wrapping check labels.
+# Rewrap from the complete subtitle so preview and export widths can differ.
+si_wrap_selection_index_header <- function(plot, width_in = 10) {
+  subtitle <- attr(plot, "si_check_line_note") %||% plot$labels$subtitle
+  if (is.null(subtitle) || !is.character(subtitle)) return(plot)
+  if (length(width_in) != 1 || !is.finite(width_in)) width_in <- 10
+  wrap_width <- max(20L, floor((width_in - 2) * 9))
+  entries <- strsplit(subtitle, " | ", fixed = TRUE)[[1]]
+  lines <- character()
+  line <- ""
+  for (entry in entries) {
+    candidate <- if (nzchar(line)) paste(line, entry, sep = " | ") else entry
+    if (nzchar(line) && nchar(candidate) > wrap_width) {
+      lines <- c(lines, line)
+      line <- entry
+    } else {
+      line <- candidate
+    }
+  }
+  # Keep each color/check pair together unless a single entry is too long.
+  lines <- unlist(lapply(c(lines, line), function(text) {
+    if (nchar(text) > wrap_width) strwrap(text, width = wrap_width) else text
+  }))
+  plot <- plot + labs(subtitle = paste(lines, collapse = "\n"))
+  attr(plot, "si_check_line_note") <- subtitle
+  plot
+}
+
 run_selection_pipeline <- function(df_raw, check_varieties = NULL,
                                    model_type = "RCBD",
                                    advance_cutoff = advance_index_cutoff,
@@ -2560,6 +2588,7 @@ run_selection_pipeline <- function(df_raw, check_varieties = NULL,
       annotate("text", x = 0.5, y = 0.5, label = "No candidate genotype found.") +
       theme_void()
   }
+  p_index <- si_wrap_selection_index_header(p_index)
   heatmap_plot <- NULL
   heatmap_data <- superiority_by_check_long %>%
     filter(!is.na(Superiority_pct))
@@ -5122,7 +5151,9 @@ server <- function(input, output, session) {
       }
       if (view == "lpsi_ranking_plot") {
         return(list(
-          plot = lpsi$ranking_plot,
+          plot = si_wrap_selection_index_header(
+            lpsi$ranking_plot, as.numeric(input$chart_width %||% 12)
+          ),
           name = "Single-Location_Trial_multi_trait_selection"
         ))
       }
@@ -7764,7 +7795,7 @@ server <- function(input, output, session) {
   }, res = 96, execOnResize = TRUE)
   output$ranking_plot <- renderPlot({
     result <- lpsi_result()
-    print(result$ranking_plot)
+    print(si_wrap_selection_index_header(result$ranking_plot, grDevices::dev.size("in")[1]))
   }, res = 96, execOnResize = TRUE)
   output$heatmap_plot <- renderPlot({
     result <- lpsi_result()
